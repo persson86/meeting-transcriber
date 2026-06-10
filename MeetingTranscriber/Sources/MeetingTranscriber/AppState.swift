@@ -18,9 +18,9 @@ enum RecordingStatus {
 
     var label: String {
         switch self {
-        case .idle: return "Pronto"
-        case .recording: return "Gravando..."
-        case .stopping: return "Salvando áudio..."
+        case .idle: return "Ready"
+        case .recording: return "Recording..."
+        case .stopping: return "Saving audio..."
         case .error(let msg): return msg
         }
     }
@@ -113,11 +113,11 @@ final class AppState: ObservableObject {
         if runningTranscriptionCount > 0 {
             let queued = queuedTranscriptionCount
             return queued > 0
-                ? "Transcrevendo \(runningTranscriptionCount), \(queued) na fila"
-                : "Transcrevendo \(runningTranscriptionCount)"
+                ? "Transcribing \(runningTranscriptionCount), \(queued) queued"
+                : "Transcribing \(runningTranscriptionCount)"
         }
         if queuedTranscriptionCount > 0 {
-            return "\(queuedTranscriptionCount) transcrição na fila"
+            return "\(queuedTranscriptionCount) queued"
         }
         return status.label
     }

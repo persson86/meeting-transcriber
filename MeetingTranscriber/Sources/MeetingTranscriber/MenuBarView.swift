@@ -8,17 +8,21 @@ struct MenuBarView: View {
         VStack(alignment: .leading, spacing: 0) {
 
             // ── Status bar ───────────────────────────────────────────────
-            HStack(spacing: 6) {
+            HStack(spacing: 8) {
                 Circle()
                     .fill(statusColor)
-                    .frame(width: 7, height: 7)
-                Text(state.statusLabel)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
+                    .frame(width: 8, height: 8)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Meeting Transcriber")
+                        .font(.caption.weight(.semibold))
+                    Text(state.statusLabel)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
                 Spacer()
             }
             .padding(.horizontal, 14)
-            .padding(.vertical, 10)
+            .padding(.vertical, 9)
 
             Divider()
 
@@ -26,13 +30,11 @@ struct MenuBarView: View {
             VStack(alignment: .leading, spacing: 8) {
 
                 if case .idle = state.status {
-                    // Title field
-                    TextField("Título da reunião", text: $state.meetingTitle)
+                    TextField("Meeting title", text: $state.meetingTitle)
                         .textFieldStyle(.roundedBorder)
 
-                    // Language — menu dropdown evita overflow
                     HStack {
-                        Text("Idioma")
+                        Text("Language")
                             .font(.caption)
                             .foregroundColor(.secondary)
                         Spacer()
@@ -40,9 +42,9 @@ struct MenuBarView: View {
                             get: { state.language },
                             set: { state.setLanguage($0) }
                         )) {
-                            Text("🇧🇷 PT-BR").tag("pt")
-                            Text("🇺🇸 English").tag("en")
-                            Text("🌐 Auto-detect").tag("auto")
+                            Text("Portuguese").tag("pt")
+                            Text("English").tag("en")
+                            Text("Auto-detect").tag("auto")
                         }
                         .pickerStyle(.menu)
                         .fixedSize()
@@ -55,7 +57,11 @@ struct MenuBarView: View {
                         .lineLimit(3)
                         .fixedSize(horizontal: false, vertical: true)
 
-                    Button("Limpar erro") { state.resetError() }
+                    Button {
+                        state.resetError()
+                    } label: {
+                        Label("Clear error", systemImage: "xmark.circle")
+                    }
                         .buttonStyle(.link)
                         .font(.caption)
 
@@ -74,22 +80,23 @@ struct MenuBarView: View {
                     }
 
                     if state.status.isRecording {
-                        Text("O indicador \"Currently Sharing\" do macOS é esperado.")
+                        Text("The macOS sharing indicator is expected while capture is active.")
                             .font(.caption2)
                             .foregroundColor(.secondary.opacity(0.7))
                     } else if state.status.isStopping {
-                        Text("Finalizando arquivos de áudio antes de liberar a próxima gravação.")
+                        Text("Saving audio before the next recording can start.")
                             .font(.caption2)
                             .foregroundColor(.secondary.opacity(0.7))
                     }
                 }
 
-                // Main action button
-                Button(actionLabel) { handleAction() }
+                Button { handleAction() } label: {
+                    Label(actionTitle, systemImage: actionIcon)
+                        .frame(maxWidth: .infinity)
+                }
                     .buttonStyle(.borderedProminent)
                     .tint(state.status.isRecording ? .red : .accentColor)
                     .disabled(state.status.isStopping)
-                    .frame(maxWidth: .infinity)
 
             }
             .padding(.horizontal, 14)
@@ -100,13 +107,14 @@ struct MenuBarView: View {
                 Divider()
                 VStack(alignment: .leading, spacing: 7) {
                     HStack {
-                        Text("Fila de transcrições")
+                        Text("Queue")
                             .font(.caption)
                             .foregroundColor(.secondary)
                         Spacer()
                         Text("\(state.runningTranscriptionCount)/\(state.maxConcurrentTranscriptionCount)")
                             .font(.caption2)
                             .foregroundColor(.secondary)
+                            .monospacedDigit()
                     }
 
                     ForEach(state.visibleTranscriptionJobs) { job in
@@ -121,10 +129,14 @@ struct MenuBarView: View {
                                     .font(.caption)
                                     .lineLimit(1)
                                     .truncationMode(.tail)
-                                Text(jobStatusLabel(job.status))
-                                    .font(.caption2)
-                                    .foregroundColor(.secondary)
-                                    .lineLimit(2)
+                                HStack(spacing: 4) {
+                                    Text(jobStatusLabel(job.status))
+                                    Text("•")
+                                    Text(timeLabel(job.createdAt))
+                                }
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                                .lineLimit(1)
                             }
 
                             Spacer(minLength: 4)
@@ -136,7 +148,7 @@ struct MenuBarView: View {
                                     Image(systemName: "doc.text")
                                 }
                                 .buttonStyle(.plain)
-                                .help("Abrir transcrição")
+                                .help("Open transcript")
                             }
                         }
                     }
@@ -181,15 +193,20 @@ struct MenuBarView: View {
 
                 Spacer()
 
-                Button("Sair") { NSApplication.shared.terminate(nil) }
+                Button {
+                    NSApplication.shared.terminate(nil)
+                } label: {
+                    Image(systemName: "power")
+                }
                     .buttonStyle(.link)
                     .foregroundColor(.secondary)
                     .font(.caption2)
+                    .help("Quit")
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 8)
         }
-        .frame(width: 260)
+        .frame(width: 300)
         .fileImporter(isPresented: $showDirPicker, allowedContentTypes: [.folder]) { result in
             if case .success(let url) = result { state.setOutputDirectory(url) }
         }
@@ -197,12 +214,20 @@ struct MenuBarView: View {
 
     // MARK: - Helpers
 
-    private var actionLabel: String {
+    private var actionTitle: String {
         switch state.status {
-        case .idle:      return "⏺  Iniciar gravação"
-        case .recording: return "⏹  Parar e enfileirar"
-        case .stopping:  return "Salvando áudio..."
-        case .error:     return "⏺  Tentar novamente"
+        case .idle:      return "Start recording"
+        case .recording: return "Stop and queue"
+        case .stopping:  return "Saving audio..."
+        case .error:     return "Try again"
+        }
+    }
+
+    private var actionIcon: String {
+        switch state.status {
+        case .idle, .error: return "record.circle"
+        case .recording: return "stop.circle"
+        case .stopping: return "hourglass"
         }
     }
 
@@ -220,9 +245,9 @@ struct MenuBarView: View {
 
     private func languageLabel(_ lang: String) -> String {
         switch lang {
-        case "pt":  return "🇧🇷 PT-BR"
-        case "en":  return "🇺🇸 EN"
-        default:    return "🌐 Auto"
+        case "pt":  return "PT"
+        case "en":  return "EN"
+        default:    return "Auto"
         }
     }
 
@@ -241,11 +266,11 @@ struct MenuBarView: View {
     private func jobStatusLabel(_ status: TranscriptionJobStatus) -> String {
         switch status {
         case .queued:
-            return "Aguardando"
+            return "Queued"
         case .running:
-            return "Processando"
+            return "Running"
         case .succeeded:
-            return "Concluída"
+            return "Done"
         case .failed(let message):
             return message
         }
@@ -267,5 +292,12 @@ struct MenuBarView: View {
         case .succeeded: return .green
         case .failed: return .orange
         }
+    }
+
+    private func timeLabel(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.timeStyle = .short
+        formatter.dateStyle = .none
+        return formatter.string(from: date)
     }
 }
