@@ -1,0 +1,32 @@
+# Compiled binaries
+spike/RecordSpike
+MeetingTranscriber/make_icon
+
+# Swift build artifacts
+MeetingTranscriber/.build/
+MeetingTranscriber/MeetingTranscriber.app/
+
+# Generated icon intermediates (regenerated via make_icon.swift + iconutil)
+MeetingTranscriber/Resources/AppIcon.iconset/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# macOS
+.DS_Store
+
+# Docs (não versionados)
+docs/
+
+# Áudios
+*.wav
+*.m4a
+*.mp3
+*.mp4
+tests/fixtures/
+
+# Transcrições
+transcriptions/
+*.transcript.txt

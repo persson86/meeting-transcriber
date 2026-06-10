@@ -1,0 +1,185 @@
+# Meeting Transcriber
+
+Local macOS meeting transcription with separate microphone and system-audio
+tracks.
+
+## Overview
+
+The project has two parts:
+
+- **MeetingTranscriber.app**: a SwiftUI menu bar app that records microphone and
+  system audio at the same time, measures the offset between both tracks, and
+  queues transcription jobs after recording stops.
+- **transcribe_meeting.py**: a Python transcription pipeline that receives one
+  or two `.wav` files, runs Whisper with speech-island chunking, and writes
+  JSONL turns for downstream LLM use. A Markdown transcript is also written by
+  default.
+
+Speaker labels are track based: microphone audio is labeled `Você`, system audio
+is labeled `Interlocutor`. Optional local clustering can split the system track
+into heuristic `Remote_A`, `Remote_B`, etc. labels.
+
+## Requirements
+
+- macOS 13 or newer
+- Python 3.9 or newer
+- BlackHole or another virtual audio device for system-audio capture
+- Apple Silicon is recommended for the default MLX backend
+
+## Setup
+
+```bash
+make setup     # create .venv/ and install pinned Python dependencies
+make test      # run the local test gate
+make app       # build MeetingTranscriber.app
+```
+
+The app defaults to a source checkout at `~/meeting-transcriber`, with Python at
+`.venv/bin/python` and the script at `transcribe_meeting.py`. You can override
+paths without recompiling:
+
+```bash
+defaults write <bundle-id> projectRoot /path/to/meeting-transcriber
+defaults write <bundle-id> pythonPath /path/to/python
+defaults write <bundle-id> scriptPath /path/to/transcribe_meeting.py
+defaults write <bundle-id> defaultOutputDirectory ~/Transcriptions
+defaults write <bundle-id> contextTerms -array "ProjectName" "CustomerName"
+defaults write <bundle-id> maxConcurrentTranscriptions 2
+```
+
+`maxConcurrentTranscriptions` controls how many transcription processes run at
+the same time. The default is `1` to keep the Mac responsive; values above `3`
+are capped.
+
+## Backends
+
+| Backend | Speed | Robustness |
+| --- | --- | --- |
+| `mlx` (default) | Fast on Apple Silicon with Metal | Greedy-only; no beam search |
+| `faster-whisper` | Usually slower on CPU | Supports `beam_size=5`, which can help with noisy audio |
+
+MLX is the default because it is fast on Apple Silicon. For noisy audio,
+overlapping speech, or unstable calls, `--backend faster-whisper` can be more
+conservative at the cost of processing time.
+
+The pipeline also supports meeting-specific vocabulary through `--context-term`,
+`--hotword`, `--replace`, and `--config-json`.
+
+## Menu Bar App
+
+1. Open `MeetingTranscriber.app`.
+2. Click the microphone icon in the macOS menu bar.
+3. Click **Start** to begin recording.
+4. Click **Stop** to save audio and enqueue the transcription.
+5. JSONL and Markdown files are written to the configured output directory.
+
+After a recording stops, the app saves the WAV files, returns to the ready state,
+and keeps processing previous jobs in the background. This lets you start another
+meeting while earlier recordings are still being transcribed.
+
+The menu shows recent jobs as queued, running, completed, or failed. Completed
+jobs can be opened from the menu.
+
+## Processing Queue
+
+Each stopped recording becomes a local transcription job containing the WAV
+paths, language, title, track offset, and output directory. Queued jobs do not
+block new recordings.
+
+Only one job runs by default to reduce CPU, Metal/GPU, memory, and disk
+contention. Increase `maxConcurrentTranscriptions` only after measuring how your
+machine behaves with the selected model.
+
+## CLI Usage
+
+```bash
+python transcribe_meeting.py \
+  --mic mic.wav \
+  --system system.wav \
+  --out ~/Transcriptions \
+  --title "Planning meeting" \
+  --format both \
+  --model medium \
+  --language pt
+```
+
+Main options:
+
+| Flag | Description |
+| --- | --- |
+| `--mic` | Microphone audio track |
+| `--system` | System audio track |
+| `--out` | Output directory |
+| `--title` | Meeting title |
+| `--format` | `both` (default), `jsonl`, `markdown`, `llm`, or `analysis` |
+| `--persona-analysis` | Writes `.analysis.jsonl` with extra context and quality signals |
+| `--language` | `pt` (default), `en`, or `auto` |
+| `--backend` | `mlx` (default) or `faster-whisper` |
+| `--model` | Whisper model for faster-whisper, from `tiny` to `large-v3` |
+| `--sys-offset MS` | System-track offset in milliseconds |
+| `--denoise` | Applies stationary-noise reduction to the microphone track |
+| `--context-term` | Expected vocabulary sent as hotwords |
+| `--hotword` | Proper noun or technical term to reinforce |
+| `--replace SOURCE=TARGET` | Deterministic text replacement |
+| `--no-default-replacements` | Disables built-in generic replacement rules |
+| `--cluster-system-speakers` | Heuristically labels the system track as `Remote_A/B/...` |
+| `--speaker-map L=N,...` | Maps speaker labels to names, for example `Remote_A=Alex` |
+| `--analysis-context KEY=VALUE` | Metadata for analysis output, for example `org=ExampleCo` |
+| `--participant NAME` | Expected participant metadata for analysis output |
+| `--filter-suspect` | Omits suspect turns from JSONL |
+| `--no-sanitize` | Keeps raw suspect text for debugging |
+| `--max-turn-duration SEC` | Maximum consolidated turn duration, default `30` |
+| `--no-meta` | Omits the first JSONL metadata record |
+| `--no-chunk-overlap` | Disables 3-second overlap for continuous speech chunks |
+
+## JSONL Output
+
+Each line is a consolidated turn:
+
+```jsonl
+{"speaker":"Você","text":"Esse e um checkpoint que fazemos toda segunda.","start_ms":186000,"end_ms":191200,"confidence":0.94,"is_suspect":false}
+{"speaker":"Interlocutor","text":"Talvez valha enviar uma atualizacao para o cliente.","start_ms":414000,"end_ms":419800,"confidence":0.87,"is_suspect":false}
+```
+
+`confidence` is derived from `avg_logprob` when the backend exposes it. If no
+confidence is available, the value is `-1.0`. `is_suspect` marks low-confidence
+turns, likely silence, or structurally unlikely text. Strong silence artifacts,
+impossible density, and repetition loops are sanitized to `[inaudível]` by
+default; use `--no-sanitize` to inspect raw output.
+
+## Analysis Output
+
+Use `--persona-analysis` when you want richer metadata for later analysis of
+tone, role, interaction style, or meeting dynamics.
+
+```bash
+python transcribe_meeting.py \
+  --mic mic.wav \
+  --system system.wav \
+  --out ~/Transcriptions \
+  --title "Demo conversation" \
+  --persona-analysis \
+  --analysis-context org=ExampleCo \
+  --analysis-context role=facilitator \
+  --participant Alex \
+  --participant Jordan
+```
+
+## Project Structure
+
+```text
+meeting-transcriber/
+├── transcribe_meeting.py
+├── MeetingTranscriber/
+│   └── Sources/MeetingTranscriber/
+│       ├── MeetingTranscriberApp.swift
+│       ├── MenuBarView.swift
+│       ├── AppState.swift
+│       ├── MicRecorder.swift
+│       ├── SystemAudioRecorder.swift
+│       ├── TranscriptionRunner.swift
+│       ├── AudioUtils.swift
+│       └── NotificationManager.swift
+├── tests/
+└── spike/
+```

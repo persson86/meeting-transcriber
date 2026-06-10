@@ -1,0 +1,13 @@
+# Pinado às versões validadas em produção (2026-06-10).
+# Setup: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+faster-whisper==1.2.1
+mlx-whisper==0.4.3
+noisereduce==3.0.3
+numpy==2.0.2
+scipy==1.13.1
+Resemblyzer==0.1.4
+scikit-learn==1.6.1
+huggingface_hub==1.8.0
+
+# Dev
+pytest==8.4.2
