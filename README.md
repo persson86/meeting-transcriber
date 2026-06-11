@@ -23,7 +23,8 @@ into heuristic `Remote_A`, `Remote_B`, etc. labels.
 
 - macOS 13 or newer
 - Python 3.9 or newer
-- BlackHole or another virtual audio device for system-audio capture
+- Screen & System Audio Recording permission (system audio is captured natively
+  via ScreenCaptureKit; no virtual audio device is required)
 - Apple Silicon is recommended for the default MLX backend
 
 ## Setup
@@ -64,6 +65,23 @@ conservative at the cost of processing time.
 
 The pipeline also supports meeting-specific vocabulary through `--context-term`,
 `--hotword`, `--replace`, and `--config-json`.
+
+## Permissions
+
+On first launch the app asks for **Screen & System Audio Recording** (used only
+to capture system audio) and, on the first recording, **Microphone** access.
+
+If recording fails with a permission error, enable the app in System Settings →
+Privacy & Security → Screen & System Audio Recording and try again. If the app
+does not appear in that list, click the **+** button below the list and select
+`MeetingTranscriber.app`. After changing the permission, restart the app.
+
+Note for source builds: the permission is tied to the app's code signature.
+Ad-hoc signatures change on every build, which makes macOS silently revoke the
+permission and hide the app from the list. Run `make setup-cert` once (in
+`MeetingTranscriber/`) to create a stable self-signed certificate so the
+permission survives rebuilds. If the app got into the hidden/denied state, reset
+it with `tccutil reset ScreenCapture <bundle-id>` and relaunch.
 
 ## Menu Bar App
 
@@ -175,6 +193,7 @@ meeting-transcriber/
 │       ├── MeetingTranscriberApp.swift
 │       ├── MenuBarView.swift
 │       ├── AppState.swift
+│       ├── AppConfig.swift
 │       ├── MicRecorder.swift
 │       ├── SystemAudioRecorder.swift
 │       ├── TranscriptionRunner.swift
