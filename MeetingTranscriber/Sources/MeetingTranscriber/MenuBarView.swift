@@ -161,6 +161,17 @@ struct MenuBarView: View {
                                 }
                                 .buttonStyle(.plain)
                                 .help("Open transcript")
+
+                                if AppConfig.secondBrainPath != nil {
+                                    Button {
+                                        state.sendToSecondBrain(job)
+                                    } label: {
+                                        Image(systemName: job.exportedToSecondBrain ? "checkmark.circle" : "brain")
+                                    }
+                                    .buttonStyle(.plain)
+                                    .disabled(job.exportedToSecondBrain)
+                                    .help(job.exportedToSecondBrain ? "Sent to second brain" : "Send to second brain")
+                                }
                             }
                         }
                     }

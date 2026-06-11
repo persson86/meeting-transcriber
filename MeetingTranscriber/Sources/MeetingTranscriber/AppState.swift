@@ -63,6 +63,7 @@ struct TranscriptionJob: Identifiable, Equatable {
     var startedAt: Date?
     var completedAt: Date?
     var status: TranscriptionJobStatus
+    var exportedToSecondBrain: Bool = false
 }
 
 @MainActor
@@ -279,6 +280,43 @@ final class AppState: ObservableObject {
         transcriptionJobs[index].status = .failed(message)
         transcriptionJobs[index].completedAt = Date()
         scheduleTranscriptionJobs()
+    }
+
+    func sendToSecondBrain(_ job: TranscriptionJob) {
+        guard case .succeeded(let outputURL) = job.status,
+              let root = AppConfig.secondBrainPath,
+              let index = transcriptionJobs.firstIndex(where: { $0.id == job.id }),
+              !transcriptionJobs[index].exportedToSecondBrain else { return }
+
+        let fm = FileManager.default
+        let queueDir = URL(fileURLWithPath: root).appendingPathComponent("queue")
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: queueDir.path, isDirectory: &isDir), isDir.boolValue else {
+            status = .error("Pasta queue/ do second-brain não encontrada em \(queueDir.path)")
+            return
+        }
+
+        let ts = Int(Date().timeIntervalSince1970)
+        let base = outputURL.deletingPathExtension()
+        let slug = base.lastPathComponent
+
+        do {
+            var copied = 0
+            for ext in ["md", "jsonl"] {
+                let source = base.appendingPathExtension(ext)
+                guard fm.fileExists(atPath: source.path) else { continue }
+                let destination = queueDir.appendingPathComponent("\(ts)-meeting-\(slug).\(ext)")
+                try fm.copyItem(at: source, to: destination)
+                copied += 1
+            }
+            guard copied > 0 else {
+                status = .error("Nenhum arquivo de transcrição encontrado para enviar")
+                return
+            }
+            transcriptionJobs[index].exportedToSecondBrain = true
+        } catch {
+            status = .error("Falha ao enviar para o second-brain: \(error.localizedDescription)")
+        }
     }
 
     func setOutputDirectory(_ url: URL) {

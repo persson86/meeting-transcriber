@@ -7,6 +7,7 @@ import Foundation
 ///   defaults write <bundle-id> defaultOutputDirectory /path/to/output
 ///   defaults write <bundle-id> contextTerms -array "ProjectName" "CustomerName"
 ///   defaults write <bundle-id> maxConcurrentTranscriptions 2
+///   defaults write <bundle-id> secondBrainPath /path/to/second-brain
 enum AppConfig {
     static var projectRoot: String {
         if let configured = UserDefaults.standard.string(forKey: "projectRoot"), !configured.isEmpty {
@@ -69,5 +70,12 @@ enum AppConfig {
         let value = UserDefaults.standard.integer(forKey: "maxConcurrentTranscriptions")
         guard value > 0 else { return 1 }
         return min(value, 3)
+    }
+
+    /// Pasta raiz do second-brain. Se não setada, a integração fica invisível na UI.
+    static var secondBrainPath: String? {
+        guard let configured = UserDefaults.standard.string(forKey: "secondBrainPath"),
+              !configured.isEmpty else { return nil }
+        return NSString(string: configured).expandingTildeInPath
     }
 }
