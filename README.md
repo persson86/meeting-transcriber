@@ -199,6 +199,5 @@ meeting-transcriber/
 │       ├── TranscriptionRunner.swift
 │       ├── AudioUtils.swift
 │       └── NotificationManager.swift
-├── tests/
-└── spike/
+└── tests/
 ```

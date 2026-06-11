@@ -302,7 +302,7 @@ class TranscribeMeetingTests(unittest.TestCase):
             SimpleNamespace(
                 start=0.0,
                 end=1.0,
-                text=" Pearson Pearson Pearson Pearson Pearson Pearson agora segue.",
+                text=" Ferreira Ferreira Ferreira Ferreira Ferreira Ferreira agora segue.",
             ),
             SimpleNamespace(
                 start=2.0,
@@ -313,7 +313,7 @@ class TranscribeMeetingTests(unittest.TestCase):
 
         segments = tm.collect_segments(raw_segments, "Interlocutor", 0.0, config)
 
-        self.assertEqual(segments[0].text, "Pearson agora segue.")
+        self.assertEqual(segments[0].text, "Ferreira agora segue.")
         self.assertEqual(segments[1].text, "thumbs down ok.")
 
     def test_collect_segments_sanitizes_intraword_runaways_before_laughter(self):
@@ -651,19 +651,19 @@ class TranscribeMeetingTests(unittest.TestCase):
         self.assertEqual(segments[1].speaker, "Remote_B")
 
     def test_normalize_known_names_corrects_similar_token(self):
-        # "Perssón" (accent typo, ~92% similar) and "Person" (~92%) should be replaced
-        for variant in ("Perssón", "Person", "Perssão"):
+        # "Ferreirá" (accent typo, ~88% similar) and "Fereira" (~93%) should be replaced
+        for variant in ("Ferreirá", "Fereira", "Ferrera"):
             with self.subTest(variant=variant):
-                result = tm.normalize_known_names(f"Então o {variant} falou isso", ["Persson"])
-                self.assertIn("Persson", result, f"Expected {variant!r} → Persson")
+                result = tm.normalize_known_names(f"Então o {variant} falou isso", ["Ferreira"])
+                self.assertIn("Ferreira", result, f"Expected {variant!r} → Ferreira")
 
     def test_normalize_known_names_leaves_dissimilar_tokens_alone(self):
-        result = tm.normalize_known_names("Isso é muito bom", ["Persson"])
+        result = tm.normalize_known_names("Isso é muito bom", ["Ferreira"])
         self.assertEqual(result, "Isso é muito bom")
 
     def test_normalize_known_names_ignores_short_tokens(self):
         # Short tokens (< 4 chars) should not be touched even if similar
-        result = tm.normalize_known_names("por", ["Persson"])
+        result = tm.normalize_known_names("por", ["Ferreira"])
         self.assertEqual(result, "por")
 
     def test_consolidate_turns_respects_max_turn_duration(self):

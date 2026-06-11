@@ -241,7 +241,7 @@ def normalize_known_names(text: str, known_names: list[str], threshold: float = 
 
 
 def collapse_repeated_ngrams(text: str, min_repeats: int = 5, max_ngram: int = 4) -> str:
-    """Colapsa loops como "Pearson Pearson..." ou "thumbs down thumbs down..."."""
+    """Colapsa loops como "Ferreira Ferreira..." ou "thumbs down thumbs down..."."""
     token_re = re.compile(r"\b\w+\b", flags=re.UNICODE)
 
     for ngram_size in range(max_ngram, 0, -1):
