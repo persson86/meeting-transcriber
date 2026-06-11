@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import CoreGraphics
 
 enum RecordingStatus {
     case idle
@@ -124,6 +125,12 @@ final class AppState: ObservableObject {
 
     func startRecording() {
         guard status.canStartRecording else { return }
+
+        if !CGPreflightScreenCaptureAccess() {
+            CGRequestScreenCaptureAccess()
+            status = .error("Permissão de gravação de tela necessária. Ative o Meeting Transcriber em Configurações do Sistema → Privacidade e Segurança → Gravação de Tela e Áudio do Sistema, depois tente novamente.")
+            return
+        }
 
         Task {
             do {

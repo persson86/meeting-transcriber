@@ -1,5 +1,6 @@
 import SwiftUI
 import UserNotifications
+import CoreGraphics
 
 @main
 struct MeetingTranscriberApp: App {
@@ -7,10 +8,11 @@ struct MeetingTranscriberApp: App {
 
     init() {
         NotificationManager.shared.requestAuthorization()
-        // Ensure output directory exists
         let dir = UserDefaults.standard.url(forKey: "outputDirectory")
             ?? AppConfig.defaultOutputDirectory
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // Defer until after NSApplication is ready so TCC can register the app bundle
+        DispatchQueue.main.async { CGRequestScreenCaptureAccess() }
     }
 
     var body: some Scene {

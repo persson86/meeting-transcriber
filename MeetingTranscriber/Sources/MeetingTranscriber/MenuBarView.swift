@@ -54,16 +54,28 @@ struct MenuBarView: View {
                     Text(msg)
                         .font(.caption)
                         .foregroundColor(.orange)
-                        .lineLimit(3)
+                        .lineLimit(4)
                         .fixedSize(horizontal: false, vertical: true)
 
-                    Button {
-                        state.resetError()
-                    } label: {
-                        Label("Clear error", systemImage: "xmark.circle")
-                    }
+                    HStack(spacing: 12) {
+                        Button {
+                            state.resetError()
+                        } label: {
+                            Label("Limpar", systemImage: "xmark.circle")
+                        }
                         .buttonStyle(.link)
                         .font(.caption)
+
+                        if msg.contains("ermissão") || msg.contains("ermission") {
+                            Button {
+                                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
+                            } label: {
+                                Label("Abrir Configurações", systemImage: "gear")
+                            }
+                            .buttonStyle(.link)
+                            .font(.caption)
+                        }
+                    }
 
                 } else {
                     // Recording / stopping — show read-only info
