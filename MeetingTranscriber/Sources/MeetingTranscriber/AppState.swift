@@ -126,12 +126,6 @@ final class AppState: ObservableObject {
     func startRecording() {
         guard status.canStartRecording else { return }
 
-        if !CGPreflightScreenCaptureAccess() {
-            CGRequestScreenCaptureAccess()
-            status = .error("Permissão de gravação de tela necessária. Ative o Meeting Transcriber em Configurações do Sistema → Privacidade e Segurança → Gravação de Tela e Áudio do Sistema, depois tente novamente.")
-            return
-        }
-
         Task {
             do {
                 let dir = FileManager.default.temporaryDirectory
@@ -150,7 +144,13 @@ final class AppState: ObservableObject {
                 status = .recording
 
             } catch {
-                status = .error(error.localizedDescription)
+                let msg = error.localizedDescription
+                if msg.contains("declined") || msg.contains("not authorized") || msg.contains("userDeclined") {
+                    CGRequestScreenCaptureAccess()
+                    status = .error("Permissão de gravação de tela necessária. Ative o Meeting Transcriber em Configurações do Sistema → Privacidade e Segurança → Gravação de Tela e Áudio do Sistema, depois tente novamente.")
+                } else {
+                    status = .error(msg)
+                }
             }
         }
     }
