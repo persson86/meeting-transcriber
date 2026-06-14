@@ -5,8 +5,9 @@ CONTENTS = $(BUNDLE)/Contents
 # Use named cert (stable identity → TCC remembers permissions between builds)
 # Run 'make setup-cert' once if not created yet
 SIGN_ID  = MeetingTranscriber Dev Signing
+OPEN_APP ?= 1
 
-.PHONY: build run clean setup-cert
+.PHONY: build install run clean setup-cert
 
 build:
 	swift build -c release 2>&1
@@ -36,7 +37,7 @@ install: build
 	@/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
 		-f ~/Applications/$(BUNDLE) 2>/dev/null || true
 	@sleep 0.5
-	@open ~/Applications/$(BUNDLE)
+	@if [ "$(OPEN_APP)" = "1" ]; then open ~/Applications/$(BUNDLE); fi
 	@echo "✓ Installed to ~/Applications/$(BUNDLE)"
 
 run: build

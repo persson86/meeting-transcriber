@@ -29,10 +29,25 @@ into heuristic `Remote_A`, `Remote_B`, etc. labels.
 
 ## Setup
 
+Create or open the folder where the checkout and transcripts should live, then
+run the installer from there:
+
 ```bash
-make setup     # create .venv/ and install pinned Python dependencies
+mkdir -p ~/Transcricoes
+cd ~/Transcricoes
+curl -fsSL https://raw.githubusercontent.com/persson86/meeting-transcriber/main/install.sh | bash
+```
+
+The installer creates or updates `./meeting-transcriber`, creates
+`./transcriptions`, installs Python dependencies, builds the menu bar app,
+copies it to `~/Applications/MeetingTranscriber.app`, configures the app to use
+those local paths, and opens it.
+
+For a local checkout, run:
+
+```bash
+make install   # install dependencies, app, and local output paths
 make test      # run the local test gate
-make app       # build MeetingTranscriber.app
 ```
 
 The app defaults to a source checkout at `~/meeting-transcriber`, with Python at
