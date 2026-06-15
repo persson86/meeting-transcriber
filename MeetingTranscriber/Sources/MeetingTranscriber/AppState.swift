@@ -289,11 +289,17 @@ final class AppState: ObservableObject {
               !transcriptionJobs[index].exportedToSecondBrain else { return }
 
         let fm = FileManager.default
-        let queueDir = URL(fileURLWithPath: root).appendingPathComponent("queue")
+        let queueDir = URL(fileURLWithPath: root)
+            .appendingPathComponent("queue")
+            .appendingPathComponent("transcricoes")
         var isDir: ObjCBool = false
-        guard fm.fileExists(atPath: queueDir.path, isDirectory: &isDir), isDir.boolValue else {
-            status = .error("Pasta queue/ do second-brain não encontrada em \(queueDir.path)")
-            return
+        if !fm.fileExists(atPath: queueDir.path, isDirectory: &isDir) || !isDir.boolValue {
+            do {
+                try fm.createDirectory(at: queueDir, withIntermediateDirectories: true)
+            } catch {
+                status = .error("Não foi possível criar queue/transcricoes/: \(error.localizedDescription)")
+                return
+            }
         }
 
         let ts = Int(Date().timeIntervalSince1970)
