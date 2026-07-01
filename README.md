@@ -61,11 +61,33 @@ defaults write <bundle-id> scriptPath /path/to/transcribe_meeting.py
 defaults write <bundle-id> defaultOutputDirectory ~/Transcriptions
 defaults write <bundle-id> contextTerms -array "ProjectName" "CustomerName"
 defaults write <bundle-id> maxConcurrentTranscriptions 2
+defaults write <bundle-id> lowMemoryMode -bool YES
+defaults write <bundle-id> mlxModel mlx-community/whisper-large-v3-turbo
+defaults write <bundle-id> transcriptionBackend mlx
+defaults write <bundle-id> debugMemoryLogging -bool YES
 ```
 
 `maxConcurrentTranscriptions` controls how many transcription processes run at
 the same time. The default is `1` to keep the Mac responsive; values above `3`
 are capped.
+
+### Low memory / responsiveness
+
+The default MLX model (`whisper-large-v3` fp16) is the biggest single memory
+consumer (~3 GB resident, 4–6 GB sustained under unified memory). On a 16 GB Mac
+that pressure is what makes the machine sluggish once transcription starts.
+
+- `lowMemoryMode -bool YES` — switches to a smaller multilingual model
+  (`whisper-large-v3-turbo`) that roughly halves memory and time with minimal
+  quality loss. The first run downloads the model.
+- `mlxModel <hf-repo>` — pin any specific MLX repo (an explicit value wins over
+  `lowMemoryMode`). Point it at a quantized repo (8-bit ≈ 1.6 GB, 4-bit ≈ 1 GB)
+  to keep the full model at lower precision — `mlx_whisper` applies the repo's
+  `config.json` quantization automatically.
+- Without either key, behavior is unchanged (`large-v3` fp16, maximum quality).
+- `debugMemoryLogging -bool YES` — logs PID, track sizes, and concurrency to
+  Console; pair with the CLI `--profile-memory` flag (RSS per phase on stderr) to
+  measure before changing the default.
 
 ## Backends
 
@@ -90,6 +112,12 @@ If recording fails with a permission error, enable the app in System Settings �
 Privacy & Security → Screen & System Audio Recording and try again. If the app
 does not appear in that list, click the **+** button below the list and select
 `MeetingTranscriber.app`. After changing the permission, restart the app.
+
+If only one track is captured — for example the microphone stops after an audio
+device/route change mid-meeting — the app shows a warning and still transcribes
+the track it has, instead of silently producing an incomplete transcript. The
+recorder also re-arms the microphone tap on device/route changes to avoid losing
+the track in the first place.
 
 Note for source builds: the permission is tied to the app's code signature.
 Ad-hoc signatures change on every build, which makes macOS silently revoke the
@@ -164,6 +192,7 @@ Main options:
 | `--max-turn-duration SEC` | Maximum consolidated turn duration, default `30` |
 | `--no-meta` | Omits the first JSONL metadata record |
 | `--no-chunk-overlap` | Disables 3-second overlap for continuous speech chunks |
+| `--profile-memory` | Prints RSS per phase to stderr for memory diagnostics (off by default) |
 
 ## JSONL Output
 

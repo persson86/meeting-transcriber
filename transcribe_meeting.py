@@ -10,7 +10,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
+import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -44,6 +47,23 @@ PIPELINE_VERSION = "0.6.0"
 DEFAULT_HOTWORD_LIMIT = 60
 PROMPT_TAIL_MAX_CHARS = 240
 RUNAWAY_UNICODE_MIN_REPEATS = 8
+
+
+# ---------------------------------------------------------------------------
+# Memory profiling (opt-in via --profile-memory; logs vão para stderr para não
+# poluir a linha "Output:" do stdout que o app Swift parseia)
+# ---------------------------------------------------------------------------
+
+def _rss_mb() -> float:
+    """RSS do processo atual em MB. Usa `ps` para evitar ambiguidade de unidade
+    do resource.ru_maxrss entre plataformas."""
+    out = subprocess.check_output(["ps", "-o", "rss=", "-p", str(os.getpid())])
+    return int(out) / 1024.0
+
+
+def _mem(tag: str, enabled: bool) -> None:
+    if enabled:
+        print(f"[mem] {tag} rss={_rss_mb():.0f}MB", file=sys.stderr, flush=True)
 
 
 @dataclass
@@ -897,6 +917,7 @@ def transcribe_track(
     denoise: bool = False,
     chunk_by_silence: bool = True,
     chunk_overlap: bool = True,
+    profile_memory: bool = False,
 ) -> list[Segment]:
     config = config or TranscriptionConfig()
 
@@ -929,8 +950,11 @@ def transcribe_track(
         print(f"    {len(segments)} segments, {round(info.duration, 1)}s audio", flush=True)
         return segments
 
+    _mem("load-audio-before", profile_memory)
     audio = audio_input if isinstance(audio_input, np.ndarray) else load_audio(audio_path)
+    _mem("load-audio-after", profile_memory)
     islands = detect_speech_islands(audio)
+    _mem("detect-islands-after", profile_memory)
     if not islands:
         print(f"    0 speech islands, {round(len(audio) / SAMPLE_RATE, 1)}s audio", flush=True)
         return []
@@ -975,6 +999,8 @@ def transcribe_track(
             dropped = 0
         segments.extend(chunk_segments)
         covered_until_sec = end_sample / SAMPLE_RATE
+        if profile_memory and i % 10 == 0:
+            _mem(f"chunk-{i}/{len(chunks)}", profile_memory)
 
         overlap_note = ""
         if use_overlap:
@@ -1573,6 +1599,10 @@ def main() -> None:
         "--no-chunk-overlap", action="store_true",
         help="Desliga o overlap de 3s entre chunks contínuos (comportamento antigo)",
     )
+    parser.add_argument(
+        "--profile-memory", action="store_true",
+        help="Imprime RSS por fase no stderr para diagnóstico de memória (off por default)",
+    )
     chunk_group = parser.add_mutually_exclusive_group()
     chunk_group.add_argument(
         "--chunk-by-silence", dest="chunk_by_silence", action="store_true", default=True,
@@ -1583,6 +1613,7 @@ def main() -> None:
         help="Modo antigo: transcreve a trilha inteira de uma vez",
     )
     args = parser.parse_args()
+    _mem("process-start", args.profile_memory)
 
     if not args.mic and not args.system:
         parser.error("Pelo menos um de --mic ou --system é obrigatório")
@@ -1613,6 +1644,7 @@ def main() -> None:
         from faster_whisper import WhisperModel
         print(f"  Loading Whisper model '{args.model}'...", flush=True)
         model = WhisperModel(args.model, device="auto", compute_type="auto")
+    _mem("model-loaded", args.profile_memory)
 
     segments: list[Segment] = []
     dual_track = bool(args.mic and args.system)
@@ -1628,7 +1660,9 @@ def main() -> None:
             denoise=args.denoise,    # OFF por default — bleed de fala não é ruído estacionário
             chunk_by_silence=args.chunk_by_silence,
             chunk_overlap=not args.no_chunk_overlap,
+            profile_memory=args.profile_memory,
         ))
+        _mem("mic-track-done", args.profile_memory)
 
     if args.system:
         speaker = "Interlocutor" if dual_track else ""
@@ -1639,10 +1673,14 @@ def main() -> None:
             denoise=False,
             chunk_by_silence=args.chunk_by_silence,
             chunk_overlap=not args.no_chunk_overlap,
+            profile_memory=args.profile_memory,
         ))
+        _mem("system-track-done", args.profile_memory)
 
     if args.cluster_system_speakers and args.system and dual_track:
+        _mem("relabel-before", args.profile_memory)
         relabel_system_speakers(segments, load_audio(args.system), sys_offset_sec)
+        _mem("relabel-after", args.profile_memory)
 
     segments.sort(key=lambda s: s.start)
 

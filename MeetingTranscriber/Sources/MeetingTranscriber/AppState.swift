@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import CoreGraphics
+import AVFoundation
 
 enum RecordingStatus {
     case idle
@@ -70,6 +71,7 @@ struct TranscriptionJob: Identifiable, Equatable {
 final class AppState: ObservableObject {
     @Published var status: RecordingStatus = .idle
     @Published var meetingTitle: String = ""
+    @Published var lastWarning: String?
     @Published var lastOutputURL: URL?
     @Published var outputDirectory: URL
     @Published var language: String  // "pt" | "en" | "auto"
@@ -100,6 +102,8 @@ final class AppState: ObservableObject {
         runningTranscriptionCount + queuedTranscriptionCount
     }
 
+    var hasActiveTranscription: Bool { activeTranscriptionCount > 0 }
+
     var maxConcurrentTranscriptionCount: Int {
         maxConcurrentTranscriptions
     }
@@ -126,9 +130,21 @@ final class AppState: ObservableObject {
 
     func startRecording() {
         guard status.canStartRecording else { return }
+        lastWarning = nil
+
+        // Não bloqueia gravar a próxima reunião, mas avisa: transcrição + nova
+        // captura ao mesmo tempo é o pior caso de memória neste Mac.
+        if hasActiveTranscription {
+            lastWarning = "Transcrição em andamento — gravar agora aumenta o uso de memória (o app processa uma por vez). A gravação continua normalmente."
+        }
 
         Task {
             do {
+                guard await ensureMicrophoneAccess() else {
+                    status = .error("Permissão de microfone necessária. Ative o Meeting Transcriber em Configurações do Sistema → Privacidade e Segurança → Microfone, depois tente novamente.")
+                    return
+                }
+
                 let dir = FileManager.default.temporaryDirectory
                     .appendingPathComponent("meeting-\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString)")
                 try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -193,6 +209,20 @@ final class AppState: ObservableObject {
                     )
                 }
 
+                // Apenas uma trilha foi capturada: transcreve o que temos, mas avisa
+                // em vez de gerar um transcript incompleto em silêncio.
+                if recordedMicURL == nil {
+                    warn("Sua voz (microfone) não foi capturada nesta reunião — só o áudio do sistema foi salvo. Verifique o dispositivo de entrada e a permissão do microfone antes da próxima gravação.")
+                } else if recordedSystemURL == nil {
+                    warn("O áudio do sistema (interlocutor) não foi capturado — só a sua voz foi salva. Verifique a permissão de Gravação de Tela e Áudio do Sistema.")
+                }
+
+                if AppConfig.debugMemoryLogging {
+                    let micKB = (recordedMicURL.flatMap { try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize } ?? 0) / 1024
+                    let sysKB = (recordedSystemURL.flatMap { try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize } ?? 0) / 1024
+                    NSLog("[mem] tracks saved mic=%dKB system=%dKB", micKB, sysKB)
+                }
+
                 // Calcula offset real entre trilhas a partir do primeiro buffer de cada uma.
                 // sysOffsetMs > 0: sistema iniciou depois do mic → timestamps do sistema adiantados.
                 let sysOffsetMs = Self.computeOffsetMs(
@@ -227,6 +257,30 @@ final class AppState: ObservableObject {
 
     func resetError() {
         if case .error = status { status = .idle }
+    }
+
+    func clearWarning() {
+        lastWarning = nil
+    }
+
+    private func warn(_ message: String) {
+        lastWarning = message
+        NotificationManager.shared.notifyWarning(message)
+    }
+
+    /// Garante acesso ao microfone antes de gravar. Sem isso, o AVAudioEngine pode
+    /// iniciar e não entregar nenhum buffer, produzindo uma trilha vazia em silêncio.
+    private func ensureMicrophoneAccess() async -> Bool {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            return true
+        case .notDetermined:
+            return await AVCaptureDevice.requestAccess(for: .audio)
+        case .denied, .restricted:
+            return false
+        @unknown default:
+            return false
+        }
     }
 
     private func scheduleTranscriptionJobs() {

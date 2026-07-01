@@ -78,4 +78,42 @@ enum AppConfig {
               !configured.isEmpty else { return nil }
         return NSString(string: configured).expandingTildeInPath
     }
+
+    // MARK: - Modelo de transcrição (memória)
+
+    /// Modelo MLX menor para o modo de baixa memória. Multilíngue (bom p/ PT-BR),
+    /// decoder podado — ~metade da memória/tempo do large-v3 fp16 com perda mínima.
+    static let lowMemoryMlxModel = "mlx-community/whisper-large-v3-turbo"
+
+    /// Override explícito do modelo MLX. nil = usa o default da CLI (large-v3 fp16).
+    ///   defaults write <bundle-id> mlxModel mlx-community/whisper-large-v3-turbo
+    static var mlxModel: String? {
+        guard let v = UserDefaults.standard.string(forKey: "mlxModel"), !v.isEmpty else { return nil }
+        return v
+    }
+
+    /// Override explícito do backend. nil = default da CLI (mlx).
+    static var transcriptionBackend: String? {
+        guard let v = UserDefaults.standard.string(forKey: "transcriptionBackend"), !v.isEmpty else { return nil }
+        return v
+    }
+
+    /// Modo de baixa memória: sem um mlxModel explícito, aponta para o modelo menor.
+    ///   defaults write <bundle-id> lowMemoryMode -bool YES
+    static var lowMemoryMode: Bool {
+        UserDefaults.standard.bool(forKey: "lowMemoryMode")
+    }
+
+    /// Modelo MLX efetivo passado à CLI: override explícito > low-memory > default da CLI (nil).
+    static var effectiveMlxModel: String? {
+        if let m = mlxModel { return m }
+        if lowMemoryMode { return lowMemoryMlxModel }
+        return nil
+    }
+
+    /// Liga logs de diagnóstico de memória no lado Swift (PID, tamanhos, concorrência).
+    ///   defaults write <bundle-id> debugMemoryLogging -bool YES
+    static var debugMemoryLogging: Bool {
+        UserDefaults.standard.bool(forKey: "debugMemoryLogging")
+    }
 }

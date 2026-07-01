@@ -20,6 +20,23 @@ enum TranscriptionError: LocalizedError {
     }
 }
 
+/// Acumula stdout/stderr do processo Python de forma thread-safe enquanto os
+/// readabilityHandlers dos pipes disparam em filas de background.
+private final class PipeDrain: @unchecked Sendable {
+    private let lock = NSLock()
+    private var out = Data()
+    private var err = Data()
+
+    func appendOut(_ d: Data) { lock.withLock { out.append(d) } }
+    func appendErr(_ d: Data) { lock.withLock { err.append(d) } }
+
+    func strings() -> (String, String) {
+        lock.withLock {
+            (String(data: out, encoding: .utf8) ?? "", String(data: err, encoding: .utf8) ?? "")
+        }
+    }
+}
+
 final class TranscriptionRunner {
     private let python = AppConfig.pythonPath
     private let script = AppConfig.scriptPath
@@ -49,6 +66,8 @@ final class TranscriptionRunner {
             }
             if let mic = micURL { args += ["--mic", mic.path] }
             if let sys = systemURL { args += ["--system", sys.path] }
+            if let model = AppConfig.effectiveMlxModel { args += ["--mlx-model", model] }
+            if let backend = AppConfig.transcriptionBackend { args += ["--backend", backend] }
 
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: python)
@@ -59,9 +78,26 @@ final class TranscriptionRunner {
             proc.standardOutput = outPipe
             proc.standardError = errPipe
 
+            // Drena os pipes em streaming em vez de só no fim: se o Python emitir mais
+            // que o buffer do pipe (~64 KB) antes de sair, ler tudo no término trava.
+            let drain = PipeDrain()
+            outPipe.fileHandleForReading.readabilityHandler = { fh in
+                let d = fh.availableData
+                if d.isEmpty { fh.readabilityHandler = nil; return }
+                drain.appendOut(d)
+            }
+            errPipe.fileHandleForReading.readabilityHandler = { fh in
+                let d = fh.availableData
+                if d.isEmpty { fh.readabilityHandler = nil; return }
+                drain.appendErr(d)
+            }
+
             proc.terminationHandler = { p in
-                let stdout = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-                let stderr = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                outPipe.fileHandleForReading.readabilityHandler = nil
+                errPipe.fileHandleForReading.readabilityHandler = nil
+                drain.appendOut(outPipe.fileHandleForReading.readDataToEndOfFile())
+                drain.appendErr(errPipe.fileHandleForReading.readDataToEndOfFile())
+                let (stdout, stderr) = drain.strings()
 
                 if p.terminationStatus == 0 {
                     let path = stdout.components(separatedBy: "\n")
@@ -84,6 +120,11 @@ final class TranscriptionRunner {
 
             do {
                 try proc.run()
+                if AppConfig.debugMemoryLogging {
+                    let model = AppConfig.effectiveMlxModel ?? "(CLI default)"
+                    NSLog("[mem] python pid=%d maxConcurrent=%d model=%@",
+                          proc.processIdentifier, AppConfig.maxConcurrentTranscriptions, model)
+                }
             } catch {
                 continuation.resume(throwing: error)
             }

@@ -26,6 +26,32 @@ struct MenuBarView: View {
 
             Divider()
 
+            // ── Warning banner (partial capture) ──────────────────────────
+            if let warning = state.lastWarning {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                    Text(warning)
+                        .font(.caption2)
+                        .foregroundColor(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 4)
+                    Button {
+                        state.clearWarning()
+                    } label: {
+                        Image(systemName: "xmark.circle")
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundColor(.secondary)
+                    .help("Dispensar aviso")
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+
+                Divider()
+            }
+
             // ── Idle / active content ─────────────────────────────────────
             VStack(alignment: .leading, spacing: 8) {
 
@@ -68,7 +94,10 @@ struct MenuBarView: View {
 
                         if msg.contains("ermissão") || msg.contains("ermission") {
                             Button {
-                                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
+                                let pane = (msg.contains("icrofone") || msg.contains("icrophone"))
+                                    ? "Privacy_Microphone"
+                                    : "Privacy_ScreenCapture"
+                                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?\(pane)")!)
                             } label: {
                                 Label("Abrir Configurações", systemImage: "gear")
                             }
