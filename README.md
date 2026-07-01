@@ -61,8 +61,7 @@ defaults write <bundle-id> scriptPath /path/to/transcribe_meeting.py
 defaults write <bundle-id> defaultOutputDirectory ~/Transcriptions
 defaults write <bundle-id> contextTerms -array "ProjectName" "CustomerName"
 defaults write <bundle-id> maxConcurrentTranscriptions 2
-defaults write <bundle-id> lowMemoryMode -bool YES
-defaults write <bundle-id> mlxModel mlx-community/whisper-large-v3-turbo
+defaults write <bundle-id> mlxModel mlx-community/whisper-large-v3-mlx
 defaults write <bundle-id> transcriptionBackend mlx
 defaults write <bundle-id> debugMemoryLogging -bool YES
 ```
@@ -71,23 +70,32 @@ defaults write <bundle-id> debugMemoryLogging -bool YES
 the same time. The default is `1` to keep the Mac responsive; values above `3`
 are capped.
 
-### Low memory / responsiveness
+### Model / memory
 
-The default MLX model (`whisper-large-v3` fp16) is the biggest single memory
-consumer (~3 GB resident, 4–6 GB sustained under unified memory). On a 16 GB Mac
-that pressure is what makes the machine sluggish once transcription starts.
+The MLX model is the biggest single memory consumer, and on a 16 GB Mac that
+pressure is what makes the machine sluggish once transcription starts. The app
+defaults to **`whisper-large-v3` 4-bit**, chosen from a real PT-BR benchmark on
+an M3 (16 GB):
 
-- `lowMemoryMode -bool YES` — switches to a smaller multilingual model
-  (`whisper-large-v3-turbo`) that roughly halves memory and time with minimal
-  quality loss. The first run downloads the model.
-- `mlxModel <hf-repo>` — pin any specific MLX repo (an explicit value wins over
-  `lowMemoryMode`). Point it at a quantized repo (8-bit ≈ 1.6 GB, 4-bit ≈ 1 GB)
-  to keep the full model at lower precision — `mlx_whisper` applies the repo's
-  `config.json` quantization automatically.
-- Without either key, behavior is unchanged (`large-v3` fp16, maximum quality).
-- `debugMemoryLogging -bool YES` — logs PID, track sizes, and concurrency to
-  Console; pair with the CLI `--profile-memory` flag (RSS per phase on stderr) to
-  measure before changing the default.
+| Model | Peak MLX memory | Time | Quality vs fp16 |
+| --- | --- | --- | --- |
+| `large-v3` fp16 | 3677 MB | baseline | reference |
+| `large-v3` 8-bit | 2451 MB (−33%) | +30% | identical |
+| `large-v3-turbo` | 2189 MB (−40%) | −31% | comparable, drifts more on names/terms |
+| **`large-v3` 4-bit (default)** | **1717 MB (−53%)** | +21% | near-identical (0.984) |
+
+4-bit roughly halves model memory with no meaningful quality loss (the extra time
+runs in the background queue). Override with `mlxModel`:
+
+- Maximum quality: `mlxModel mlx-community/whisper-large-v3-mlx` (fp16).
+- Fastest: `mlxModel mlx-community/whisper-large-v3-turbo` (accepts a small
+  quality drop on proper nouns).
+- Any quantized repo works — `mlx_whisper` applies the repo's `config.json`
+  quantization automatically. The first run downloads the model.
+
+`debugMemoryLogging -bool YES` logs PID, track sizes, and concurrency to Console;
+pair with the CLI `--profile-memory` flag (RSS per phase plus the real MLX peak on
+stderr) to measure before changing the model.
 
 ## Backends
 

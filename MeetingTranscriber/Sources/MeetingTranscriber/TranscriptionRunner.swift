@@ -66,7 +66,7 @@ final class TranscriptionRunner {
             }
             if let mic = micURL { args += ["--mic", mic.path] }
             if let sys = systemURL { args += ["--system", sys.path] }
-            if let model = AppConfig.effectiveMlxModel { args += ["--mlx-model", model] }
+            args += ["--mlx-model", AppConfig.mlxModel]
             if let backend = AppConfig.transcriptionBackend { args += ["--backend", backend] }
 
             let proc = Process()
@@ -121,9 +121,8 @@ final class TranscriptionRunner {
             do {
                 try proc.run()
                 if AppConfig.debugMemoryLogging {
-                    let model = AppConfig.effectiveMlxModel ?? "(CLI default)"
                     NSLog("[mem] python pid=%d maxConcurrent=%d model=%@",
-                          proc.processIdentifier, AppConfig.maxConcurrentTranscriptions, model)
+                          proc.processIdentifier, AppConfig.maxConcurrentTranscriptions, AppConfig.mlxModel)
                 }
             } catch {
                 continuation.resume(throwing: error)

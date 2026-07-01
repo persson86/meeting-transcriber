@@ -81,34 +81,24 @@ enum AppConfig {
 
     // MARK: - Modelo de transcrição (memória)
 
-    /// Modelo MLX menor para o modo de baixa memória. Multilíngue (bom p/ PT-BR),
-    /// decoder podado — ~metade da memória/tempo do large-v3 fp16 com perda mínima.
-    static let lowMemoryMlxModel = "mlx-community/whisper-large-v3-turbo"
+    /// Default otimizado para memória: large-v3 4-bit. Benchmark PT-BR real (M3 16GB):
+    /// pico MLX 1717 MB vs 3677 MB do fp16 (−53%), qualidade ≈ idêntica (0,984; chega
+    /// a acertar nomes que o fp16 errou). Custa ~+21% de tempo, que roda em background.
+    /// Override via `mlxModel` para qualidade máxima (`mlx-community/whisper-large-v3-mlx`)
+    /// ou velocidade (`mlx-community/whisper-large-v3-turbo`, ~−31% tempo, leve perda).
+    static let defaultMlxModel = "mlx-community/whisper-large-v3-mlx-4bit"
 
-    /// Override explícito do modelo MLX. nil = usa o default da CLI (large-v3 fp16).
-    ///   defaults write <bundle-id> mlxModel mlx-community/whisper-large-v3-turbo
-    static var mlxModel: String? {
-        guard let v = UserDefaults.standard.string(forKey: "mlxModel"), !v.isEmpty else { return nil }
-        return v
+    /// Modelo MLX efetivo. Override explícito vence; senão, o default otimizado.
+    ///   defaults write <bundle-id> mlxModel mlx-community/whisper-large-v3-mlx
+    static var mlxModel: String {
+        if let v = UserDefaults.standard.string(forKey: "mlxModel"), !v.isEmpty { return v }
+        return defaultMlxModel
     }
 
     /// Override explícito do backend. nil = default da CLI (mlx).
     static var transcriptionBackend: String? {
         guard let v = UserDefaults.standard.string(forKey: "transcriptionBackend"), !v.isEmpty else { return nil }
         return v
-    }
-
-    /// Modo de baixa memória: sem um mlxModel explícito, aponta para o modelo menor.
-    ///   defaults write <bundle-id> lowMemoryMode -bool YES
-    static var lowMemoryMode: Bool {
-        UserDefaults.standard.bool(forKey: "lowMemoryMode")
-    }
-
-    /// Modelo MLX efetivo passado à CLI: override explícito > low-memory > default da CLI (nil).
-    static var effectiveMlxModel: String? {
-        if let m = mlxModel { return m }
-        if lowMemoryMode { return lowMemoryMlxModel }
-        return nil
     }
 
     /// Liga logs de diagnóstico de memória no lado Swift (PID, tamanhos, concorrência).

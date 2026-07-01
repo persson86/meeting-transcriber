@@ -66,6 +66,16 @@ def _mem(tag: str, enabled: bool) -> None:
         print(f"[mem] {tag} rss={_rss_mb():.0f}MB", file=sys.stderr, flush=True)
 
 
+def _mlx_peak_mb() -> float | None:
+    """Pico de memória alocada pelo MLX (unified/Metal). RSS não captura os buffers
+    Metal, então este é o número real de memória do modelo no backend mlx."""
+    try:
+        import mlx.core as mx
+        return mx.get_peak_memory() / 1e6
+    except Exception:
+        return None
+
+
 @dataclass
 class Segment:
     start: float
@@ -1775,6 +1785,11 @@ def main() -> None:
         f"Segments: {len(segments)}, Turns: {len(turns)}, "
         f"Duration: {format_time(max((s.end for s in segments), default=0))}"
     )
+
+    if args.profile_memory and args.backend == "mlx":
+        peak = _mlx_peak_mb()
+        if peak is not None:
+            print(f"[mem] mlx-peak-mb={peak:.0f}", file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":
