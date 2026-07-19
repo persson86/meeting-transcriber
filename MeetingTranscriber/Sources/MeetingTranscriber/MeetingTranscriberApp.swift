@@ -5,6 +5,7 @@ import CoreGraphics
 @main
 struct MeetingTranscriberApp: App {
     @StateObject private var appState = AppState()
+    @NSApplicationDelegateAdaptor(URLSchemeDelegate.self) private var urlSchemeDelegate
 
     init() {
         NotificationManager.shared.requestAuthorization()

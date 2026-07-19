@@ -149,6 +149,24 @@ meeting while earlier recordings are still being transcribed.
 The menu shows recent jobs as queued, running, completed, or failed. Completed
 jobs can be opened from the menu.
 
+## External Recommendation Trigger
+
+The app registers the `meetingtranscriber://` URL scheme so an external tool
+(a calendar watcher, a script, another app) can tell it "this upcoming meeting
+is worth recording" without the app knowing anything about calendars itself.
+Triggering it shows a native macOS notification with the meeting title and a
+short reason — it never starts a recording automatically.
+
+```bash
+open "meetingtranscriber://recommend?title=Steering%20Client%20X&reason=external%20client%20%2B%20strategic%20agenda&lead=10"
+```
+
+| Param | Description |
+| --- | --- |
+| `title` | Meeting title, URL-encoded |
+| `reason` | Short justification shown in the notification body, URL-encoded |
+| `lead` | Minutes-until-start shown in the notification title (default `10`) |
+
 ## Processing Queue
 
 Each stopped recording becomes a local transcription job containing the WAV
@@ -250,6 +268,7 @@ meeting-transcriber/
 │       ├── SystemAudioRecorder.swift
 │       ├── TranscriptionRunner.swift
 │       ├── AudioUtils.swift
-│       └── NotificationManager.swift
+│       ├── NotificationManager.swift
+│       └── URLSchemeDelegate.swift
 └── tests/
 ```
