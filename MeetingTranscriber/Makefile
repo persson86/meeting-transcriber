@@ -1,6 +1,6 @@
 APP      = MeetingTranscriber
-BUNDLE   = $(APP).app
 BIN_DIR  = .build/release
+BUNDLE   = $(BIN_DIR)/$(APP).app
 CONTENTS = $(BUNDLE)/Contents
 # Use named cert (stable identity → TCC remembers permissions between builds)
 # Run 'make setup-cert' once if not created yet
@@ -35,10 +35,10 @@ install: build
 	@mkdir -p ~/Applications
 	@cp -r $(BUNDLE) ~/Applications/
 	@/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
-		-f ~/Applications/$(BUNDLE) 2>/dev/null || true
+		-f ~/Applications/$(APP).app 2>/dev/null || true
 	@sleep 0.5
-	@if [ "$(OPEN_APP)" = "1" ]; then open ~/Applications/$(BUNDLE); fi
-	@echo "✓ Installed to ~/Applications/$(BUNDLE)"
+	@if [ "$(OPEN_APP)" = "1" ]; then open ~/Applications/$(APP).app; fi
+	@echo "✓ Installed to ~/Applications/$(APP).app"
 
 run: build
 	@pkill -x $(APP) 2>/dev/null || true

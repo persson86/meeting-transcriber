@@ -4,7 +4,7 @@ import AppKit
 /// meeting-radar automation). MenuBarExtra scenes don't support SwiftUI's
 /// `.onOpenURL`, so this registers the classic Apple Event handler instead.
 final class URLSchemeDelegate: NSObject, NSApplicationDelegate {
-    func applicationDidFinishLaunching(_ notification: Notification) {
+    func applicationWillFinishLaunching(_ notification: Notification) {
         NSAppleEventManager.shared().setEventHandler(
             self,
             andSelector: #selector(handleGetURL(_:withReplyEvent:)),
