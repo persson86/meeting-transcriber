@@ -48,6 +48,64 @@ class TranscribeMeetingTests(unittest.TestCase):
         self.addCleanup(lambda: Path(tmp.name).unlink(missing_ok=True))
         return tmp.name
 
+    def test_emit_progress_clamps_and_only_emits_increases(self):
+        tm._last_progress = -1
+
+        with patch("builtins.print") as print_mock:
+            tm.emit_progress(-5)
+            tm.emit_progress(0)
+            tm.emit_progress(17.9)
+            tm.emit_progress(17)
+            tm.emit_progress(101)
+
+        self.assertEqual(
+            [call.args[0] for call in print_mock.call_args_list],
+            ["PROGRESS: 0", "PROGRESS: 17", "PROGRESS: 100"],
+        )
+        self.assertTrue(all(call.kwargs == {"flush": True} for call in print_mock.call_args_list))
+
+    def test_audio_duration_sec_reads_wav_without_loading_samples(self):
+        wav_path = self.write_wav(duration_sec=2.5)
+
+        self.assertAlmostEqual(tm.audio_duration_sec(wav_path), 2.5)
+        self.assertEqual(tm.audio_duration_sec(None), 0.0)
+        self.assertEqual(tm.audio_duration_sec("/missing/audio.wav"), 0.0)
+
+    def test_transcribe_track_reports_chunk_progress_by_total_duration(self):
+        wav_path = self.write_wav(duration_sec=3.0, amplitude=1000)
+        model = FakeModel()
+
+        with patch.object(
+            tm,
+            "detect_speech_islands",
+            return_value=[{"start": tm.SAMPLE_RATE, "end": 2 * tm.SAMPLE_RATE}],
+        ), patch.object(tm, "emit_progress") as emit:
+            tm.transcribe_track(
+                wav_path,
+                "Você",
+                model,
+                chunk_by_silence=True,
+                progress_base_sec=3.0,
+                total_sec=10.0,
+            )
+
+        emit.assert_called_once_with(45.0)
+
+    def test_transcribe_track_reports_full_track_progress(self):
+        wav_path = self.write_wav(duration_sec=3.0)
+
+        with patch.object(tm, "emit_progress") as emit:
+            tm.transcribe_track(
+                wav_path,
+                "Você",
+                FakeModel(),
+                chunk_by_silence=False,
+                progress_base_sec=2.0,
+                total_sec=10.0,
+            )
+
+        emit.assert_called_once_with(45.0)
+
     def test_chunk_by_silence_restores_absolute_timestamps(self):
         wav_path = self.write_wav(amplitude=1000)
         model = FakeModel()

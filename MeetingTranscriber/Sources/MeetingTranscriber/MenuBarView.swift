@@ -178,6 +178,17 @@ struct MenuBarView: View {
                                 .font(.caption2)
                                 .foregroundColor(.secondary)
                                 .lineLimit(1)
+
+                                if job.status.isRunning {
+                                    HStack(spacing: 6) {
+                                        ProgressView(value: Double(job.progress), total: 100)
+                                            .progressViewStyle(.linear)
+                                        Text("\(job.progress)%")
+                                            .font(.caption2)
+                                            .monospacedDigit()
+                                            .foregroundColor(.secondary)
+                                    }
+                                }
                             }
 
                             Spacer(minLength: 4)
@@ -202,6 +213,14 @@ struct MenuBarView: View {
                                     .help(job.exportedToSecondBrain ? "Sent to second brain" : "Send to second brain")
                                 }
                             }
+
+                            Button {
+                                state.cancelJob(job.id)
+                            } label: {
+                                Image(systemName: "xmark.circle")
+                            }
+                            .buttonStyle(.plain)
+                            .help(job.status.isFinished ? "Remover da lista" : "Cancelar e descartar")
                         }
                     }
                 }
@@ -231,7 +250,7 @@ struct MenuBarView: View {
             HStack(spacing: 0) {
                 // Output folder
                 Button {
-                    showDirPicker = true
+                    NSWorkspace.shared.open(state.outputDirectory)
                 } label: {
                     Label(
                         state.outputDirectory.lastPathComponent,
@@ -242,6 +261,18 @@ struct MenuBarView: View {
                     .lineLimit(1)
                 }
                 .buttonStyle(.plain)
+                .help("Abrir no Finder")
+
+                Button {
+                    showDirPicker = true
+                } label: {
+                    Image(systemName: "pencil")
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(.secondary)
+                .font(.caption2)
+                .padding(.leading, 4)
+                .help("Trocar pasta de saída")
 
                 Spacer()
 

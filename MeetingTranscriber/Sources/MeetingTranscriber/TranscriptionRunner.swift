@@ -1,6 +1,7 @@
 import Foundation
 
 enum TranscriptionError: LocalizedError {
+    case cancelled
     case pythonNotFound(String)
     case scriptNotFound(String)
     case noOutputPath(String)
@@ -8,6 +9,8 @@ enum TranscriptionError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
+        case .cancelled:
+            return "Transcrição cancelada pelo usuário."
         case .pythonNotFound(let path):
             return "Python não encontrado em \(path). Crie o venv (make setup) ou ajuste pythonPath via defaults."
         case .scriptNotFound(let path):
@@ -26,8 +29,29 @@ private final class PipeDrain: @unchecked Sendable {
     private let lock = NSLock()
     private var out = Data()
     private var err = Data()
+    private var lineBuf = Data()
+    var onProgress: ((Int) -> Void)?
 
-    func appendOut(_ d: Data) { lock.withLock { out.append(d) } }
+    func appendOut(_ d: Data) {
+        let progressUpdates: [Int] = lock.withLock {
+            out.append(d)
+            lineBuf.append(d)
+
+            var updates: [Int] = []
+            while let newline = lineBuf.firstIndex(of: 0x0A) {
+                let line = lineBuf[..<newline]
+                lineBuf.removeSubrange(...newline)
+                guard let text = String(data: line, encoding: .utf8),
+                      text.hasPrefix("PROGRESS: "),
+                      let value = Int(text.dropFirst("PROGRESS: ".count)) else { continue }
+                updates.append(value)
+            }
+            return updates
+        }
+        for value in progressUpdates {
+            onProgress?(value)
+        }
+    }
     func appendErr(_ d: Data) { lock.withLock { err.append(d) } }
 
     func strings() -> (String, String) {
@@ -40,6 +64,18 @@ private final class PipeDrain: @unchecked Sendable {
 final class TranscriptionRunner {
     private let python = AppConfig.pythonPath
     private let script = AppConfig.scriptPath
+    private let lock = NSLock()
+    private var proc: Process?
+    private var processStarted = false
+    private var cancelled = false
+
+    func cancel() {
+        let processToTerminate: Process? = lock.withLock {
+            cancelled = true
+            return processStarted ? proc : nil
+        }
+        processToTerminate?.terminate()
+    }
 
     func run(
         micURL: URL?,
@@ -47,7 +83,8 @@ final class TranscriptionRunner {
         title: String,
         language: String = "pt",
         sysOffsetMs: Double = 0,
-        outputDir: URL
+        outputDir: URL,
+        onProgress: @escaping (Int) -> Void = { _ in }
     ) async throws -> URL {
         guard FileManager.default.isExecutableFile(atPath: python) else {
             throw TranscriptionError.pythonNotFound(python)
@@ -81,6 +118,7 @@ final class TranscriptionRunner {
             // Drena os pipes em streaming em vez de só no fim: se o Python emitir mais
             // que o buffer do pipe (~64 KB) antes de sair, ler tudo no término trava.
             let drain = PipeDrain()
+            drain.onProgress = onProgress
             outPipe.fileHandleForReading.readabilityHandler = { fh in
                 let d = fh.availableData
                 if d.isEmpty { fh.readabilityHandler = nil; return }
@@ -98,8 +136,15 @@ final class TranscriptionRunner {
                 drain.appendOut(outPipe.fileHandleForReading.readDataToEndOfFile())
                 drain.appendErr(errPipe.fileHandleForReading.readDataToEndOfFile())
                 let (stdout, stderr) = drain.strings()
+                let wasCancelled = self.lock.withLock {
+                    self.proc = nil
+                    self.processStarted = false
+                    return self.cancelled
+                }
 
-                if p.terminationStatus == 0 {
+                if wasCancelled {
+                    continuation.resume(throwing: TranscriptionError.cancelled)
+                } else if p.terminationStatus == 0 {
                     let path = stdout.components(separatedBy: "\n")
                         .first(where: { $0.hasPrefix("Output: ") })
                         .map { String($0.dropFirst("Output: ".count)) }
@@ -118,13 +163,34 @@ final class TranscriptionRunner {
                 }
             }
 
+            let cancelledBeforeStart = lock.withLock {
+                guard !cancelled else { return true }
+                self.proc = proc
+                return false
+            }
+            guard !cancelledBeforeStart else {
+                continuation.resume(throwing: TranscriptionError.cancelled)
+                return
+            }
+
             do {
                 try proc.run()
+                let shouldTerminate = lock.withLock {
+                    processStarted = true
+                    return cancelled
+                }
+                if shouldTerminate {
+                    proc.terminate()
+                }
                 if AppConfig.debugMemoryLogging {
                     NSLog("[mem] python pid=%d maxConcurrent=%d model=%@",
                           proc.processIdentifier, AppConfig.maxConcurrentTranscriptions, AppConfig.mlxModel)
                 }
             } catch {
+                lock.withLock {
+                    self.proc = nil
+                    self.processStarted = false
+                }
                 continuation.resume(throwing: error)
             }
         }

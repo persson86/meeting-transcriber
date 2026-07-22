@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import sys
+import wave
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -48,6 +49,8 @@ DEFAULT_HOTWORD_LIMIT = 60
 PROMPT_TAIL_MAX_CHARS = 240
 RUNAWAY_UNICODE_MIN_REPEATS = 8
 
+_last_progress = -1
+
 
 # ---------------------------------------------------------------------------
 # Memory profiling (opt-in via --profile-memory; logs vão para stderr para não
@@ -64,6 +67,25 @@ def _rss_mb() -> float:
 def _mem(tag: str, enabled: bool) -> None:
     if enabled:
         print(f"[mem] {tag} rss={_rss_mb():.0f}MB", file=sys.stderr, flush=True)
+
+
+def emit_progress(pct: int) -> None:
+    global _last_progress
+    pct = max(0, min(100, int(pct)))
+    if pct <= _last_progress:
+        return
+    _last_progress = pct
+    print(f"PROGRESS: {pct}", flush=True)
+
+
+def audio_duration_sec(path: str | None) -> float:
+    if not path:
+        return 0.0
+    try:
+        with wave.open(path, "rb") as audio:
+            return audio.getnframes() / float(audio.getframerate())
+    except Exception:
+        return 0.0
 
 
 def _mlx_peak_mb() -> float | None:
@@ -928,6 +950,8 @@ def transcribe_track(
     chunk_by_silence: bool = True,
     chunk_overlap: bool = True,
     profile_memory: bool = False,
+    progress_base_sec: float = 0.0,
+    total_sec: float = 1.0,
 ) -> list[Segment]:
     config = config or TranscriptionConfig()
 
@@ -957,6 +981,7 @@ def transcribe_track(
             print(f"    Detected: {info.language} ({info.language_probability:.0%})", flush=True)
 
         segments = collect_segments(raw_segments, speaker, offset_sec, config)
+        emit_progress(90 * (progress_base_sec + info.duration) / total_sec)
         print(f"    {len(segments)} segments, {round(info.duration, 1)}s audio", flush=True)
         return segments
 
@@ -1009,6 +1034,7 @@ def transcribe_track(
             dropped = 0
         segments.extend(chunk_segments)
         covered_until_sec = end_sample / SAMPLE_RATE
+        emit_progress(90 * (progress_base_sec + covered_until_sec) / total_sec)
         if profile_memory and i % 10 == 0:
             _mem(f"chunk-{i}/{len(chunks)}", profile_memory)
 
@@ -1646,6 +1672,11 @@ def main() -> None:
     )
     config.known_names.extend(args.known_names)
 
+    mic_duration_sec = audio_duration_sec(args.mic)
+    system_duration_sec = audio_duration_sec(args.system)
+    total_sec = mic_duration_sec + system_duration_sec or 1.0
+    emit_progress(0)
+
     # Carrega backend de inferência UMA vez — reutilizado nas duas trilhas
     if args.backend == "mlx":
         print(f"  Loading MLX backend: {args.mlx_model}...", flush=True)
@@ -1671,6 +1702,8 @@ def main() -> None:
             chunk_by_silence=args.chunk_by_silence,
             chunk_overlap=not args.no_chunk_overlap,
             profile_memory=args.profile_memory,
+            progress_base_sec=0,
+            total_sec=total_sec,
         ))
         _mem("mic-track-done", args.profile_memory)
 
@@ -1684,6 +1717,8 @@ def main() -> None:
             chunk_by_silence=args.chunk_by_silence,
             chunk_overlap=not args.no_chunk_overlap,
             profile_memory=args.profile_memory,
+            progress_base_sec=mic_duration_sec,
+            total_sec=total_sec,
         ))
         _mem("system-track-done", args.profile_memory)
 
@@ -1691,6 +1726,7 @@ def main() -> None:
         _mem("relabel-before", args.profile_memory)
         relabel_system_speakers(segments, load_audio(args.system), sys_offset_sec)
         _mem("relabel-after", args.profile_memory)
+    emit_progress(92)
 
     segments.sort(key=lambda s: s.start)
 
@@ -1704,6 +1740,7 @@ def main() -> None:
                 print(f"  Trimmed {trimmed} system segment(s) after mic end ({format_time(mic_end)})", flush=True)
 
     turns = consolidate_turns(segments, max_turn_duration_s=args.max_turn_duration)
+    emit_progress(95)
 
     if args.speaker_map:
         apply_speaker_map(turns, args.speaker_map)
@@ -1778,6 +1815,7 @@ def main() -> None:
     else:
         primary_output = md_path
 
+    emit_progress(99)
     print(f"\nOutput: {primary_output}")
     if len(output_paths) > 1:
         print("Additional output: " + ", ".join(str(path) for path in output_paths if path != primary_output))

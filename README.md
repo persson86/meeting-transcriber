@@ -97,6 +97,33 @@ runs in the background queue). Override with `mlxModel`:
 pair with the CLI `--profile-memory` flag (RSS per phase plus the real MLX peak on
 stderr) to measure before changing the model.
 
+## Updating to the Latest Version
+
+> [!TIP]
+> Already installed and want the newest features (cancel/discard a queued or
+> running job, live progress %, one-click "open transcripts folder in Finder")?
+> Re-run the installer from the **same folder** you used the first time — it
+> updates your existing checkout in place, it does not start over.
+
+```bash
+cd ~/Transcricoes   # the folder you used the first time you installed
+curl -fsSL https://raw.githubusercontent.com/persson86/meeting-transcriber/main/install.sh | bash
+```
+
+This pulls the latest changes into `./meeting-transcriber`, rebuilds the app,
+reinstalls it to `~/Applications/MeetingTranscriber.app`, and reopens it — your
+output folder and settings are untouched. If you're not sure which folder you
+used, look in your home folder for a `meeting-transcriber` folder (Finder →
+Go → Home).
+
+Prefer the manual route from an existing checkout?
+
+```bash
+cd meeting-transcriber
+git pull --ff-only
+make install
+```
+
 ## Backends
 
 | Backend | Speed | Robustness |
@@ -146,8 +173,14 @@ After a recording stops, the app saves the WAV files, returns to the ready state
 and keeps processing previous jobs in the background. This lets you start another
 meeting while earlier recordings are still being transcribed.
 
-The menu shows recent jobs as queued, running, completed, or failed. Completed
-jobs can be opened from the menu.
+The menu shows recent jobs as queued, running, completed, or failed. A running
+job shows a live progress percentage. Every job — queued, running, or
+finished — has a cancel/discard button (✕); canceling a running job stops the
+Python process and deletes its temporary audio, and canceling a queued one
+removes it before it ever starts. Completed jobs can be opened from the menu.
+
+Click the output folder name in the footer to open it directly in Finder;
+click the pencil icon next to it to change the output folder.
 
 ## External Recommendation Trigger
 

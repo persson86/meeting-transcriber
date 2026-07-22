@@ -64,6 +64,7 @@ struct TranscriptionJob: Identifiable, Equatable {
     var startedAt: Date?
     var completedAt: Date?
     var status: TranscriptionJobStatus
+    var progress: Int = 0
     var exportedToSecondBrain: Bool = false
 }
 
@@ -81,6 +82,7 @@ final class AppState: ObservableObject {
     private var sys: SystemAudioRecorder?
     private var tempDir: URL?
     private let maxConcurrentTranscriptions: Int
+    private var runners: [UUID: TranscriptionRunner] = [:]
 
     init() {
         maxConcurrentTranscriptions = AppConfig.maxConcurrentTranscriptions
@@ -293,15 +295,22 @@ final class AppState: ObservableObject {
     }
 
     private func runTranscriptionJob(_ job: TranscriptionJob) {
-        Task { [job] in
+        let runner = TranscriptionRunner()
+        runners[job.id] = runner
+        Task { [job, runner] in
             do {
-                let outputURL = try await TranscriptionRunner().run(
+                let outputURL = try await runner.run(
                     micURL: job.micURL,
                     systemURL: job.systemURL,
                     title: job.title,
                     language: job.language,
                     sysOffsetMs: job.sysOffsetMs,
-                    outputDir: job.outputDir
+                    outputDir: job.outputDir,
+                    onProgress: { [weak self] pct in
+                        Task { @MainActor in
+                            self?.updateProgress(id: job.id, pct: pct)
+                        }
+                    }
                 )
 
                 try Self.archiveSessionFiles(
@@ -320,8 +329,16 @@ final class AppState: ObservableObject {
         }
     }
 
+    private func updateProgress(id: UUID, pct: Int) {
+        guard let index = transcriptionJobs.firstIndex(where: { $0.id == id }),
+              transcriptionJobs[index].status.isRunning else { return }
+        transcriptionJobs[index].progress = max(transcriptionJobs[index].progress, pct)
+    }
+
     private func finishTranscriptionJob(id: UUID, outputURL: URL) {
+        runners[id] = nil
         guard let index = transcriptionJobs.firstIndex(where: { $0.id == id }) else { return }
+        transcriptionJobs[index].progress = 100
         transcriptionJobs[index].status = .succeeded(outputURL)
         transcriptionJobs[index].completedAt = Date()
         lastOutputURL = outputURL
@@ -330,10 +347,29 @@ final class AppState: ObservableObject {
     }
 
     private func failTranscriptionJob(id: UUID, message: String) {
+        runners[id] = nil
         guard let index = transcriptionJobs.firstIndex(where: { $0.id == id }) else { return }
         transcriptionJobs[index].status = .failed(message)
         transcriptionJobs[index].completedAt = Date()
         scheduleTranscriptionJobs()
+    }
+
+    func cancelJob(_ id: UUID) {
+        guard let index = transcriptionJobs.firstIndex(where: { $0.id == id }) else { return }
+        let job = transcriptionJobs[index]
+        runners[id]?.cancel()
+        runners[id] = nil
+        transcriptionJobs.remove(at: index)
+        deleteTempDir(for: job)
+        scheduleTranscriptionJobs()
+    }
+
+    private func deleteTempDir(for job: TranscriptionJob) {
+        guard let audioURL = job.micURL ?? job.systemURL else { return }
+        let directory = audioURL.deletingLastPathComponent().resolvingSymlinksInPath()
+        let temporaryDirectory = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+        guard directory.path.hasPrefix(temporaryDirectory.path + "/") else { return }
+        try? FileManager.default.removeItem(at: directory)
     }
 
     func sendToSecondBrain(_ job: TranscriptionJob) {
