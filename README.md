@@ -25,6 +25,8 @@ into heuristic `Remote_A`, `Remote_B`, etc. labels.
 - Python 3.9 or newer
 - Screen & System Audio Recording permission (system audio is captured natively
   via ScreenCaptureKit; no virtual audio device is required)
+- Calendar permission is optional and is requested only when using the automatic
+  meeting-title action
 - Apple Silicon is recommended for the default MLX backend
 
 ## Setup
@@ -142,6 +144,8 @@ The pipeline also supports meeting-specific vocabulary through `--context-term`,
 
 On first launch the app asks for **Screen & System Audio Recording** (used only
 to capture system audio) and, on the first recording, **Microphone** access.
+Calendar access is requested separately, only after clicking
+**Usar próxima reunião do Calendar**.
 
 If recording fails with a permission error, enable the app in System Settings →
 Privacy & Security → Screen & System Audio Recording and try again. If the app
@@ -165,15 +169,30 @@ it with `tccutil reset ScreenCapture <bundle-id>` and relaunch.
 
 1. Open `MeetingTranscriber.app`.
 2. Click the microphone icon in the macOS menu bar.
-3. Click **Start** to begin recording.
-4. Click **Stop** to save audio and enqueue the transcription.
-5. JSONL and Markdown files are written to the configured output directory.
+3. Enter a meeting title or click **Usar próxima reunião do Calendar**.
+4. Click **Iniciar gravação** to begin recording.
+5. Click **Parar e adicionar à fila** to save audio and enqueue the transcription.
+6. Follow progress in the **Transcrições** section. JSONL and Markdown files are
+   written to the configured output directory.
+
+The Calendar action looks at the next 24 hours and uses the earliest upcoming
+non-cancelled, non-all-day event that you accepted, or that you organized with
+other participants. It fills the title field but never starts recording
+automatically. If no eligible event is found, the existing title is preserved
+and the app shows a warning.
+
+To process an iPhone recording manually, click **Processar arquivo de áudio…**. The
+file picker opens in Downloads by default; choose the 16 kHz WAV and leave the
+app open while the job runs. The app copies the selected file into its temporary
+queue and never changes or deletes the original in Downloads. A single imported
+track uses the neutral speaker label `Áudio`.
 
 After a recording stops, the app saves the WAV files, returns to the ready state,
 and keeps processing previous jobs in the background. This lets you start another
 meeting while earlier recordings are still being transcribed.
 
-The menu shows recent jobs as queued, running, completed, or failed. A running
+The wider menu uses native large controls and larger action targets for better
+readability. It shows recent jobs as queued, running, completed, or failed. A running
 job shows a live progress percentage. Every job — queued, running, or
 finished — has a cancel/discard button (✕); canceling a running job stops the
 Python process and deletes its temporary audio, and canceling a queued one

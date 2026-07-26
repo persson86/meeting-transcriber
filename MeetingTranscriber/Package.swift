@@ -11,6 +11,11 @@ let package = Package(
             swiftSettings: [
                 .unsafeFlags(["-strict-concurrency=minimal"])
             ]
+        ),
+        .testTarget(
+            name: "MeetingTranscriberTests",
+            dependencies: ["MeetingTranscriber"],
+            path: "Tests/MeetingTranscriberTests"
         )
     ]
 )

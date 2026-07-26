@@ -1,4 +1,19 @@
+import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
+
+private enum MenuLayout {
+    static let popoverWidth: CGFloat = 400
+    static let padding: CGFloat = 16
+    static let sectionSpacing: CGFloat = 16
+    static let controlSpacing: CGFloat = 8
+    static let compactSpacing: CGFloat = 4
+    static let statusDotSize: CGFloat = 10
+    static let buttonLabelMinHeight: CGFloat = 24
+    static let iconButtonSize: CGFloat = 28
+    static let jobIconWidth: CGFloat = 20
+    static let queueMaxHeight: CGFloat = 260
+}
 
 struct MenuBarView: View {
     @EnvironmentObject var state: AppState
@@ -8,89 +23,120 @@ struct MenuBarView: View {
         VStack(alignment: .leading, spacing: 0) {
 
             // ── Status bar ───────────────────────────────────────────────
-            HStack(spacing: 8) {
+            HStack(spacing: MenuLayout.controlSpacing) {
                 Circle()
                     .fill(statusColor)
-                    .frame(width: 8, height: 8)
-                VStack(alignment: .leading, spacing: 1) {
+                    .frame(
+                        width: MenuLayout.statusDotSize,
+                        height: MenuLayout.statusDotSize
+                    )
+                VStack(alignment: .leading, spacing: MenuLayout.compactSpacing) {
                     Text("Meeting Transcriber")
-                        .font(.caption.weight(.semibold))
+                        .font(.headline)
                     Text(state.statusLabel)
-                        .font(.caption2)
+                        .font(.subheadline)
                         .foregroundColor(.secondary)
                 }
                 Spacer()
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 9)
+            .padding(MenuLayout.padding)
 
             Divider()
 
             // ── Warning banner (partial capture) ──────────────────────────
             if let warning = state.lastWarning {
-                HStack(alignment: .top, spacing: 6) {
+                HStack(alignment: .top, spacing: MenuLayout.controlSpacing) {
                     Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.caption)
+                        .font(.body)
                         .foregroundColor(.orange)
                     Text(warning)
-                        .font(.caption2)
+                        .font(.callout)
                         .foregroundColor(.orange)
                         .fixedSize(horizontal: false, vertical: true)
-                    Spacer(minLength: 4)
+                    Spacer(minLength: MenuLayout.compactSpacing)
                     Button {
                         state.clearWarning()
                     } label: {
                         Image(systemName: "xmark.circle")
                     }
                     .buttonStyle(.plain)
+                    .frame(
+                        width: MenuLayout.iconButtonSize,
+                        height: MenuLayout.iconButtonSize
+                    )
+                    .contentShape(Rectangle())
                     .foregroundColor(.secondary)
                     .help("Dispensar aviso")
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
+                .padding(MenuLayout.padding)
 
                 Divider()
             }
 
             // ── Idle / active content ─────────────────────────────────────
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: MenuLayout.sectionSpacing) {
 
                 if case .idle = state.status {
-                    TextField("Meeting title", text: $state.meetingTitle)
-                        .textFieldStyle(.roundedBorder)
+                    VStack(alignment: .leading, spacing: MenuLayout.controlSpacing) {
+                        Text("Título da reunião")
+                            .font(.subheadline.weight(.medium))
+
+                        TextField("Nome da reunião", text: $state.meetingTitle)
+                            .textFieldStyle(.roundedBorder)
+                            .controlSize(.large)
+
+                        Button {
+                            state.syncMeetingTitleFromCalendar()
+                        } label: {
+                            Label(
+                                state.isCalendarSyncing
+                                    ? "Sincronizando…"
+                                    : "Usar próxima reunião do Calendar",
+                                systemImage: "calendar"
+                            )
+                            .frame(
+                                maxWidth: .infinity,
+                                minHeight: MenuLayout.buttonLabelMinHeight
+                            )
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.large)
+                        .disabled(state.isCalendarSyncing)
+                        .help("Preencher com a próxima reunião confirmada")
+                    }
 
                     HStack {
-                        Text("Language")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
+                        Text("Idioma")
+                            .font(.subheadline.weight(.medium))
                         Spacer()
                         Picker("", selection: Binding(
                             get: { state.language },
                             set: { state.setLanguage($0) }
                         )) {
-                            Text("Portuguese").tag("pt")
-                            Text("English").tag("en")
-                            Text("Auto-detect").tag("auto")
+                            Text("Português").tag("pt")
+                            Text("Inglês").tag("en")
+                            Text("Detectar automaticamente").tag("auto")
                         }
                         .pickerStyle(.menu)
-                        .fixedSize()
+                        .labelsHidden()
+                        .controlSize(.large)
                     }
 
                 } else if case .error(let msg) = state.status {
                     Text(msg)
-                        .font(.caption)
+                        .font(.body)
                         .foregroundColor(.orange)
                         .lineLimit(4)
                         .fixedSize(horizontal: false, vertical: true)
 
-                    HStack(spacing: 12) {
+                    HStack(spacing: MenuLayout.sectionSpacing) {
                         Button {
                             state.resetError()
                         } label: {
                             Label("Limpar", systemImage: "xmark.circle")
                         }
                         .buttonStyle(.link)
-                        .font(.caption)
+                        .font(.callout)
 
                         if msg.contains("ermissão") || msg.contains("ermission") {
                             Button {
@@ -102,7 +148,7 @@ struct MenuBarView: View {
                                 Label("Abrir Configurações", systemImage: "gear")
                             }
                             .buttonStyle(.link)
-                            .font(.caption)
+                            .font(.callout)
                         }
                     }
 
@@ -110,122 +156,174 @@ struct MenuBarView: View {
                     // Recording / stopping — show read-only info
                     HStack {
                         Text(state.meetingTitle)
-                            .font(.callout)
-                            .foregroundColor(.secondary)
+                            .font(.body.weight(.medium))
                             .lineLimit(1)
                             .truncationMode(.tail)
                         Spacer()
                         Text(languageLabel(state.language))
-                            .font(.caption2)
+                            .font(.subheadline)
                             .foregroundColor(.secondary)
                     }
 
                     if state.status.isRecording {
-                        Text("The macOS sharing indicator is expected while capture is active.")
-                            .font(.caption2)
-                            .foregroundColor(.secondary.opacity(0.7))
+                        Text("O indicador de compartilhamento do macOS é esperado durante a captura.")
+                            .font(.callout)
+                            .foregroundColor(.secondary)
                     } else if state.status.isStopping {
-                        Text("Saving audio before the next recording can start.")
-                            .font(.caption2)
-                            .foregroundColor(.secondary.opacity(0.7))
+                        Text("Salvando o áudio antes de liberar a próxima gravação.")
+                            .font(.callout)
+                            .foregroundColor(.secondary)
+                    } else if state.status.isImporting {
+                        Text("Copiando o áudio selecionado para a fila de transcrição.")
+                            .font(.callout)
+                            .foregroundColor(.secondary)
                     }
                 }
 
                 Button { handleAction() } label: {
                     Label(actionTitle, systemImage: actionIcon)
-                        .frame(maxWidth: .infinity)
+                        .frame(
+                            maxWidth: .infinity,
+                            minHeight: MenuLayout.buttonLabelMinHeight
+                        )
                 }
                     .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
                     .tint(state.status.isRecording ? .red : .accentColor)
-                    .disabled(state.status.isStopping)
+                    .disabled(
+                        state.status.isStopping
+                            || state.status.isImporting
+                            || state.isCalendarSyncing
+                    )
+
+                if case .idle = state.status {
+                    Button {
+                        chooseAudioFile()
+                    } label: {
+                        Label(
+                            "Processar arquivo de áudio…",
+                            systemImage: "waveform.badge.plus"
+                        )
+                        .frame(
+                            maxWidth: .infinity,
+                            minHeight: MenuLayout.buttonLabelMinHeight
+                        )
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.large)
+                    .disabled(state.isCalendarSyncing)
+                    .help("Escolher um WAV de 16 kHz sem alterar o arquivo original")
+                }
 
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
+            .padding(MenuLayout.padding)
 
             // ── Transcription queue ─────────────────────────────────────
             if !state.visibleTranscriptionJobs.isEmpty {
                 Divider()
-                VStack(alignment: .leading, spacing: 7) {
+                VStack(alignment: .leading, spacing: MenuLayout.controlSpacing) {
                     HStack {
-                        Text("Queue")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
+                        Text("Transcrições")
+                            .font(.subheadline.weight(.semibold))
                         Spacer()
                         Text("\(state.runningTranscriptionCount)/\(state.maxConcurrentTranscriptionCount)")
-                            .font(.caption2)
+                            .font(.callout)
                             .foregroundColor(.secondary)
                             .monospacedDigit()
                     }
 
-                    ForEach(state.visibleTranscriptionJobs) { job in
-                        HStack(alignment: .top, spacing: 7) {
-                            Image(systemName: jobIcon(job.status))
-                                .font(.caption)
-                                .foregroundColor(jobTint(job.status))
-                                .frame(width: 14)
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: MenuLayout.controlSpacing) {
+                            ForEach(state.visibleTranscriptionJobs) { job in
+                                HStack(alignment: .top, spacing: MenuLayout.controlSpacing) {
+                                    Image(systemName: jobIcon(job.status))
+                                        .font(.body)
+                                        .foregroundColor(jobTint(job.status))
+                                        .frame(width: MenuLayout.jobIconWidth)
 
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(job.title)
-                                    .font(.caption)
-                                    .lineLimit(1)
-                                    .truncationMode(.tail)
-                                HStack(spacing: 4) {
-                                    Text(jobStatusLabel(job.status))
-                                    Text("•")
-                                    Text(timeLabel(job.createdAt))
-                                }
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
-                                .lineLimit(1)
+                                    VStack(alignment: .leading, spacing: MenuLayout.compactSpacing) {
+                                        Text(job.title)
+                                            .font(.callout.weight(.medium))
+                                            .lineLimit(1)
+                                            .truncationMode(.tail)
+                                        HStack(spacing: MenuLayout.compactSpacing) {
+                                            Text(jobStatusLabel(job.status))
+                                            Text("•")
+                                            Text(timeLabel(job.createdAt))
+                                        }
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                        .lineLimit(1)
 
-                                if job.status.isRunning {
-                                    HStack(spacing: 6) {
-                                        ProgressView(value: Double(job.progress), total: 100)
-                                            .progressViewStyle(.linear)
-                                        Text("\(job.progress)%")
-                                            .font(.caption2)
-                                            .monospacedDigit()
-                                            .foregroundColor(.secondary)
+                                        if job.status.isRunning {
+                                            HStack(spacing: MenuLayout.controlSpacing) {
+                                                ProgressView(value: Double(job.progress), total: 100)
+                                                    .progressViewStyle(.linear)
+                                                Text("\(job.progress)%")
+                                                    .font(.caption)
+                                                    .monospacedDigit()
+                                                    .foregroundColor(.secondary)
+                                            }
+                                        }
                                     }
-                                }
-                            }
 
-                            Spacer(minLength: 4)
+                                    Spacer(minLength: MenuLayout.compactSpacing)
 
-                            if case .succeeded(let url) = job.status {
-                                Button {
-                                    NSWorkspace.shared.open(url)
-                                } label: {
-                                    Image(systemName: "doc.text")
-                                }
-                                .buttonStyle(.plain)
-                                .help("Open transcript")
+                                    if case .succeeded(let url) = job.status {
+                                        Button {
+                                            NSWorkspace.shared.open(url)
+                                        } label: {
+                                            Image(systemName: "doc.text")
+                                                .frame(
+                                                    width: MenuLayout.iconButtonSize,
+                                                    height: MenuLayout.iconButtonSize
+                                                )
+                                                .contentShape(Rectangle())
+                                        }
+                                        .buttonStyle(.plain)
+                                        .help("Abrir transcrição")
 
-                                if AppConfig.secondBrainPath != nil {
+                                        if AppConfig.secondBrainPath != nil {
+                                            Button {
+                                                state.sendToSecondBrain(job)
+                                            } label: {
+                                                Image(systemName: job.exportedToSecondBrain ? "checkmark.circle" : "brain")
+                                                    .frame(
+                                                        width: MenuLayout.iconButtonSize,
+                                                        height: MenuLayout.iconButtonSize
+                                                    )
+                                                    .contentShape(Rectangle())
+                                            }
+                                            .buttonStyle(.plain)
+                                            .disabled(job.exportedToSecondBrain)
+                                            .help(
+                                                job.exportedToSecondBrain
+                                                    ? "Enviada ao second-brain"
+                                                    : "Enviar ao second-brain"
+                                            )
+                                        }
+                                    }
+
                                     Button {
-                                        state.sendToSecondBrain(job)
+                                        state.cancelJob(job.id)
                                     } label: {
-                                        Image(systemName: job.exportedToSecondBrain ? "checkmark.circle" : "brain")
+                                        Image(systemName: "xmark.circle")
+                                            .frame(
+                                                width: MenuLayout.iconButtonSize,
+                                                height: MenuLayout.iconButtonSize
+                                            )
+                                            .contentShape(Rectangle())
                                     }
                                     .buttonStyle(.plain)
-                                    .disabled(job.exportedToSecondBrain)
-                                    .help(job.exportedToSecondBrain ? "Sent to second brain" : "Send to second brain")
+                                    .help(job.status.isFinished ? "Remover da lista" : "Cancelar e descartar")
                                 }
+                                .padding(.vertical, MenuLayout.compactSpacing)
                             }
-
-                            Button {
-                                state.cancelJob(job.id)
-                            } label: {
-                                Image(systemName: "xmark.circle")
-                            }
-                            .buttonStyle(.plain)
-                            .help(job.status.isFinished ? "Remover da lista" : "Cancelar e descartar")
                         }
                     }
+                    .frame(maxHeight: MenuLayout.queueMaxHeight)
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 9)
+                .padding(MenuLayout.padding)
             }
 
             // ── Last output ───────────────────────────────────────────────
@@ -235,19 +333,18 @@ struct MenuBarView: View {
                     NSWorkspace.shared.open(url)
                 } label: {
                     Label(url.lastPathComponent, systemImage: "doc.text")
-                        .font(.caption)
+                        .font(.callout)
                         .lineLimit(1)
                         .truncationMode(.middle)
                 }
                 .buttonStyle(.link)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
+                .padding(MenuLayout.padding)
             }
 
             // ── Footer ────────────────────────────────────────────────────
             Divider()
 
-            HStack(spacing: 0) {
+            HStack(spacing: MenuLayout.controlSpacing) {
                 // Output folder
                 Button {
                     NSWorkspace.shared.open(state.outputDirectory)
@@ -256,7 +353,7 @@ struct MenuBarView: View {
                         state.outputDirectory.lastPathComponent,
                         systemImage: "folder"
                     )
-                    .font(.caption2)
+                    .font(.callout)
                     .foregroundColor(.secondary)
                     .lineLimit(1)
                 }
@@ -267,11 +364,15 @@ struct MenuBarView: View {
                     showDirPicker = true
                 } label: {
                     Image(systemName: "pencil")
+                        .frame(
+                            width: MenuLayout.iconButtonSize,
+                            height: MenuLayout.iconButtonSize
+                        )
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .foregroundColor(.secondary)
-                .font(.caption2)
-                .padding(.leading, 4)
+                .font(.body)
                 .help("Trocar pasta de saída")
 
                 Spacer()
@@ -280,16 +381,20 @@ struct MenuBarView: View {
                     NSApplication.shared.terminate(nil)
                 } label: {
                     Image(systemName: "power")
+                        .frame(
+                            width: MenuLayout.iconButtonSize,
+                            height: MenuLayout.iconButtonSize
+                        )
+                        .contentShape(Rectangle())
                 }
-                    .buttonStyle(.link)
+                    .buttonStyle(.plain)
                     .foregroundColor(.secondary)
-                    .font(.caption2)
-                    .help("Quit")
+                    .font(.body)
+                    .help("Encerrar")
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
+            .padding(MenuLayout.padding)
         }
-        .frame(width: 300)
+        .frame(width: MenuLayout.popoverWidth)
         .fileImporter(isPresented: $showDirPicker, allowedContentTypes: [.folder]) { result in
             if case .success(let url) = result { state.setOutputDirectory(url) }
         }
@@ -297,12 +402,32 @@ struct MenuBarView: View {
 
     // MARK: - Helpers
 
+    private func chooseAudioFile() {
+        let panel = NSOpenPanel()
+        panel.title = "Processar arquivo de áudio"
+        panel.message = "Escolha um WAV de 16 kHz para adicionar à fila de transcrição."
+        panel.prompt = "Processar"
+        panel.allowedContentTypes = [.wav]
+        panel.allowsMultipleSelection = false
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.directoryURL = FileManager.default.urls(
+            for: .downloadsDirectory,
+            in: .userDomainMask
+        ).first
+
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        state.importAudioFile(url)
+    }
+
     private var actionTitle: String {
         switch state.status {
-        case .idle:      return "Start recording"
-        case .recording: return "Stop and queue"
-        case .stopping:  return "Saving audio..."
-        case .error:     return "Try again"
+        case .idle:      return "Iniciar gravação"
+        case .recording: return "Parar e adicionar à fila"
+        case .stopping:  return "Salvando áudio…"
+        case .importing: return "Importando áudio…"
+        case .error:     return "Tentar novamente"
         }
     }
 
@@ -311,6 +436,7 @@ struct MenuBarView: View {
         case .idle, .error: return "record.circle"
         case .recording: return "stop.circle"
         case .stopping: return "hourglass"
+        case .importing: return "square.and.arrow.down"
         }
     }
 
@@ -322,6 +448,7 @@ struct MenuBarView: View {
             return .green.opacity(0.7)
         case .recording: return .red
         case .stopping:  return .orange
+        case .importing: return .blue
         case .error:     return .orange
         }
     }
@@ -330,7 +457,7 @@ struct MenuBarView: View {
         switch lang {
         case "pt":  return "PT"
         case "en":  return "EN"
-        default:    return "Auto"
+        default:    return "Automático"
         }
     }
 
@@ -343,17 +470,19 @@ struct MenuBarView: View {
             state.stopRecording()
         case .stopping:
             break
+        case .importing:
+            break
         }
     }
 
     private func jobStatusLabel(_ status: TranscriptionJobStatus) -> String {
         switch status {
         case .queued:
-            return "Queued"
+            return "Na fila"
         case .running:
-            return "Running"
+            return "Em andamento"
         case .succeeded:
-            return "Done"
+            return "Concluída"
         case .failed(let message):
             return message
         }

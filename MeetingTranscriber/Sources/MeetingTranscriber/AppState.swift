@@ -7,11 +7,13 @@ enum RecordingStatus {
     case idle
     case recording
     case stopping
+    case importing
     case error(String)
 
     var isRecording: Bool { if case .recording = self { return true }; return false }
     var isStopping: Bool { if case .stopping = self { return true }; return false }
-    var isBusy: Bool { isRecording || isStopping }
+    var isImporting: Bool { if case .importing = self { return true }; return false }
+    var isBusy: Bool { isRecording || isStopping || isImporting }
     var canStartRecording: Bool {
         if case .idle = self { return true }
         if case .error = self { return true }
@@ -20,9 +22,10 @@ enum RecordingStatus {
 
     var label: String {
         switch self {
-        case .idle: return "Ready"
-        case .recording: return "Recording..."
-        case .stopping: return "Saving audio..."
+        case .idle: return "Pronto"
+        case .recording: return "Gravando…"
+        case .stopping: return "Salvando áudio…"
+        case .importing: return "Importando áudio…"
         case .error(let msg): return msg
         }
     }
@@ -77,12 +80,15 @@ final class AppState: ObservableObject {
     @Published var outputDirectory: URL
     @Published var language: String  // "pt" | "en" | "auto"
     @Published var transcriptionJobs: [TranscriptionJob] = []
+    @Published var isCalendarSyncing = false
 
     private var mic: MicRecorder?
     private var sys: SystemAudioRecorder?
     private var tempDir: URL?
     private let maxConcurrentTranscriptions: Int
     private var runners: [UUID: TranscriptionRunner] = [:]
+    private let calendarLookup = CalendarLookup()
+    private var calendarWarning: String?
 
     init() {
         maxConcurrentTranscriptions = AppConfig.maxConcurrentTranscriptions
@@ -115,23 +121,23 @@ final class AppState: ObservableObject {
     }
 
     var statusLabel: String {
-        if status.isRecording || status.isStopping {
+        if status.isRecording || status.isStopping || status.isImporting {
             return status.label
         }
         if runningTranscriptionCount > 0 {
             let queued = queuedTranscriptionCount
             return queued > 0
-                ? "Transcribing \(runningTranscriptionCount), \(queued) queued"
-                : "Transcribing \(runningTranscriptionCount)"
+                ? "Transcrevendo \(runningTranscriptionCount) • \(queued) na fila"
+                : "Transcrevendo \(runningTranscriptionCount)"
         }
         if queuedTranscriptionCount > 0 {
-            return "\(queuedTranscriptionCount) queued"
+            return "\(queuedTranscriptionCount) na fila"
         }
         return status.label
     }
 
     func startRecording() {
-        guard status.canStartRecording else { return }
+        guard status.canStartRecording, !isCalendarSyncing else { return }
         lastWarning = nil
 
         // Não bloqueia gravar a próxima reunião, mas avisa: transcrição + nova
@@ -257,17 +263,89 @@ final class AppState: ObservableObject {
         }
     }
 
+    func importAudioFile(_ sourceURL: URL) {
+        guard status.canStartRecording, !isCalendarSyncing else { return }
+        lastWarning = nil
+        status = .importing
+
+        let title = meetingTitle.isEmpty ? Self.defaultTitle() : meetingTitle
+        let outDir = outputDirectory
+        let currentLanguage = language
+
+        Task {
+            do {
+                let stagedURL = try await Self.stageImportedAudio(from: sourceURL)
+                let job = TranscriptionJob(
+                    id: UUID(),
+                    title: title,
+                    language: currentLanguage,
+                    micURL: stagedURL,
+                    systemURL: nil,
+                    outputDir: outDir,
+                    sysOffsetMs: 0,
+                    createdAt: Date(),
+                    startedAt: nil,
+                    completedAt: nil,
+                    status: .queued
+                )
+
+                transcriptionJobs.append(job)
+                meetingTitle = Self.defaultTitle()
+                status = .idle
+                scheduleTranscriptionJobs()
+            } catch {
+                status = .error(error.localizedDescription)
+            }
+        }
+    }
+
     func resetError() {
         if case .error = status { status = .idle }
     }
 
     func clearWarning() {
         lastWarning = nil
+        calendarWarning = nil
+    }
+
+    func syncMeetingTitleFromCalendar() {
+        guard status.canStartRecording, !isCalendarSyncing else { return }
+        isCalendarSyncing = true
+
+        Task {
+            defer { isCalendarSyncing = false }
+
+            do {
+                guard let meeting = try await calendarLookup.nextConfirmedMeeting() else {
+                    showCalendarWarning("Nenhuma reunião confirmada nas próximas 24h.")
+                    return
+                }
+
+                meetingTitle = Self.calendarTitle(for: meeting)
+                clearCalendarWarning()
+            } catch let error as CalendarLookupError {
+                showCalendarWarning(error.localizedDescription)
+            } catch {
+                showCalendarWarning("Não foi possível consultar o Calendar: \(error.localizedDescription)")
+            }
+        }
     }
 
     private func warn(_ message: String) {
         lastWarning = message
         NotificationManager.shared.notifyWarning(message)
+    }
+
+    private func showCalendarWarning(_ message: String) {
+        calendarWarning = message
+        lastWarning = message
+    }
+
+    private func clearCalendarWarning() {
+        if lastWarning == calendarWarning {
+            lastWarning = nil
+        }
+        calendarWarning = nil
     }
 
     /// Garante acesso ao microfone antes de gravar. Sem isso, o AVAudioEngine pode
@@ -480,6 +558,39 @@ final class AppState: ObservableObject {
         return url
     }
 
+    private static func stageImportedAudio(from sourceURL: URL) async throws -> URL {
+        try await Task.detached(priority: .userInitiated) {
+            guard sourceURL.pathExtension.lowercased() == "wav" else {
+                throw AudioImportError.unsupportedFile
+            }
+
+            let hasScopedAccess = sourceURL.startAccessingSecurityScopedResource()
+            defer {
+                if hasScopedAccess { sourceURL.stopAccessingSecurityScopedResource() }
+            }
+
+            let audioFile = try AVAudioFile(forReading: sourceURL)
+            guard audioFile.length > 0 else {
+                throw AudioImportError.emptyFile
+            }
+            guard abs(audioFile.fileFormat.sampleRate - 16_000) < 0.5 else {
+                throw AudioImportError.unsupportedSampleRate(audioFile.fileFormat.sampleRate)
+            }
+
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("meeting-import-\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString)")
+            do {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                let stagedURL = directory.appendingPathComponent("mic.wav")
+                try FileManager.default.copyItem(at: sourceURL, to: stagedURL)
+                return stagedURL
+            } catch {
+                try? FileManager.default.removeItem(at: directory)
+                throw error
+            }
+        }.value
+    }
+
     private static func uniqueArchiveDirectory(for outputURL: URL) throws -> URL {
         let fm = FileManager.default
         let base = outputURL.deletingPathExtension()
@@ -503,8 +614,34 @@ final class AppState: ObservableObject {
     }
 
     static func defaultTitle() -> String {
+        "Reunião \(formattedTitleDate(Date()))"
+    }
+
+    private static func calendarTitle(for meeting: CalendarMeeting) -> String {
+        "\(meeting.title) — \(formattedTitleDate(meeting.startDate))"
+    }
+
+    private static func formattedTitleDate(_ date: Date) -> String {
         let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
         fmt.dateFormat = "yyyy-MM-dd HH:mm"
-        return "Reunião \(fmt.string(from: Date()))"
+        return fmt.string(from: date)
+    }
+}
+
+private enum AudioImportError: LocalizedError {
+    case unsupportedFile
+    case emptyFile
+    case unsupportedSampleRate(Double)
+
+    var errorDescription: String? {
+        switch self {
+        case .unsupportedFile:
+            return "Selecione um arquivo WAV."
+        case .emptyFile:
+            return "O arquivo selecionado não contém áudio."
+        case .unsupportedSampleRate(let sampleRate):
+            return "O WAV precisa ter 16 kHz; o arquivo selecionado tem \(Int(sampleRate)) Hz."
+        }
     }
 }

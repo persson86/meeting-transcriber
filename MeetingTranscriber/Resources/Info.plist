@@ -20,6 +20,10 @@
     <true/>
     <key>NSMicrophoneUsageDescription</key>
     <string>Necessário para gravar sua voz durante a reunião.</string>
+    <key>NSCalendarsFullAccessUsageDescription</key>
+    <string>Usado para ler suas próximas reuniões e preencher o título da transcrição.</string>
+    <key>NSCalendarsUsageDescription</key>
+    <string>Usado para ler suas próximas reuniões e preencher o título da transcrição.</string>
     <key>NSScreenCaptureUsageDescription</key>
     <string>Necessário para capturar o áudio do sistema durante a reunião.</string>
     <key>CFBundleIconFile</key>
