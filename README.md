@@ -66,6 +66,7 @@ defaults write <bundle-id> maxConcurrentTranscriptions 2
 defaults write <bundle-id> mlxModel mlx-community/whisper-large-v3-mlx
 defaults write <bundle-id> transcriptionBackend mlx
 defaults write <bundle-id> debugMemoryLogging -bool YES
+defaults write <bundle-id> secondBrainPath /path/to/second-brain
 ```
 
 `maxConcurrentTranscriptions` controls how many transcription processes run at
@@ -102,10 +103,12 @@ stderr) to measure before changing the model.
 ## Updating to the Latest Version
 
 > [!TIP]
-> Already installed and want the newest features (cancel/discard a queued or
-> running job, live progress %, one-click "open transcripts folder in Finder")?
-> Re-run the installer from the **same folder** you used the first time — it
-> updates your existing checkout in place, it does not start over.
+> Already installed and want the newest features (transcription queue reliably
+> visible again with live progress %, confirmation before cancelling an
+> in-flight job, transcripts open in Sublime Text by default, more resilient
+> system-audio capture)? Re-run the installer from the **same folder** you used
+> the first time — it updates your existing checkout in place, it does not
+> start over.
 
 ```bash
 cd ~/Transcricoes   # the folder you used the first time you installed
@@ -193,10 +196,20 @@ meeting while earlier recordings are still being transcribed.
 
 The wider menu uses native large controls and larger action targets for better
 readability. It shows recent jobs as queued, running, completed, or failed. A running
-job shows a live progress percentage. Every job — queued, running, or
-finished — has a cancel/discard button (✕); canceling a running job stops the
-Python process and deletes its temporary audio, and canceling a queued one
-removes it before it ever starts. Completed jobs can be opened from the menu.
+job shows a live progress percentage. A running or queued job is always visible
+in the list, no matter how many older completed jobs pile up in the same session —
+only the most recent finished jobs are kept around (older ones, along with their
+temporary audio, are pruned automatically).
+
+Every job has a dismiss button: for a completed job it's a plain ✕ that just
+removes it from the list, no confirmation needed. For a running or queued job
+it's a red stop icon that asks for confirmation before cancelling — it stops the
+Python process and deletes the temporary audio, which cannot be undone.
+
+Completed jobs can be opened with the 📄 button, or sent to a configured
+second-brain vault with the 🧠 button (only shown when `secondBrainPath` is set;
+see [Setup](#setup)). Opening a transcript prefers Sublime Text if it's
+installed; otherwise it prompts you to pick which app to open it with.
 
 Click the output folder name in the footer to open it directly in Finder;
 click the pencil icon next to it to change the output folder.

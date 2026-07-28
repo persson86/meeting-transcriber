@@ -90,6 +90,10 @@ final class AppState: ObservableObject {
     private let calendarLookup = CalendarLookup()
     private var calendarWarning: String?
 
+    /// Quantas transcrições concluídas ficam retidas (na lista e em memória).
+    /// Jobs ativos não contam para esse limite — eles são sempre visíveis.
+    private static let finishedJobRetentionCount = 4
+
     init() {
         maxConcurrentTranscriptions = AppConfig.maxConcurrentTranscriptions
         outputDirectory = UserDefaults.standard.url(forKey: "outputDirectory")
@@ -116,8 +120,23 @@ final class AppState: ObservableObject {
         maxConcurrentTranscriptions
     }
 
+    /// Fila visível no popover: primeiro os jobs ativos, na ordem em que serão
+    /// processados; depois as transcrições concluídas mais recentes. Um job em
+    /// execução nunca sai da lista enquanto o contador de status ainda o conta.
     var visibleTranscriptionJobs: [TranscriptionJob] {
-        Array(transcriptionJobs.suffix(5).reversed())
+        Self.visibleJobs(from: transcriptionJobs, finishedLimit: Self.finishedJobRetentionCount)
+    }
+
+    static func visibleJobs(from jobs: [TranscriptionJob], finishedLimit: Int) -> [TranscriptionJob] {
+        let active = jobs.filter { !$0.status.isFinished }
+        let recentFinished = jobs.filter { $0.status.isFinished }
+            .sorted { finishedAt($0) > finishedAt($1) }
+            .prefix(finishedLimit)
+        return active + recentFinished
+    }
+
+    private static func finishedAt(_ job: TranscriptionJob) -> Date {
+        job.completedAt ?? job.createdAt
     }
 
     var statusLabel: String {
@@ -421,6 +440,7 @@ final class AppState: ObservableObject {
         transcriptionJobs[index].completedAt = Date()
         lastOutputURL = outputURL
         NotificationManager.shared.notifyDone(fileURL: outputURL)
+        pruneFinishedJobs()
         scheduleTranscriptionJobs()
     }
 
@@ -429,7 +449,25 @@ final class AppState: ObservableObject {
         guard let index = transcriptionJobs.firstIndex(where: { $0.id == id }) else { return }
         transcriptionJobs[index].status = .failed(message)
         transcriptionJobs[index].completedAt = Date()
+        pruneFinishedJobs()
         scheduleTranscriptionJobs()
+    }
+
+    /// O que saiu da lista também sai da memória e do disco: jobs concluídos além
+    /// da janela de retenção são removidos junto com o áudio temporário. O áudio de
+    /// uma transcrição bem-sucedida já foi copiado para o arquivo permanente por
+    /// `archiveSessionFiles`; o de uma que falhou só existia aqui, e sem o job na
+    /// lista não haveria como reprocessá-lo pela UI de qualquer forma.
+    private func pruneFinishedJobs() {
+        let retainedIDs = Set(visibleTranscriptionJobs.map(\.id))
+        let stale = transcriptionJobs.filter { $0.status.isFinished && !retainedIDs.contains($0.id) }
+        guard !stale.isEmpty else { return }
+
+        let staleIDs = Set(stale.map(\.id))
+        transcriptionJobs.removeAll { staleIDs.contains($0.id) }
+        for job in stale {
+            deleteTempDir(for: job)
+        }
     }
 
     func cancelJob(_ id: UUID) {

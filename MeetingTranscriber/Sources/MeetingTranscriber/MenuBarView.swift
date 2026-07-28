@@ -12,12 +12,12 @@ private enum MenuLayout {
     static let buttonLabelMinHeight: CGFloat = 24
     static let iconButtonSize: CGFloat = 28
     static let jobIconWidth: CGFloat = 20
-    static let queueMaxHeight: CGFloat = 260
 }
 
 struct MenuBarView: View {
     @EnvironmentObject var state: AppState
     @State private var showDirPicker = false
+    @State private var jobPendingCancellation: TranscriptionJob?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -232,82 +232,47 @@ struct MenuBarView: View {
                             .monospacedDigit()
                     }
 
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: MenuLayout.controlSpacing) {
-                            ForEach(state.visibleTranscriptionJobs) { job in
-                                HStack(alignment: .top, spacing: MenuLayout.controlSpacing) {
-                                    Image(systemName: jobIcon(job.status))
-                                        .font(.body)
-                                        .foregroundColor(jobTint(job.status))
-                                        .frame(width: MenuLayout.jobIconWidth)
+                    VStack(alignment: .leading, spacing: MenuLayout.controlSpacing) {
+                        ForEach(state.visibleTranscriptionJobs) { job in
+                            HStack(alignment: .top, spacing: MenuLayout.controlSpacing) {
+                                Image(systemName: jobIcon(job.status))
+                                    .font(.body)
+                                    .foregroundColor(jobTint(job.status))
+                                    .frame(width: MenuLayout.jobIconWidth)
 
-                                    VStack(alignment: .leading, spacing: MenuLayout.compactSpacing) {
-                                        Text(job.title)
-                                            .font(.callout.weight(.medium))
-                                            .lineLimit(1)
-                                            .truncationMode(.tail)
-                                        HStack(spacing: MenuLayout.compactSpacing) {
-                                            Text(jobStatusLabel(job.status))
-                                            Text("•")
-                                            Text(timeLabel(job.createdAt))
-                                        }
-                                        .font(.caption)
-                                        .foregroundColor(.secondary)
+                                VStack(alignment: .leading, spacing: MenuLayout.compactSpacing) {
+                                    Text(job.title)
+                                        .font(.callout.weight(.medium))
                                         .lineLimit(1)
+                                        .truncationMode(.tail)
+                                    HStack(spacing: MenuLayout.compactSpacing) {
+                                        Text(jobStatusLabel(job.status))
+                                        Text("•")
+                                        Text(timeLabel(job.createdAt))
+                                    }
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                    .lineLimit(1)
 
-                                        if job.status.isRunning {
-                                            HStack(spacing: MenuLayout.controlSpacing) {
-                                                ProgressView(value: Double(job.progress), total: 100)
-                                                    .progressViewStyle(.linear)
-                                                Text("\(job.progress)%")
-                                                    .font(.caption)
-                                                    .monospacedDigit()
-                                                    .foregroundColor(.secondary)
-                                            }
+                                    if job.status.isRunning {
+                                        HStack(spacing: MenuLayout.controlSpacing) {
+                                            ProgressView(value: Double(job.progress), total: 100)
+                                                .progressViewStyle(.linear)
+                                            Text("\(job.progress)%")
+                                                .font(.caption)
+                                                .monospacedDigit()
+                                                .foregroundColor(.secondary)
                                         }
                                     }
+                                }
 
-                                    Spacer(minLength: MenuLayout.compactSpacing)
+                                Spacer(minLength: MenuLayout.compactSpacing)
 
-                                    if case .succeeded(let url) = job.status {
-                                        Button {
-                                            NSWorkspace.shared.open(url)
-                                        } label: {
-                                            Image(systemName: "doc.text")
-                                                .frame(
-                                                    width: MenuLayout.iconButtonSize,
-                                                    height: MenuLayout.iconButtonSize
-                                                )
-                                                .contentShape(Rectangle())
-                                        }
-                                        .buttonStyle(.plain)
-                                        .help("Abrir transcrição")
-
-                                        if AppConfig.secondBrainPath != nil {
-                                            Button {
-                                                state.sendToSecondBrain(job)
-                                            } label: {
-                                                Image(systemName: job.exportedToSecondBrain ? "checkmark.circle" : "brain")
-                                                    .frame(
-                                                        width: MenuLayout.iconButtonSize,
-                                                        height: MenuLayout.iconButtonSize
-                                                    )
-                                                    .contentShape(Rectangle())
-                                            }
-                                            .buttonStyle(.plain)
-                                            .disabled(job.exportedToSecondBrain)
-                                            .help(
-                                                job.exportedToSecondBrain
-                                                    ? "Enviada ao second-brain"
-                                                    : "Enviar ao second-brain"
-                                            )
-                                        }
-                                    }
-
+                                if case .succeeded(let url) = job.status {
                                     Button {
-                                        state.cancelJob(job.id)
+                                        openTranscript(url)
                                     } label: {
-                                        Image(systemName: "xmark.circle")
+                                        Image(systemName: "doc.text")
                                             .frame(
                                                 width: MenuLayout.iconButtonSize,
                                                 height: MenuLayout.iconButtonSize
@@ -315,22 +280,78 @@ struct MenuBarView: View {
                                             .contentShape(Rectangle())
                                     }
                                     .buttonStyle(.plain)
-                                    .help(job.status.isFinished ? "Remover da lista" : "Cancelar e descartar")
+                                    .help("Abrir transcrição")
+
+                                    if AppConfig.secondBrainPath != nil {
+                                        Button {
+                                            state.sendToSecondBrain(job)
+                                        } label: {
+                                            Image(systemName: job.exportedToSecondBrain ? "checkmark.circle" : "brain")
+                                                .frame(
+                                                    width: MenuLayout.iconButtonSize,
+                                                    height: MenuLayout.iconButtonSize
+                                                )
+                                                .contentShape(Rectangle())
+                                        }
+                                        .buttonStyle(.plain)
+                                        .disabled(job.exportedToSecondBrain)
+                                        .help(
+                                            job.exportedToSecondBrain
+                                                ? "Enviada ao second-brain"
+                                                : "Enviar ao second-brain"
+                                        )
+                                    }
                                 }
-                                .padding(.vertical, MenuLayout.compactSpacing)
+
+                                Button {
+                                    if job.status.isFinished {
+                                        state.cancelJob(job.id)
+                                    } else {
+                                        jobPendingCancellation = job
+                                    }
+                                } label: {
+                                    Image(systemName: dismissIcon(job.status))
+                                        .foregroundColor(dismissTint(job.status))
+                                        .frame(
+                                            width: MenuLayout.iconButtonSize,
+                                            height: MenuLayout.iconButtonSize
+                                        )
+                                        .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .help(job.status.isFinished ? "Remover da lista" : "Cancelar e descartar")
                             }
+                            .padding(.vertical, MenuLayout.compactSpacing)
                         }
                     }
-                    .frame(maxHeight: MenuLayout.queueMaxHeight)
                 }
                 .padding(MenuLayout.padding)
+                .confirmationDialog(
+                    "Cancelar esta transcrição?",
+                    isPresented: Binding(
+                        get: { jobPendingCancellation != nil },
+                        set: { if !$0 { jobPendingCancellation = nil } }
+                    ),
+                    titleVisibility: .visible,
+                    presenting: jobPendingCancellation
+                ) { job in
+                    Button("Cancelar e descartar", role: .destructive) {
+                        state.cancelJob(job.id)
+                        jobPendingCancellation = nil
+                    }
+                    Button("Manter na fila", role: .cancel) {
+                        jobPendingCancellation = nil
+                    }
+                } message: { job in
+                    Text("“\(job.title)” será interrompida e o áudio gravado, apagado. Não dá para desfazer.")
+                }
             }
 
             // ── Last output ───────────────────────────────────────────────
             if let url = state.lastOutputURL {
                 Divider()
                 Button {
-                    NSWorkspace.shared.open(url)
+                    openTranscript(url)
                 } label: {
                     Label(url.lastPathComponent, systemImage: "doc.text")
                         .font(.callout)
@@ -401,6 +422,40 @@ struct MenuBarView: View {
     }
 
     // MARK: - Helpers
+
+    /// Abre uma transcrição concluída. Prefere o Sublime Text; se não estiver
+    /// instalado, deixa o usuário escolher o programa em vez de cair num app
+    /// qualquer que o macOS tenha associado à extensão.
+    private func openTranscript(_ url: URL) {
+        if let sublimeURL = Self.sublimeTextURL() {
+            NSWorkspace.shared.open([url], withApplicationAt: sublimeURL, configuration: NSWorkspace.OpenConfiguration())
+        } else {
+            promptForApplication(toOpen: url)
+        }
+    }
+
+    private static func sublimeTextURL() -> URL? {
+        ["com.sublimetext.4", "com.sublimetext.3", "com.sublimetext.2"]
+            .lazy
+            .compactMap { NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0) }
+            .first
+    }
+
+    private func promptForApplication(toOpen url: URL) {
+        let panel = NSOpenPanel()
+        panel.title = "Abrir com…"
+        panel.message = "Sublime Text não foi encontrado. Escolha outro programa para abrir \"\(url.lastPathComponent)\"."
+        panel.prompt = "Abrir"
+        panel.allowedContentTypes = [.application]
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let appURL = panel.url else { return }
+        NSWorkspace.shared.open([url], withApplicationAt: appURL, configuration: NSWorkspace.OpenConfiguration())
+    }
 
     private func chooseAudioFile() {
         let panel = NSOpenPanel()
@@ -506,10 +561,26 @@ struct MenuBarView: View {
         }
     }
 
-    private func timeLabel(_ date: Date) -> String {
+    /// Concluída: some da lista, sem consequência. Ativa: interrompe o processo e
+    /// descarta o áudio — vermelho porque é a única ação destrutiva da linha.
+    private func dismissIcon(_ status: TranscriptionJobStatus) -> String {
+        status.isFinished ? "xmark.circle" : "stop.circle"
+    }
+
+    private func dismissTint(_ status: TranscriptionJobStatus) -> Color {
+        status.isFinished ? .secondary : .red
+    }
+
+    /// Reaproveitado entre linhas e re-renders: `transcriptionJobs` republica a cada
+    /// tick de progresso, e alocar um DateFormatter por linha custa caro à toa.
+    private static let timeFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.timeStyle = .short
         formatter.dateStyle = .none
-        return formatter.string(from: date)
+        return formatter
+    }()
+
+    private func timeLabel(_ date: Date) -> String {
+        Self.timeFormatter.string(from: date)
     }
 }

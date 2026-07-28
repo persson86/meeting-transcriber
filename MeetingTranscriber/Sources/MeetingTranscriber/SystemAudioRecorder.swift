@@ -42,7 +42,11 @@ final class SystemAudioRecorder: @unchecked Sendable {
     }
 
     func stop(saveTo url: URL) async throws {
-        try await stream?.stopCapture()
+        // stopCapture() throws if the stream already died mid-recording (e.g. the
+        // OS tears it down after dropped frames). That's a signal, not a reason to
+        // discard whatever the writer already buffered — best-effort stop, then
+        // always try to save.
+        try? await stream?.stopCapture()
         stream = nil
         if !writer.isEmpty {
             try writer.save(to: url)
