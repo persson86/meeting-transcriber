@@ -1810,7 +1810,7 @@ def main() -> None:
         primary_output = llm_path
     elif args.format == "analysis":
         primary_output = analysis_path
-    elif args.format in ("jsonl", "both"):
+    elif args.format == "jsonl":
         primary_output = jsonl_path
     else:
         primary_output = md_path
