@@ -92,7 +92,7 @@ final class AppState: ObservableObject {
 
     /// Quantas transcrições concluídas ficam retidas (na lista e em memória).
     /// Jobs ativos não contam para esse limite — eles são sempre visíveis.
-    private static let finishedJobRetentionCount = 4
+    private static let finishedJobRetentionCount = 5
 
     init() {
         maxConcurrentTranscriptions = AppConfig.maxConcurrentTranscriptions
@@ -100,6 +100,7 @@ final class AppState: ObservableObject {
             ?? AppConfig.defaultOutputDirectory
         language = UserDefaults.standard.string(forKey: "language") ?? "pt"
         meetingTitle = Self.defaultTitle()
+        transcriptionJobs = Self.loadRecentFinishedJobs(from: outputDirectory, limit: Self.finishedJobRetentionCount)
     }
 
     var runningTranscriptionCount: Int {
@@ -664,6 +665,54 @@ final class AppState: ObservableObject {
         fmt.locale = Locale(identifier: "en_US_POSIX")
         fmt.dateFormat = "yyyy-MM-dd HH:mm"
         return fmt.string(from: date)
+    }
+
+    /// A fila só vive na memória do processo: sem isso, reabrir o app zera a
+    /// lista mesmo com transcrições recentes já salvas em disco. Reconstrói os
+    /// jobs mais recentes a partir dos `.md` existentes na pasta de saída.
+    private static func loadRecentFinishedJobs(from outputDirectory: URL, limit: Int) -> [TranscriptionJob] {
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(
+            at: outputDirectory,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+
+        let recent = entries
+            .filter { $0.pathExtension.lowercased() == "md" }
+            .compactMap { url -> (URL, Date)? in
+                guard let date = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+                else { return nil }
+                return (url, date)
+            }
+            .sorted { $0.1 > $1.1 }
+            .prefix(limit)
+
+        return recent.map { url, date in
+            TranscriptionJob(
+                id: UUID(),
+                title: transcriptTitle(from: url) ?? url.deletingPathExtension().lastPathComponent,
+                language: "auto",
+                micURL: nil,
+                systemURL: nil,
+                outputDir: outputDirectory,
+                sysOffsetMs: 0,
+                createdAt: date,
+                startedAt: nil,
+                completedAt: date,
+                status: .succeeded(url)
+            )
+        }
+    }
+
+    /// O Markdown gerado por transcribe_meeting.py começa com "# {título}".
+    private static func transcriptTitle(from url: URL) -> String? {
+        guard let text = try? String(contentsOf: url, encoding: .utf8),
+              let firstLine = text.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false).first
+        else { return nil }
+        let trimmed = firstLine.trimmingCharacters(in: .whitespaces)
+        guard trimmed.hasPrefix("# ") else { return nil }
+        return String(trimmed.dropFirst(2))
     }
 }
 
