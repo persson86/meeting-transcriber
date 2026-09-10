@@ -1,6 +1,6 @@
 PYTHON = .venv/bin/python
 
-.PHONY: test baselines baselines-update app setup install
+.PHONY: test test-python test-swift test-integration test-asr verify-release baselines baselines-update app setup install
 
 setup:
 	python3 -m venv .venv
@@ -10,9 +10,25 @@ setup:
 install:
 	./install.sh
 
-# Gate local: unit + validação de fixtures/goldens (rápido, sem transcrever)
-test:
-	$(PYTHON) -m pytest tests/ -q
+# Gate portátil: não usa modelo, permissões, hardware ou corpus privado.
+test: test-python test-swift
+
+test-python:
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -m pytest tests/ -q -p no:cacheprovider
+
+test-swift:
+	SDKROOT="$$(xcrun --sdk macosx --show-sdk-path)" swift test --package-path MeetingTranscriber
+
+test-integration:
+	SDKROOT="$$(xcrun --sdk macosx --show-sdk-path)" swift test --package-path MeetingTranscriber --filter TranscriptionRunnerTests
+
+test-asr:
+	@test -f tests/fixtures/audio-baselines/manifest.json || { \
+		echo "BLOQUEADO: corpus local ausente; nenhum teste ASR foi executado." >&2; exit 2; \
+	}
+	$(PYTHON) tests/run_quality_baselines.py
+
+verify-release: test app
 
 # Regressão de qualidade completa: transcreve os casos primary-regression
 # e compara contra os goldens aprovados (pesado — Whisper large-v3)

@@ -26,6 +26,10 @@ def wav_metadata(path):
         }
 
 
+@unittest.skipUnless(
+    MANIFEST_PATH.exists(),
+    "corpus local de áudio ausente; execute make test-asr em um ambiente provisionado",
+)
 class AudioBaselineTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

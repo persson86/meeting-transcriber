@@ -5,6 +5,7 @@ enum TranscriptionError: LocalizedError {
     case pythonNotFound(String)
     case scriptNotFound(String)
     case noOutputPath(String)
+    case invalidOutput(String)
     case processFailed(Int32, String)
 
     var errorDescription: String? {
@@ -17,6 +18,8 @@ enum TranscriptionError: LocalizedError {
             return "Script de transcrição não encontrado em \(path). Ajuste scriptPath via defaults."
         case .noOutputPath(let out):
             return "Script não retornou caminho do arquivo.\n\(out)"
+        case .invalidOutput(let detail):
+            return "A transcrição terminou sem produzir artefatos válidos: \(detail)"
         case .processFailed(let code, let out):
             return "Transcrição falhou (exit \(code)):\n\(out)"
         }
@@ -62,12 +65,17 @@ private final class PipeDrain: @unchecked Sendable {
 }
 
 final class TranscriptionRunner {
-    private let python = AppConfig.pythonPath
-    private let script = AppConfig.scriptPath
+    private let python: String
+    private let script: String
     private let lock = NSLock()
     private var proc: Process?
     private var processStarted = false
     private var cancelled = false
+
+    init(python: String = AppConfig.pythonPath, script: String = AppConfig.scriptPath) {
+        self.python = python
+        self.script = script
+    }
 
     func cancel() {
         let processToTerminate: Process? = lock.withLock {
@@ -84,6 +92,9 @@ final class TranscriptionRunner {
         language: String = "pt",
         sysOffsetMs: Double = 0,
         outputDir: URL,
+        sessionID: UUID? = nil,
+        captureIntegrity: CaptureIntegrity = .unknown,
+        recordedAt: Date? = nil,
         onProgress: @escaping (Int) -> Void = { _ in }
     ) async throws -> URL {
         guard FileManager.default.isExecutableFile(atPath: python) else {
@@ -95,6 +106,10 @@ final class TranscriptionRunner {
 
         return try await withCheckedThrowingContinuation { continuation in
             var args = [script, "--out", outputDir.path, "--title", title, "--language", language]
+            if let sessionID { args += ["--session-id", sessionID.uuidString] }
+            if let recordedAt { args += ["--recorded-at", ISO8601DateFormatter().string(from: recordedAt)] }
+            args += ["--capture-integrity", captureIntegrity.status.rawValue]
+            for issue in captureIntegrity.details { args += ["--capture-issue", issue] }
             for term in AppConfig.contextTerms {
                 args += ["--context-term", term]
             }
@@ -150,7 +165,16 @@ final class TranscriptionRunner {
                         .map { String($0.dropFirst("Output: ".count)) }
 
                     if let path, !path.isEmpty {
-                        continuation.resume(returning: URL(fileURLWithPath: path))
+                        do {
+                            let outputURL = try Self.validateOutput(
+                                declaredPath: path,
+                                outputDirectory: outputDir,
+                                sessionID: sessionID
+                            )
+                            continuation.resume(returning: outputURL)
+                        } catch {
+                            continuation.resume(throwing: error)
+                        }
                     } else {
                         continuation.resume(throwing: TranscriptionError.noOutputPath(stdout))
                     }
@@ -194,5 +218,62 @@ final class TranscriptionRunner {
                 continuation.resume(throwing: error)
             }
         }
+    }
+
+    private static func validateOutput(
+        declaredPath: String,
+        outputDirectory: URL,
+        sessionID: UUID?
+    ) throws -> URL {
+        let output = URL(fileURLWithPath: declaredPath).standardizedFileURL
+        let root = outputDirectory.standardizedFileURL
+        let rootPrefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
+        guard output.path.hasPrefix(rootPrefix), output.pathExtension == "md" else {
+            throw TranscriptionError.invalidOutput("o caminho declarado não é um Markdown dentro da pasta configurada")
+        }
+
+        let base = output.deletingPathExtension()
+        let jsonl = base.appendingPathExtension("jsonl")
+        for artifact in [output, jsonl] {
+            guard let values = try? artifact.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+                  values.isRegularFile == true,
+                  (values.fileSize ?? 0) > 0 else {
+                throw TranscriptionError.invalidOutput("\(artifact.lastPathComponent) está ausente ou vazio")
+            }
+        }
+
+        let jsonlText: String
+        do {
+            jsonlText = try String(contentsOf: jsonl, encoding: .utf8)
+        } catch {
+            throw TranscriptionError.invalidOutput("não foi possível ler \(jsonl.lastPathComponent)")
+        }
+        let rows = jsonlText.split(whereSeparator: \.isNewline)
+        guard !rows.isEmpty else {
+            throw TranscriptionError.invalidOutput("o JSONL não contém registros")
+        }
+        var parsedRows: [[String: Any]] = []
+        do {
+            parsedRows = try rows.map { line in
+                guard let row = try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else {
+                    throw TranscriptionError.invalidOutput("o JSONL contém um registro que não é objeto")
+                }
+                return row
+            }
+        } catch let error as TranscriptionError {
+            throw error
+        } catch {
+            throw TranscriptionError.invalidOutput("o JSONL não é parseável")
+        }
+
+        guard let firstRow = parsedRows.first,
+              firstRow["type"] as? String == "meta" else {
+            throw TranscriptionError.invalidOutput("o primeiro registro JSONL não contém metadados")
+        }
+        if let sessionID,
+           firstRow["session_id"] as? String != sessionID.uuidString {
+            throw TranscriptionError.invalidOutput("o JSONL não pertence à sessão solicitada")
+        }
+        return output
     }
 }

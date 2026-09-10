@@ -6,11 +6,12 @@ CONTENTS = $(BUNDLE)/Contents
 # Run 'make setup-cert' once if not created yet
 SIGN_ID  = MeetingTranscriber Dev Signing
 OPEN_APP ?= 1
+ALLOW_RUNNING_INSTALL ?= 0
 
 .PHONY: build install run clean setup-cert
 
 build:
-	swift build -c release 2>&1
+	SDKROOT="$$(xcrun --sdk macosx --show-sdk-path)" swift build -c release 2>&1
 	@echo "→ Assembling $(BUNDLE)..."
 	@rm -rf $(BUNDLE)
 	@mkdir -p $(CONTENTS)/MacOS $(CONTENTS)/Resources
@@ -31,7 +32,16 @@ build:
 	@echo "✓ $(BUNDLE) ready"
 
 install: build
-	@pkill -x $(APP) 2>/dev/null || true
+	@if pgrep -x $(APP) >/dev/null 2>&1; then \
+		if [ "$(ALLOW_RUNNING_INSTALL)" = "1" ]; then \
+			echo "⚠️  Encerrando $(APP) por override explícito"; \
+			pkill -x $(APP); \
+		else \
+			echo "✗ $(APP) está aberto. Feche-o antes de instalar para não interromper uma gravação." >&2; \
+			echo "  Use ALLOW_RUNNING_INSTALL=1 somente após confirmar que não há captura ativa." >&2; \
+			exit 2; \
+		fi; \
+	fi
 	@mkdir -p ~/Applications
 	@cp -r $(BUNDLE) ~/Applications/
 	@/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
@@ -41,8 +51,10 @@ install: build
 	@echo "✓ Installed to ~/Applications/$(APP).app"
 
 run: build
-	@pkill -x $(APP) 2>/dev/null || true
-	@sleep 0.5
+	@if pgrep -x $(APP) >/dev/null 2>&1; then \
+		echo "✗ $(APP) já está aberto. Feche a instância atual antes de executar o build." >&2; \
+		exit 2; \
+	fi
 	@open $(BUNDLE)
 
 setup-cert:

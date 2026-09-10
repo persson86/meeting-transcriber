@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import wave
 from dataclasses import dataclass
 from datetime import datetime
@@ -44,7 +45,7 @@ CHUNK_OVERLAP_SEC = 3.0
 CHUNK_DEDUP_TOLERANCE_SEC = 0.5
 TEXT_DENSITY_SUSPECT_CHARS_PER_SEC = 80.0
 
-PIPELINE_VERSION = "0.6.0"
+PIPELINE_VERSION = "0.7.0"
 DEFAULT_HOTWORD_LIMIT = 60
 PROMPT_TAIL_MAX_CHARS = 240
 RUNAWAY_UNICODE_MIN_REPEATS = 8
@@ -199,7 +200,6 @@ LANGUAGE_CONFIG = {
             "Squatch": "Squad",
             "Splat": "Squad",
             "ponta desse bag": "ponta do iceberg",
-            "vai obrigar muito time": "vai agregar muito ao time",
         },
     },
     "en": {
@@ -514,18 +514,16 @@ def load_transcription_config(
 
 def normalize_audio(data: np.ndarray) -> np.ndarray:
     """Converte WAV mono/stereo para float32 mono normalizado."""
-    if data.ndim > 1:
-        data = data.mean(axis=1)
-
     if np.issubdtype(data.dtype, np.floating):
-        return data.astype(np.float32)
+        normalized = data.astype(np.float32)
+    else:
+        info = np.iinfo(data.dtype)
+        scale = max(abs(info.min), info.max)
+        normalized = data.astype(np.float32) / float(scale)
 
-    if data.dtype == np.int16:
-        return data.astype(np.float32) / 32768.0
-
-    info = np.iinfo(data.dtype)
-    scale = max(abs(info.min), info.max)
-    return data.astype(np.float32) / float(scale)
+    if normalized.ndim > 1:
+        normalized = normalized.mean(axis=1)
+    return normalized
 
 
 def load_audio(audio_path: str) -> np.ndarray:
@@ -679,24 +677,33 @@ def _relabel_resemblyzer(
     X = np.array(embeddings, dtype=np.float32)
     n = len(system_segs)
 
-    if n < 2:
-        system_segs[0].speaker = _speaker_label(0)
+    if n < 4:
+        for seg in system_segs:
+            seg.speaker = _speaker_label(0)
         return
 
-    # Find optimal k in [2, min(max_speakers, n//2, 8)] by silhouette score
-    best_k = 2
+    # A split needs repeated evidence for each label. In particular, do not
+    # force two clusters just because multiple segments exist.
+    best_k: int | None = None
     best_score = -1.0
     upper_k = min(max_speakers, n // 2, 8)
     for k in range(2, upper_k + 1):
         labels = AgglomerativeClustering(
             n_clusters=k, metric="cosine", linkage="average"
         ).fit_predict(X)
-        if len(set(labels)) < 2:
+        _, counts = np.unique(labels, return_counts=True)
+        if len(counts) < 2 or np.any(counts < 2):
             continue
         score = float(silhouette_score(X, labels, metric="cosine"))
-        if score > best_score:
+        if score >= 0.25 and score > best_score:
             best_score = score
             best_k = k
+
+    if best_k is None:
+        for seg in system_segs:
+            seg.speaker = _speaker_label(0)
+        print("  [diarize] insufficient evidence for multiple remote speakers", flush=True)
+        return
 
     labels = AgglomerativeClustering(
         n_clusters=best_k, metric="cosine", linkage="average"
@@ -912,11 +919,11 @@ def collect_segments(
 ) -> list[Segment]:
     segments = []
     for seg in raw_segments:
-        text = seg.text.strip()
+        raw_text = seg.text.strip()
         # Normalize whitespace including verse-like \n that Whisper emits on rhythmic pauses
-        text = re.sub(r"\s+", " ", text)
+        raw_text = re.sub(r"\s+", " ", raw_text)
+        text = raw_text
         text = apply_text_replacements(text, config.replacements)
-        raw_text = text
         text, text_is_suspect = sanitize_intraword_runaways(text)
         text = collapse_runaway_repetitions(text)
         text = normalize_laughter(text)
@@ -1222,23 +1229,21 @@ def consolidate_turns(
         for split_segment in split_long_segment(segment, max_turn_duration_s)
     ]
 
-    grouped: dict[str, list[list[Segment]]] = {}
-    for seg in sorted(expanded_segments, key=lambda item: (item.speaker, item.start)):
+    grouped: list[list[Segment]] = []
+    for seg in sorted(expanded_segments, key=lambda item: (item.start, item.end, item.speaker)):
         speaker = seg.speaker or "Áudio"
-        speaker_groups = grouped.setdefault(speaker, [])
-        if speaker_groups:
-            last_group = speaker_groups[-1]
+        if grouped and (grouped[-1][-1].speaker or "Áudio") == speaker:
+            last_group = grouped[-1]
             gap = seg.start - last_group[-1].end
             span_if_added = seg.end - last_group[0].start
             if gap < gap_threshold_s and span_if_added <= max_turn_duration_s:
                 last_group.append(seg)
                 continue
-        speaker_groups.append([seg])
+        grouped.append([seg])
 
     turns = [
         turn_from_segments(group)
-        for speaker_groups in grouped.values()
-        for group in speaker_groups
+        for group in grouped
     ]
     return sorted(turns, key=lambda turn: (turn.start_ms, turn.end_ms, turn.speaker))
 
@@ -1253,10 +1258,16 @@ def build_meeting_meta(
     analysis_context: dict[str, str] | None = None,
     participants: list[str] | None = None,
     analysis_goal: str | None = None,
+    session_id: str | None = None,
+    capture_integrity: str = "unknown",
+    capture_issues: list[str] | None = None,
+    recorded_at: str | None = None,
 ) -> dict:
+    processed_at = datetime.now().astimezone().isoformat(timespec="seconds")
     meta = {
         "title": title,
-        "date": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "date": recorded_at or processed_at,
+        "processed_at": processed_at,
         "duration_ms": max((turn.end_ms for turn in turns), default=0),
         "language": language,
         "tracks": tracks,
@@ -1264,7 +1275,12 @@ def build_meeting_meta(
         "backend": backend,
         "model": model_name,
         "pipeline_version": PIPELINE_VERSION,
+        "capture_integrity": capture_integrity,
     }
+    if session_id:
+        meta["session_id"] = session_id
+    if capture_issues:
+        meta["capture_issues"] = capture_issues
     if analysis_goal:
         meta["analysis_goal"] = analysis_goal
     if participants:
@@ -1370,8 +1386,34 @@ def build_jsonl(
             "confidence": turn.confidence,
             "is_suspect": turn.is_suspect,
         })
+        source_text = turn.raw_text or turn.text
+        if source_text != text:
+            record["raw_text"] = source_text
         lines.append(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
     return "\n".join(lines) + ("\n" if lines else "")
+
+
+def write_text_atomic(path: Path, content: str) -> None:
+    """Publica um artefato completo por rename no mesmo diretório."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".inprogress",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
 
 
 def turn_output_text(turn: Turn, sanitize_suspect: bool = True) -> str:
@@ -1419,6 +1461,9 @@ def build_markdown(
     dual_track: bool,
     language: str,
     sanitize_suspect: bool = True,
+    capture_integrity: str = "unknown",
+    capture_issues: list[str] | None = None,
+    recorded_at: str | None = None,
 ) -> str:
     now = datetime.now()
     duration = max((turn.end_ms for turn in turns), default=0) / 1000.0
@@ -1426,12 +1471,18 @@ def build_markdown(
 
     lines = [
         f"# {title}", "",
-        f"**Data:** {now.strftime('%Y-%m-%d %H:%M')}",
+        f"**Data:** {recorded_at or now.strftime('%Y-%m-%d %H:%M')}",
         f"**Duração:** {format_time(duration)}",
         f"**Trilhas:** {'mic + sistema' if dual_track else 'única'}",
         f"**Idioma:** {lang_label}",
         "", "---", "",
     ]
+    if capture_integrity == "degraded":
+        lines.extend([
+            "> ⚠ Captura parcial. O conteúdo abaixo pode estar incompleto.",
+            *[f"> - {issue}" for issue in (capture_issues or [])],
+            "",
+        ])
     for turn in turns:
         ts = format_time(turn.start_ms / 1000.0)
         suspect = " ⚠ suspeito" if turn.is_suspect else ""
@@ -1526,6 +1577,16 @@ def main() -> None:
     parser.add_argument(
         "--language", default="pt", choices=["pt", "en", "auto"],
         help="Idioma: pt (PT-BR, default), en (inglês), auto (detecção automática)",
+    )
+    parser.add_argument("--session-id", help="ID estável da sessão para proveniência e saída única")
+    parser.add_argument("--recorded-at", help="Data/hora ISO-8601 do início da gravação")
+    parser.add_argument(
+        "--capture-integrity", default="unknown", choices=["unknown", "complete", "degraded"],
+        help="Integridade observada da captura antes da transcrição",
+    )
+    parser.add_argument(
+        "--capture-issue", action="append", default=[],
+        help="Limitação observada da captura (pode repetir)",
     )
     parser.add_argument(
         "--backend", default="mlx", choices=["mlx", "faster-whisper"],
@@ -1758,12 +1819,20 @@ def main() -> None:
             "Identificar persona, tom, voz, posicionamento, personalidade e contexto"
             if args.persona_analysis or args.format == "analysis" else None
         ),
+        session_id=args.session_id,
+        capture_integrity=args.capture_integrity,
+        capture_issues=args.capture_issue,
+        recorded_at=args.recorded_at,
     )
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     now = datetime.now()
     filename_stem = f"{now.strftime('%Y-%m-%d_%H-%M')}_{slugify(args.title)}"
+    if args.session_id:
+        safe_session_id = re.sub(r"[^a-zA-Z0-9]", "", args.session_id)[:8]
+        if safe_session_id:
+            filename_stem = f"{filename_stem}-{safe_session_id}"
     output_paths: list[Path] = []
 
     jsonl_path = out_dir / f"{filename_stem}.jsonl"
@@ -1779,30 +1848,33 @@ def main() -> None:
     )
 
     if args.format in ("jsonl", "both"):
-        jsonl_path.write_text(jsonl_text, encoding="utf-8")
+        write_text_atomic(jsonl_path, jsonl_text)
         output_paths.append(jsonl_path)
 
     if args.format in ("markdown", "both"):
-        md_path.write_text(
+        write_text_atomic(
+            md_path,
             build_markdown(
                 args.title,
                 turns,
                 dual_track,
                 args.language,
                 sanitize_suspect=not args.no_sanitize,
+                capture_integrity=args.capture_integrity,
+                capture_issues=args.capture_issue,
+                recorded_at=args.recorded_at,
             ),
-            encoding="utf-8",
         )
         output_paths.append(md_path)
 
     if args.format == "llm":
-        llm_path.write_text(build_llm_package(meta, jsonl_text), encoding="utf-8")
+        write_text_atomic(llm_path, build_llm_package(meta, jsonl_text))
         output_paths.append(llm_path)
 
     if args.format == "analysis":
-        analysis_path.write_text(
+        write_text_atomic(
+            analysis_path,
             build_analysis_jsonl(turns, meta=None if args.no_meta else meta),
-            encoding="utf-8",
         )
         output_paths.append(analysis_path)
 

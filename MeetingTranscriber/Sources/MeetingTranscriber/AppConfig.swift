@@ -8,6 +8,7 @@ import Foundation
 ///   defaults write <bundle-id> contextTerms -array "ProjectName" "CustomerName"
 ///   defaults write <bundle-id> maxConcurrentTranscriptions 2
 ///   defaults write <bundle-id> secondBrainPath /path/to/second-brain
+///   defaults write <bundle-id> sessionRoot /path/to/recoverable/sessions
 enum AppConfig {
     static var projectRoot: String {
         if let configured = UserDefaults.standard.string(forKey: "projectRoot"), !configured.isEmpty {
@@ -77,6 +78,16 @@ enum AppConfig {
         guard let configured = UserDefaults.standard.string(forKey: "secondBrainPath"),
               !configured.isEmpty else { return nil }
         return NSString(string: configured).expandingTildeInPath
+    }
+
+    /// Sessões pendentes e seus áudios recuperáveis. Fica fora de `/tmp` para
+    /// sobreviver a encerramentos e reinícios do app.
+    static var sessionRoot: URL {
+        if let configured = UserDefaults.standard.string(forKey: "sessionRoot"), !configured.isEmpty {
+            return URL(fileURLWithPath: NSString(string: configured).expandingTildeInPath)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/MeetingTranscriber/Sessions")
     }
 
     // MARK: - Modelo de transcrição (memória)

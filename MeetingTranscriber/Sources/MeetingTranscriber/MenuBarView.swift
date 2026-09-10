@@ -192,8 +192,10 @@ struct MenuBarView: View {
                     .tint(state.status.isRecording ? .red : .accentColor)
                     .disabled(
                         state.status.isStopping
+                            || state.status.isStarting
                             || state.status.isImporting
                             || state.isCalendarSyncing
+                            || !state.storageIsAvailable
                     )
 
                 if case .idle = state.status {
@@ -235,9 +237,9 @@ struct MenuBarView: View {
                     VStack(alignment: .leading, spacing: MenuLayout.controlSpacing) {
                         ForEach(state.visibleTranscriptionJobs) { job in
                             HStack(alignment: .top, spacing: MenuLayout.controlSpacing) {
-                                Image(systemName: jobIcon(job.status))
+                                Image(systemName: jobIcon(job))
                                     .font(.body)
-                                    .foregroundColor(jobTint(job.status))
+                                    .foregroundColor(jobTint(job))
                                     .frame(width: MenuLayout.jobIconWidth)
 
                                 VStack(alignment: .leading, spacing: MenuLayout.compactSpacing) {
@@ -246,7 +248,7 @@ struct MenuBarView: View {
                                         .lineLimit(1)
                                         .truncationMode(.tail)
                                     HStack(spacing: MenuLayout.compactSpacing) {
-                                        Text(jobStatusLabel(job.status))
+                                        Text(jobStatusLabel(job))
                                         Text("•")
                                         Text(timeLabel(job.createdAt))
                                     }
@@ -303,9 +305,25 @@ struct MenuBarView: View {
                                     }
                                 }
 
+                                if case .failed = job.status,
+                                   job.micURL != nil || job.systemURL != nil {
+                                    Button {
+                                        state.retryJob(job.id)
+                                    } label: {
+                                        Image(systemName: "arrow.clockwise.circle")
+                                            .frame(
+                                                width: MenuLayout.iconButtonSize,
+                                                height: MenuLayout.iconButtonSize
+                                            )
+                                            .contentShape(Rectangle())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("Tentar novamente com o áudio preservado")
+                                }
+
                                 Button {
                                     if job.status.isFinished {
-                                        state.cancelJob(job.id)
+                                        state.dismissJob(job.id)
                                     } else {
                                         jobPendingCancellation = job
                                     }
@@ -319,7 +337,7 @@ struct MenuBarView: View {
                                         .contentShape(Rectangle())
                                 }
                                 .buttonStyle(.plain)
-                                .help(job.status.isFinished ? "Remover da lista" : "Cancelar e descartar")
+                                .help(job.status.isFinished ? "Remover da lista" : "Cancelar processamento")
                             }
                             .padding(.vertical, MenuLayout.compactSpacing)
                         }
@@ -335,7 +353,7 @@ struct MenuBarView: View {
                     titleVisibility: .visible,
                     presenting: jobPendingCancellation
                 ) { job in
-                    Button("Cancelar e descartar", role: .destructive) {
+                    Button("Cancelar processamento") {
                         state.cancelJob(job.id)
                         jobPendingCancellation = nil
                     }
@@ -343,7 +361,7 @@ struct MenuBarView: View {
                         jobPendingCancellation = nil
                     }
                 } message: { job in
-                    Text("“\(job.title)” será interrompida e o áudio gravado, apagado. Não dá para desfazer.")
+                    Text("“\(job.title)” será interrompida. O áudio ficará preservado para tentar novamente.")
                 }
             }
 
@@ -479,6 +497,7 @@ struct MenuBarView: View {
     private var actionTitle: String {
         switch state.status {
         case .idle:      return "Iniciar gravação"
+        case .starting:  return "Iniciando gravação…"
         case .recording: return "Parar e adicionar à fila"
         case .stopping:  return "Salvando áudio…"
         case .importing: return "Importando áudio…"
@@ -489,6 +508,7 @@ struct MenuBarView: View {
     private var actionIcon: String {
         switch state.status {
         case .idle, .error: return "record.circle"
+        case .starting: return "hourglass"
         case .recording: return "stop.circle"
         case .stopping: return "hourglass"
         case .importing: return "square.and.arrow.down"
@@ -501,6 +521,7 @@ struct MenuBarView: View {
             if state.runningTranscriptionCount > 0 { return .orange }
             if state.queuedTranscriptionCount > 0 { return .blue }
             return .green.opacity(0.7)
+        case .starting:  return .orange
         case .recording: return .red
         case .stopping:  return .orange
         case .importing: return .blue
@@ -521,6 +542,8 @@ struct MenuBarView: View {
         case .idle, .error:
             state.resetError()
             state.startRecording()
+        case .starting:
+            break
         case .recording:
             state.stopRecording()
         case .stopping:
@@ -530,39 +553,44 @@ struct MenuBarView: View {
         }
     }
 
-    private func jobStatusLabel(_ status: TranscriptionJobStatus) -> String {
-        switch status {
+    private func jobStatusLabel(_ job: TranscriptionJob) -> String {
+        switch job.status {
         case .queued:
             return "Na fila"
         case .running:
             return "Em andamento"
+        case .cancelling:
+            return "Cancelando…"
         case .succeeded:
-            return "Concluída"
+            return job.captureIntegrity.status == .degraded ? "Concluída com captura parcial" : "Concluída"
         case .failed(let message):
             return message
         }
     }
 
-    private func jobIcon(_ status: TranscriptionJobStatus) -> String {
-        switch status {
+    private func jobIcon(_ job: TranscriptionJob) -> String {
+        switch job.status {
         case .queued: return "clock"
         case .running: return "waveform"
-        case .succeeded: return "checkmark.circle.fill"
+        case .cancelling: return "stop.circle"
+        case .succeeded:
+            return job.captureIntegrity.status == .degraded ? "exclamationmark.triangle.fill" : "checkmark.circle.fill"
         case .failed: return "exclamationmark.triangle.fill"
         }
     }
 
-    private func jobTint(_ status: TranscriptionJobStatus) -> Color {
-        switch status {
+    private func jobTint(_ job: TranscriptionJob) -> Color {
+        switch job.status {
         case .queued: return .blue
         case .running: return .orange
-        case .succeeded: return .green
+        case .cancelling: return .orange
+        case .succeeded: return job.captureIntegrity.status == .degraded ? .orange : .green
         case .failed: return .orange
         }
     }
 
-    /// Concluída: some da lista, sem consequência. Ativa: interrompe o processo e
-    /// descarta o áudio — vermelho porque é a única ação destrutiva da linha.
+    /// Concluída: some da lista, sem excluir o áudio. Ativa: interrompe somente o
+    /// processamento; o áudio fica disponível para uma nova tentativa.
     private func dismissIcon(_ status: TranscriptionJobStatus) -> String {
         status.isFinished ? "xmark.circle" : "stop.circle"
     }

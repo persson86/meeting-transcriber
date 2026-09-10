@@ -71,6 +71,16 @@ class TranscribeMeetingTests(unittest.TestCase):
         self.assertEqual(tm.audio_duration_sec(None), 0.0)
         self.assertEqual(tm.audio_duration_sec("/missing/audio.wav"), 0.0)
 
+    def test_normalize_audio_downmixes_integer_channels_after_scaling(self):
+        mono = np.array([1000, -1000], dtype=np.int16)
+        stereo = np.column_stack([mono, mono])
+
+        normalized_mono = tm.normalize_audio(mono)
+        normalized_stereo = tm.normalize_audio(stereo)
+
+        np.testing.assert_allclose(normalized_stereo, normalized_mono)
+        self.assertLessEqual(float(np.max(np.abs(normalized_stereo))), 1.0)
+
     def test_transcribe_track_reports_chunk_progress_by_total_duration(self):
         wav_path = self.write_wav(duration_sec=3.0, amplitude=1000)
         model = FakeModel()
@@ -310,6 +320,30 @@ class TranscribeMeetingTests(unittest.TestCase):
             segments[0].text,
             "ambiente em UAT com endpoint, subscription e subscription",
         )
+        self.assertEqual(
+            segments[0].raw_text,
+            "ambiente em OAT com SandPoint, subscriptionion e subscript ion",
+        )
+
+    def test_default_replacements_do_not_change_semantic_statement(self):
+        config = tm.load_transcription_config(
+            language="pt",
+            config_json=None,
+            context_terms=[],
+            replacement_pairs=[],
+        )
+        raw_segments = [
+            SimpleNamespace(
+                start=0.0,
+                end=1.0,
+                text=" Isso vai obrigar muito time a mudar de processo. ",
+            ),
+        ]
+
+        segments = tm.collect_segments(raw_segments, "Você", 0.0, config)
+
+        self.assertEqual(segments[0].text, "Isso vai obrigar muito time a mudar de processo.")
+        self.assertEqual(segments[0].raw_text, segments[0].text)
 
     def test_default_replacements_can_be_disabled(self):
         config = tm.load_transcription_config(
@@ -333,6 +367,7 @@ class TranscribeMeetingTests(unittest.TestCase):
         segments = tm.collect_segments(raw_segments, "Você", 0.0, config)
 
         self.assertEqual(segments[0].text, "Krisp e Markdown")
+        self.assertEqual(segments[0].raw_text, "Crisp e maquedal")
 
     def test_collect_segments_collapses_runaway_repeated_sentences(self):
         config = tm.TranscriptionConfig()
@@ -654,7 +689,7 @@ class TranscribeMeetingTests(unittest.TestCase):
 
         self.assertIn("16000Hz", parser.message)
 
-    def test_consolidate_turns_merges_same_speaker_across_short_interjection(self):
+    def test_consolidate_turns_keeps_same_speaker_separate_across_interjection(self):
         segments = [
             tm.Segment(0.0, 1.0, "primeira parte", "Você", avg_logprob=-0.2),
             tm.Segment(1.1, 1.2, "aham", "Interlocutor", avg_logprob=-0.3),
@@ -663,11 +698,27 @@ class TranscribeMeetingTests(unittest.TestCase):
 
         turns = tm.consolidate_turns(segments)
 
-        self.assertEqual(len(turns), 2)
+        self.assertEqual(len(turns), 3)
         self.assertEqual(turns[0].speaker, "Você")
-        self.assertEqual(turns[0].text, "primeira parte segunda parte")
+        self.assertEqual(turns[0].text, "primeira parte")
         self.assertEqual(turns[0].start_ms, 0)
-        self.assertEqual(turns[0].end_ms, 2000)
+        self.assertEqual(turns[0].end_ms, 1000)
+        self.assertEqual(turns[1].speaker, "Interlocutor")
+        self.assertEqual(turns[1].text, "aham")
+        self.assertEqual(turns[2].speaker, "Você")
+        self.assertEqual(turns[2].text, "segunda parte")
+
+    def test_consolidate_turns_avoids_artificial_overlap_for_a_b_a(self):
+        segments = [
+            tm.Segment(0.0, 1.0, "primeira parte", "Você"),
+            tm.Segment(1.1, 1.2, "aham", "Interlocutor"),
+            tm.Segment(1.4, 2.0, "segunda parte", "Você"),
+        ]
+
+        turns = tm.consolidate_turns(segments)
+        rows = [json.loads(line) for line in tm.build_analysis_jsonl(turns).splitlines()]
+
+        self.assertEqual([row["overlap_ms"] for row in rows], [0, 0, 0])
 
     def test_build_jsonl_outputs_parseable_turn_objects(self):
         turns = [
@@ -692,7 +743,7 @@ class TranscribeMeetingTests(unittest.TestCase):
             "is_suspect": False,
         }])
 
-    def test_relabel_system_speakers_uses_remote_labels(self):
+    def test_relabel_system_speakers_keeps_one_label_without_repeated_evidence(self):
         system_audio = np.concatenate([
             np.full(tm.SAMPLE_RATE, 1000 / 32768.0, dtype=np.float32),
             np.zeros(tm.SAMPLE_RATE, dtype=np.float32),
@@ -706,7 +757,7 @@ class TranscribeMeetingTests(unittest.TestCase):
         tm.relabel_system_speakers(segments, system_audio, 0.0)
 
         self.assertEqual(segments[0].speaker, "Remote_A")
-        self.assertEqual(segments[1].speaker, "Remote_B")
+        self.assertEqual(segments[1].speaker, "Remote_A")
 
     def test_normalize_known_names_corrects_similar_token(self):
         # "Ferreirá" (accent typo, ~88% similar) and "Fereira" (~93%) should be replaced
@@ -841,6 +892,40 @@ class TranscribeMeetingTests(unittest.TestCase):
 
         self.assertEqual(row["text"], "FooterKidsKidsKidsKidsKids")
 
+    def test_build_jsonl_preserves_raw_asr_when_replacements_changed_text(self):
+        turns = [
+            tm.Turn(
+                "Você", "ambiente em UAT", 0, 1000, 0.9, False,
+                raw_text="ambiente em OAT",
+            ),
+        ]
+
+        row = json.loads(tm.build_jsonl(turns).strip())
+
+        self.assertEqual(row["text"], "ambiente em UAT")
+        self.assertEqual(row["raw_text"], "ambiente em OAT")
+
+    def test_build_jsonl_preserves_source_when_safe_text_changes_output(self):
+        turn = tm.Turn(
+            "Você", "texto bruto", 0, 1000, 0.1, True,
+            raw_text=None,
+            safe_text="[inaudível]",
+        )
+
+        row = json.loads(tm.build_jsonl([turn]).strip())
+
+        self.assertEqual(row["text"], "[inaudível]")
+        self.assertEqual(row["raw_text"], "texto bruto")
+
+    def test_write_text_atomic_leaves_complete_destination(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "transcript.jsonl"
+
+            tm.write_text_atomic(destination, '{"type":"turn"}\n')
+
+            self.assertEqual(destination.read_text(encoding="utf-8"), '{"type":"turn"}\n')
+            self.assertEqual(list(Path(tmp).glob("*.inprogress")), [])
+
     def test_build_jsonl_filter_suspect_removes_flagged_turns(self):
         turns = [
             tm.Turn("Você", "texto limpo", 0, 1000, 0.9, False),
@@ -904,6 +989,39 @@ class LlmOutputTests(unittest.TestCase):
         self.assertEqual(rows[0]["pipeline_version"], tm.PIPELINE_VERSION)
         self.assertTrue(all(row["type"] == "turn" for row in rows[1:]))
         self.assertEqual(rows[1]["speaker"], "Você")
+
+    def test_capture_integrity_and_session_provenance_are_exported(self):
+        turns = self.make_turns()
+        meta = tm.build_meeting_meta(
+            title="Planejamento",
+            language="pt",
+            turns=turns,
+            tracks="both",
+            backend="mlx",
+            model_name="modelo",
+            session_id="session-123",
+            capture_integrity="degraded",
+            capture_issues=["microfone terminou cedo"],
+            recorded_at="2026-09-10T09:00:00-03:00",
+        )
+
+        self.assertEqual(meta["session_id"], "session-123")
+        self.assertEqual(meta["date"], "2026-09-10T09:00:00-03:00")
+        self.assertEqual(meta["capture_integrity"], "degraded")
+        self.assertEqual(meta["capture_issues"], ["microfone terminou cedo"])
+        self.assertIn("processed_at", meta)
+
+        markdown = tm.build_markdown(
+            "Planejamento",
+            turns,
+            dual_track=True,
+            language="pt",
+            capture_integrity="degraded",
+            capture_issues=["microfone terminou cedo"],
+            recorded_at="2026-09-10T09:00:00-03:00",
+        )
+        self.assertIn("Captura parcial", markdown)
+        self.assertIn("microfone terminou cedo", markdown)
 
     def test_build_jsonl_without_meta_has_no_type_field(self):
         turns = self.make_turns()
@@ -1096,6 +1214,28 @@ class DiarizationTests(unittest.TestCase):
             [seg.speaker for seg in segments],
             ["Remote_A", "Remote_B", "Remote_A", "Remote_B"],
         )
+
+    def test_relabel_resemblyzer_keeps_one_label_without_cluster_evidence(self):
+        audio, segments = self.make_two_speaker_audio_and_segments()
+
+        class FakeEncoder:
+            embedding_size = 4
+
+            def __init__(self, device):
+                pass
+
+            def embed_utterance(self, wav):
+                return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+
+        fake_module = SimpleNamespace(
+            VoiceEncoder=FakeEncoder,
+            preprocess_wav=lambda wav, source_sr: wav,
+        )
+
+        with patch.dict(sys.modules, {"resemblyzer": fake_module}):
+            tm._relabel_resemblyzer(segments, audio, 0.0, max_speakers=8)
+
+        self.assertEqual([seg.speaker for seg in segments], ["Remote_A"] * 4)
 
     def test_relabel_resemblyzer_keeps_non_system_segments_untouched(self):
         audio, segments = self.make_two_speaker_audio_and_segments()

@@ -5,15 +5,17 @@ import AVFoundation
 
 enum RecordingStatus {
     case idle
+    case starting
     case recording
     case stopping
     case importing
     case error(String)
 
+    var isStarting: Bool { if case .starting = self { return true }; return false }
     var isRecording: Bool { if case .recording = self { return true }; return false }
     var isStopping: Bool { if case .stopping = self { return true }; return false }
     var isImporting: Bool { if case .importing = self { return true }; return false }
-    var isBusy: Bool { isRecording || isStopping || isImporting }
+    var isBusy: Bool { isStarting || isRecording || isStopping || isImporting }
     var canStartRecording: Bool {
         if case .idle = self { return true }
         if case .error = self { return true }
@@ -23,6 +25,7 @@ enum RecordingStatus {
     var label: String {
         switch self {
         case .idle: return "Pronto"
+        case .starting: return "Iniciando gravação…"
         case .recording: return "Gravando…"
         case .stopping: return "Salvando áudio…"
         case .importing: return "Importando áudio…"
@@ -34,6 +37,7 @@ enum RecordingStatus {
 enum TranscriptionJobStatus: Equatable {
     case queued
     case running
+    case cancelling
     case succeeded(URL)
     case failed(String)
 
@@ -43,14 +47,16 @@ enum TranscriptionJobStatus: Equatable {
     }
 
     var isRunning: Bool {
-        if case .running = self { return true }
-        return false
+        switch self {
+        case .running, .cancelling: return true
+        default: return false
+        }
     }
 
     var isFinished: Bool {
         switch self {
         case .succeeded, .failed: return true
-        case .queued, .running: return false
+        case .queued, .running, .cancelling: return false
         }
     }
 }
@@ -69,6 +75,7 @@ struct TranscriptionJob: Identifiable, Equatable {
     var status: TranscriptionJobStatus
     var progress: Int = 0
     var exportedToSecondBrain: Bool = false
+    var captureIntegrity: CaptureIntegrity = .unknown
 }
 
 @MainActor
@@ -85,22 +92,50 @@ final class AppState: ObservableObject {
     private var mic: MicRecorder?
     private var sys: SystemAudioRecorder?
     private var tempDir: URL?
+    private var currentSessionID: UUID?
+    private var captureStartedAt: Date?
+    private var captureMonitorTask: Task<Void, Never>?
+    private var captureHealthWarnings: Set<String> = []
     private let maxConcurrentTranscriptions: Int
     private var runners: [UUID: TranscriptionRunner] = [:]
     private let calendarLookup = CalendarLookup()
+    private let sessionStore: SessionStore
+    private let sessionLease: SessionStoreLease?
+    private let storageLeaseAvailable: Bool
     private var calendarWarning: String?
 
     /// Quantas transcrições concluídas ficam retidas (na lista e em memória).
     /// Jobs ativos não contam para esse limite — eles são sempre visíveis.
     private static let finishedJobRetentionCount = 5
 
-    init() {
+    init(sessionStore: SessionStore = SessionStore()) {
+        self.sessionStore = sessionStore
         maxConcurrentTranscriptions = AppConfig.maxConcurrentTranscriptions
         outputDirectory = UserDefaults.standard.url(forKey: "outputDirectory")
             ?? AppConfig.defaultOutputDirectory
         language = UserDefaults.standard.string(forKey: "language") ?? "pt"
         meetingTitle = Self.defaultTitle()
-        transcriptionJobs = Self.loadRecentFinishedJobs(from: outputDirectory, limit: Self.finishedJobRetentionCount)
+        let lease = try? sessionStore.acquireExclusiveLease()
+        sessionLease = lease
+        storageLeaseAvailable = lease != nil
+        guard storageLeaseAvailable else {
+            status = .error("Outra instância do Meeting Transcriber já está usando as sessões. Feche-a antes de continuar.")
+            return
+        }
+        let recovered = sessionStore.loadJobs()
+        let recoveredOutputs = Set(recovered.compactMap { job -> String? in
+            guard case .succeeded(let url) = job.status else { return nil }
+            return url.resolvingSymlinksInPath().path
+        })
+        let legacy = Self.loadRecentFinishedJobs(from: outputDirectory, limit: Self.finishedJobRetentionCount)
+            .filter { job in
+                guard case .succeeded(let url) = job.status else { return true }
+                return !recoveredOutputs.contains(url.resolvingSymlinksInPath().path)
+            }
+        transcriptionJobs = recovered + legacy
+        for job in recovered { try? sessionStore.save(job) }
+        pruneFinishedJobs()
+        Task { scheduleTranscriptionJobs() }
     }
 
     var runningTranscriptionCount: Int {
@@ -116,6 +151,8 @@ final class AppState: ObservableObject {
     }
 
     var hasActiveTranscription: Bool { activeTranscriptionCount > 0 }
+
+    var storageIsAvailable: Bool { storageLeaseAvailable }
 
     var maxConcurrentTranscriptionCount: Int {
         maxConcurrentTranscriptions
@@ -141,7 +178,7 @@ final class AppState: ObservableObject {
     }
 
     var statusLabel: String {
-        if status.isRecording || status.isStopping || status.isImporting {
+        if status.isBusy {
             return status.label
         }
         if runningTranscriptionCount > 0 {
@@ -157,7 +194,8 @@ final class AppState: ObservableObject {
     }
 
     func startRecording() {
-        guard status.canStartRecording, !isCalendarSyncing else { return }
+        guard storageLeaseAvailable, status.canStartRecording, !isCalendarSyncing else { return }
+        status = .starting
         lastWarning = nil
 
         // Não bloqueia gravar a próxima reunião, mas avisa: transcrição + nova
@@ -166,30 +204,83 @@ final class AppState: ObservableObject {
             lastWarning = "Transcrição em andamento — gravar agora aumenta o uso de memória (o app processa uma por vez). A gravação continua normalmente."
         }
 
+        let title = meetingTitle.isEmpty ? Self.defaultTitle() : meetingTitle
+        let outDir = outputDirectory
+        let currentLanguage = language
+        let sessionID = UUID()
+
         Task {
+            var pendingDirectory: URL?
+            var pendingMic: MicRecorder?
+            var pendingSystem: SystemAudioRecorder?
+            var recordingStartedAt: Date?
             do {
                 guard await ensureMicrophoneAccess() else {
                     status = .error("Permissão de microfone necessária. Ative o Meeting Transcriber em Configurações do Sistema → Privacidade e Segurança → Microfone, depois tente novamente.")
                     return
                 }
 
-                let dir = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("meeting-\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString)")
-                try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                let createdAt = Date()
+                recordingStartedAt = createdAt
 
-                let micRec = MicRecorder()
+                let dir = try sessionStore.prepareRecording(
+                    id: sessionID,
+                    title: title,
+                    language: currentLanguage,
+                    outputDirectory: outDir,
+                    createdAt: createdAt
+                )
+                pendingDirectory = dir
+
+                let micRec = MicRecorder(
+                    stagingDirectory: dir,
+                    stagingFileName: "mic.inprogress.wav",
+                    preserveOnDeinit: true
+                )
+                pendingMic = micRec
                 try micRec.start()
 
-                let sysRec = SystemAudioRecorder()
+                let sysRec = SystemAudioRecorder(
+                    stagingDirectory: dir,
+                    stagingFileName: "system.inprogress.wav",
+                    preserveOnDeinit: true
+                )
+                pendingSystem = sysRec
                 try await sysRec.start()
 
                 mic = micRec
                 sys = sysRec
                 tempDir = dir
+                currentSessionID = sessionID
+                captureStartedAt = createdAt
+                captureHealthWarnings = []
                 status = .recording
+                startCaptureMonitor()
 
             } catch {
                 let msg = error.localizedDescription
+                if let dir = pendingDirectory {
+                    let micURL = dir.appendingPathComponent("mic.wav")
+                    let systemURL = dir.appendingPathComponent("system.wav")
+                    try? pendingMic?.stop(saveTo: micURL)
+                    try? await pendingSystem?.stop(saveTo: systemURL)
+                    let failedJob = TranscriptionJob(
+                        id: sessionID,
+                        title: title,
+                        language: currentLanguage,
+                        micURL: Self.existingAudioFileURL(micURL),
+                        systemURL: Self.existingAudioFileURL(systemURL),
+                        outputDir: outDir,
+                        sysOffsetMs: 0,
+                        createdAt: recordingStartedAt ?? Date(),
+                        startedAt: recordingStartedAt,
+                        completedAt: Date(),
+                        status: .failed("Não foi possível iniciar a captura: \(msg)"),
+                        captureIntegrity: .degraded(["A inicialização da captura foi interrompida."])
+                    )
+                    transcriptionJobs.append(failedJob)
+                    persist(failedJob)
+                }
                 if msg.contains("declined") || msg.contains("not authorized") || msg.contains("userDeclined") {
                     CGRequestScreenCaptureAccess()
                     status = .error("Permissão de gravação de tela necessária. Ative o Meeting Transcriber em Configurações do Sistema → Privacidade e Segurança → Gravação de Tela e Áudio do Sistema, depois tente novamente.")
@@ -207,7 +298,10 @@ final class AppState: ObservableObject {
         let micCopy = mic
         let sysCopy = sys
         let dir = tempDir
-        mic = nil; sys = nil; tempDir = nil
+        let sessionID = currentSessionID ?? UUID()
+        let startedAt = captureStartedAt ?? Date()
+        captureMonitorTask?.cancel()
+        captureMonitorTask = nil
 
         let title = meetingTitle.isEmpty ? Self.defaultTitle() : meetingTitle
         let outDir = outputDirectory
@@ -224,8 +318,22 @@ final class AppState: ObservableObject {
                     )
                 }
 
-                try micCopy?.stop(saveTo: micURL)
-                try await sysCopy?.stop(saveTo: sysURL)
+                var captureIssues: [String] = []
+                do { try micCopy?.stop(saveTo: micURL) }
+                catch { captureIssues.append("Falha ao finalizar o microfone: \(error.localizedDescription)") }
+                do { try await sysCopy?.stop(saveTo: sysURL) }
+                catch { captureIssues.append("Falha ao finalizar o áudio do sistema: \(error.localizedDescription)") }
+
+                captureIssues.append(contentsOf: Self.healthIssues(
+                    mic: micCopy?.health,
+                    system: sysCopy?.health
+                ))
+                captureIssues.append(contentsOf: captureHealthWarnings)
+                captureIssues = Array(Set(captureIssues)).sorted()
+
+                mic = nil; sys = nil; tempDir = nil
+                currentSessionID = nil; captureStartedAt = nil
+                captureHealthWarnings = []
 
                 let recordedMicURL = Self.existingAudioFileURL(micURL)
                 let recordedSystemURL = Self.existingAudioFileURL(sysURL)
@@ -240,9 +348,9 @@ final class AppState: ObservableObject {
                 // Apenas uma trilha foi capturada: transcreve o que temos, mas avisa
                 // em vez de gerar um transcript incompleto em silêncio.
                 if recordedMicURL == nil {
-                    warn("Sua voz (microfone) não foi capturada nesta reunião — só o áudio do sistema foi salvo. Verifique o dispositivo de entrada e a permissão do microfone antes da próxima gravação.")
+                    captureIssues.append("Sua voz (microfone) não foi capturada.")
                 } else if recordedSystemURL == nil {
-                    warn("O áudio do sistema (interlocutor) não foi capturado — só a sua voz foi salva. Verifique a permissão de Gravação de Tela e Áudio do Sistema.")
+                    captureIssues.append("O áudio do sistema (interlocutor) não foi capturado.")
                 }
 
                 if AppConfig.debugMemoryLogging {
@@ -258,45 +366,82 @@ final class AppState: ObservableObject {
                     sysTime: sysCopy?.firstBufferTime
                 )
 
+                captureIssues.append(contentsOf: Self.durationIntegrityIssues(
+                    micURL: recordedMicURL,
+                    systemURL: recordedSystemURL,
+                    sessionDuration: Date().timeIntervalSince(startedAt),
+                    sysOffsetMs: sysOffsetMs
+                ))
+
                 let job = TranscriptionJob(
-                    id: UUID(),
+                    id: sessionID,
                     title: title,
                     language: currentLanguage,
                     micURL: recordedMicURL,
                     systemURL: recordedSystemURL,
                     outputDir: outDir,
                     sysOffsetMs: sysOffsetMs,
-                    createdAt: Date(),
+                    createdAt: startedAt,
                     startedAt: nil,
                     completedAt: nil,
-                    status: .queued
+                    status: .queued,
+                    captureIntegrity: captureIssues.isEmpty ? .complete : .degraded(captureIssues)
                 )
 
                 transcriptionJobs.append(job)
+                persist(job)
+                if !captureIssues.isEmpty {
+                    warn("Captura parcial: \(captureIssues.joined(separator: " ")) O áudio recuperável foi preservado.")
+                }
                 meetingTitle = Self.defaultTitle()
                 status = .idle
                 scheduleTranscriptionJobs()
 
             } catch {
+                mic = nil; sys = nil; tempDir = nil
+                currentSessionID = nil; captureStartedAt = nil
+                captureHealthWarnings = []
+                let failedMicURL = dir.map { Self.existingAudioFileURL($0.appendingPathComponent("mic.wav")) } ?? nil
+                let failedSystemURL = dir.map { Self.existingAudioFileURL($0.appendingPathComponent("system.wav")) } ?? nil
+                if !transcriptionJobs.contains(where: { $0.id == sessionID }) {
+                    let failedJob = TranscriptionJob(
+                        id: sessionID,
+                        title: title,
+                        language: currentLanguage,
+                        micURL: failedMicURL,
+                        systemURL: failedSystemURL,
+                        outputDir: outDir,
+                        sysOffsetMs: 0,
+                        createdAt: startedAt,
+                        startedAt: startedAt,
+                        completedAt: Date(),
+                        status: .failed(error.localizedDescription),
+                        captureIntegrity: .degraded(["Não foi possível concluir a captura."])
+                    )
+                    transcriptionJobs.append(failedJob)
+                    persist(failedJob)
+                }
                 status = .error(error.localizedDescription)
             }
         }
     }
 
     func importAudioFile(_ sourceURL: URL) {
-        guard status.canStartRecording, !isCalendarSyncing else { return }
+        guard storageLeaseAvailable, status.canStartRecording, !isCalendarSyncing else { return }
         lastWarning = nil
         status = .importing
 
         let title = meetingTitle.isEmpty ? Self.defaultTitle() : meetingTitle
         let outDir = outputDirectory
         let currentLanguage = language
+        let sessionID = UUID()
 
         Task {
             do {
-                let stagedURL = try await Self.stageImportedAudio(from: sourceURL)
+                let sessionDirectory = sessionStore.sessionDirectory(for: sessionID)
+                let stagedURL = try await Self.stageImportedAudio(from: sourceURL, destinationDirectory: sessionDirectory)
                 let job = TranscriptionJob(
-                    id: UUID(),
+                    id: sessionID,
                     title: title,
                     language: currentLanguage,
                     micURL: stagedURL,
@@ -306,10 +451,12 @@ final class AppState: ObservableObject {
                     createdAt: Date(),
                     startedAt: nil,
                     completedAt: nil,
-                    status: .queued
+                    status: .queued,
+                    captureIntegrity: .complete
                 )
 
                 transcriptionJobs.append(job)
+                persist(job)
                 meetingTitle = Self.defaultTitle()
                 status = .idle
                 scheduleTranscriptionJobs()
@@ -320,6 +467,7 @@ final class AppState: ObservableObject {
     }
 
     func resetError() {
+        guard storageLeaseAvailable else { return }
         if case .error = status { status = .idle }
     }
 
@@ -356,6 +504,43 @@ final class AppState: ObservableObject {
         NotificationManager.shared.notifyWarning(message)
     }
 
+    private func startCaptureMonitor() {
+        captureMonitorTask?.cancel()
+        captureMonitorTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                guard !Task.isCancelled, let self, case .recording = self.status else { return }
+                self.checkCaptureHealth()
+            }
+        }
+    }
+
+    private func checkCaptureHealth() {
+        guard let mic, let sys else { return }
+        let micHealth = mic.health
+        let systemHealth = sys.health
+        var issues: [String] = []
+        if let error = micHealth.firstErrorDescription {
+            issues.append("Falha ao gravar o microfone: \(error)")
+        }
+        if let error = micHealth.recoveryErrorDescription {
+            issues.append("O microfone não retomou após a troca de dispositivo: \(error)")
+        }
+        if let error = systemHealth.firstErrorDescription {
+            issues.append("Falha ao gravar o áudio do sistema: \(error)")
+        }
+        if let error = systemHealth.streamStopErrorDescription {
+            issues.append("A captura do áudio do sistema foi interrompida: \(error)")
+        }
+        if Date().timeIntervalSince(captureStartedAt ?? Date()) > 5,
+           micHealth.receivedBufferCount == 0 || Self.hostTimeAgeSeconds(micHealth.lastBufferHostTime) > 5 {
+            issues.append("O microfone deixou de entregar áudio há mais de cinco segundos.")
+        }
+        for issue in issues where captureHealthWarnings.insert(issue).inserted {
+            warn("Captura parcial: \(issue) A gravação recuperável continua sendo preservada.")
+        }
+    }
+
     private func showCalendarWarning(_ message: String) {
         calendarWarning = message
         lastWarning = message
@@ -388,6 +573,7 @@ final class AppState: ObservableObject {
               let index = transcriptionJobs.firstIndex(where: { $0.status.isQueued }) {
             transcriptionJobs[index].status = .running
             transcriptionJobs[index].startedAt = Date()
+            persist(transcriptionJobs[index])
             runTranscriptionJob(transcriptionJobs[index])
         }
     }
@@ -404,6 +590,9 @@ final class AppState: ObservableObject {
                     language: job.language,
                     sysOffsetMs: job.sysOffsetMs,
                     outputDir: job.outputDir,
+                    sessionID: job.id,
+                    captureIntegrity: job.captureIntegrity,
+                    recordedAt: job.createdAt,
                     onProgress: { [weak self] pct in
                         Task { @MainActor in
                             self?.updateProgress(id: job.id, pct: pct)
@@ -417,7 +606,9 @@ final class AppState: ObservableObject {
                     systemURL: job.systemURL,
                     title: job.title,
                     language: job.language,
-                    sysOffsetMs: job.sysOffsetMs
+                    sysOffsetMs: job.sysOffsetMs,
+                    createdAt: job.createdAt,
+                    captureIntegrity: job.captureIntegrity
                 )
 
                 finishTranscriptionJob(id: job.id, outputURL: outputURL)
@@ -430,7 +621,11 @@ final class AppState: ObservableObject {
     private func updateProgress(id: UUID, pct: Int) {
         guard let index = transcriptionJobs.firstIndex(where: { $0.id == id }),
               transcriptionJobs[index].status.isRunning else { return }
+        let previousProgress = transcriptionJobs[index].progress
         transcriptionJobs[index].progress = max(transcriptionJobs[index].progress, pct)
+        if pct == 100 || pct / 5 > previousProgress / 5 {
+            persist(transcriptionJobs[index])
+        }
     }
 
     private func finishTranscriptionJob(id: UUID, outputURL: URL) {
@@ -439,6 +634,7 @@ final class AppState: ObservableObject {
         transcriptionJobs[index].progress = 100
         transcriptionJobs[index].status = .succeeded(outputURL)
         transcriptionJobs[index].completedAt = Date()
+        persist(transcriptionJobs[index])
         lastOutputURL = outputURL
         NotificationManager.shared.notifyDone(fileURL: outputURL)
         pruneFinishedJobs()
@@ -450,15 +646,13 @@ final class AppState: ObservableObject {
         guard let index = transcriptionJobs.firstIndex(where: { $0.id == id }) else { return }
         transcriptionJobs[index].status = .failed(message)
         transcriptionJobs[index].completedAt = Date()
+        persist(transcriptionJobs[index])
         pruneFinishedJobs()
         scheduleTranscriptionJobs()
     }
 
-    /// O que saiu da lista também sai da memória e do disco: jobs concluídos além
-    /// da janela de retenção são removidos junto com o áudio temporário. O áudio de
-    /// uma transcrição bem-sucedida já foi copiado para o arquivo permanente por
-    /// `archiveSessionFiles`; o de uma que falhou só existia aqui, e sem o job na
-    /// lista não haveria como reprocessá-lo pela UI de qualquer forma.
+    /// Limita apenas o histórico visual em memória. Áudio e manifest continuam no
+    /// armazenamento recuperável até um descarte explícito futuro.
     private func pruneFinishedJobs() {
         let retainedIDs = Set(visibleTranscriptionJobs.map(\.id))
         let stale = transcriptionJobs.filter { $0.status.isFinished && !retainedIDs.contains($0.id) }
@@ -466,27 +660,42 @@ final class AppState: ObservableObject {
 
         let staleIDs = Set(stale.map(\.id))
         transcriptionJobs.removeAll { staleIDs.contains($0.id) }
-        for job in stale {
-            deleteTempDir(for: job)
-        }
     }
 
     func cancelJob(_ id: UUID) {
         guard let index = transcriptionJobs.firstIndex(where: { $0.id == id }) else { return }
-        let job = transcriptionJobs[index]
+        if transcriptionJobs[index].status.isQueued {
+            transcriptionJobs[index].status = .failed("Cancelada. O áudio foi preservado para tentar novamente.")
+            transcriptionJobs[index].completedAt = Date()
+            persist(transcriptionJobs[index])
+            scheduleTranscriptionJobs()
+            return
+        }
+        guard transcriptionJobs[index].status.isRunning else { return }
+        transcriptionJobs[index].status = .cancelling
+        persist(transcriptionJobs[index])
         runners[id]?.cancel()
-        runners[id] = nil
-        transcriptionJobs.remove(at: index)
-        deleteTempDir(for: job)
+    }
+
+    func retryJob(_ id: UUID) {
+        guard let index = transcriptionJobs.firstIndex(where: { $0.id == id }),
+              case .failed = transcriptionJobs[index].status,
+              transcriptionJobs[index].micURL != nil || transcriptionJobs[index].systemURL != nil else { return }
+        transcriptionJobs[index].status = .queued
+        transcriptionJobs[index].startedAt = nil
+        transcriptionJobs[index].completedAt = nil
+        transcriptionJobs[index].progress = 0
+        persist(transcriptionJobs[index])
         scheduleTranscriptionJobs()
     }
 
-    private func deleteTempDir(for job: TranscriptionJob) {
-        guard let audioURL = job.micURL ?? job.systemURL else { return }
-        let directory = audioURL.deletingLastPathComponent().resolvingSymlinksInPath()
-        let temporaryDirectory = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
-        guard directory.path.hasPrefix(temporaryDirectory.path + "/") else { return }
-        try? FileManager.default.removeItem(at: directory)
+    func dismissJob(_ id: UUID) {
+        guard let index = transcriptionJobs.firstIndex(where: { $0.id == id }),
+              transcriptionJobs[index].status.isFinished else { return }
+        do { try sessionStore.hide(id: id) } catch {
+            // Itens legados não têm manifest; remover da lista continua seguro.
+        }
+        transcriptionJobs.remove(at: index)
     }
 
     func sendToSecondBrain(_ job: TranscriptionJob) {
@@ -527,6 +736,7 @@ final class AppState: ObservableObject {
                 return
             }
             transcriptionJobs[index].exportedToSecondBrain = true
+            persist(transcriptionJobs[index])
         } catch {
             status = .error("Falha ao enviar para o second-brain: \(error.localizedDescription)")
         }
@@ -559,7 +769,9 @@ final class AppState: ObservableObject {
         systemURL: URL?,
         title: String,
         language: String,
-        sysOffsetMs: Double
+        sysOffsetMs: Double,
+        createdAt: Date = Date(),
+        captureIntegrity: CaptureIntegrity = .unknown
     ) throws {
         let fm = FileManager.default
         let archiveURL = try uniqueArchiveDirectory(for: outputURL)
@@ -579,10 +791,12 @@ final class AppState: ObservableObject {
             "title": title,
             "language": language,
             "sysOffsetMs": sysOffsetMs,
-            "createdAt": ISO8601DateFormatter().string(from: Date()),
+            "createdAt": ISO8601DateFormatter().string(from: createdAt),
             "output": outputURL.lastPathComponent,
             "format": outputURL.pathExtension,
-            "files": files
+            "files": files,
+            "captureIntegrity": captureIntegrity.status.rawValue,
+            "captureIssues": captureIntegrity.details
         ]
         let data = try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted, .sortedKeys])
         try data.write(to: archiveURL.appendingPathComponent("metadata.json"))
@@ -597,7 +811,7 @@ final class AppState: ObservableObject {
         return url
     }
 
-    private static func stageImportedAudio(from sourceURL: URL) async throws -> URL {
+    private static func stageImportedAudio(from sourceURL: URL, destinationDirectory: URL) async throws -> URL {
         try await Task.detached(priority: .userInitiated) {
             guard sourceURL.pathExtension.lowercased() == "wav" else {
                 throw AudioImportError.unsupportedFile
@@ -616,8 +830,7 @@ final class AppState: ObservableObject {
                 throw AudioImportError.unsupportedSampleRate(audioFile.fileFormat.sampleRate)
             }
 
-            let directory = FileManager.default.temporaryDirectory
-                .appendingPathComponent("meeting-import-\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString)")
+            let directory = destinationDirectory
             do {
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
                 let stagedURL = directory.appendingPathComponent("mic.wav")
@@ -628,6 +841,82 @@ final class AppState: ObservableObject {
                 throw error
             }
         }.value
+    }
+
+    private func persist(_ job: TranscriptionJob) {
+        do {
+            try sessionStore.save(job)
+        } catch {
+            lastWarning = "Não foi possível persistir o estado da sessão: \(error.localizedDescription)"
+        }
+    }
+
+    private static func audioDuration(_ url: URL?) -> TimeInterval? {
+        guard let url, let file = try? AVAudioFile(forReading: url), file.fileFormat.sampleRate > 0 else {
+            return nil
+        }
+        return Double(file.length) / file.fileFormat.sampleRate
+    }
+
+    static func durationIntegrityIssues(
+        micURL: URL?,
+        systemURL: URL?,
+        sessionDuration: TimeInterval,
+        sysOffsetMs: Double = 0
+    ) -> [String] {
+        guard let micDuration = audioDuration(micURL),
+              let systemDuration = audioDuration(systemURL) else { return [] }
+        let micEnd = micDuration
+        let systemEnd = sysOffsetMs / 1_000 + systemDuration
+        let reference = max(micEnd, systemEnd, sessionDuration)
+        let tolerance = max(5.0, reference * 0.05)
+        if sessionDuration - max(micEnd, systemEnd) > tolerance {
+            return [
+                "As duas trilhas terminaram antes do fim da sessão " +
+                "(\(Int(micDuration))s de microfone, \(Int(systemDuration))s de sistema, " +
+                "\(Int(sessionDuration))s de sessão)."
+            ]
+        }
+        guard abs(micEnd - systemEnd) > tolerance else { return [] }
+        let shorter = micEnd < systemEnd ? "microfone" : "sistema"
+        return [
+            "A trilha do \(shorter) terminou antes da outra " +
+            "(\(Int(micDuration))s de microfone, \(Int(systemDuration))s de sistema)."
+        ]
+    }
+
+    static func healthIssues(
+        mic: AudioCaptureHealth?,
+        system: AudioCaptureHealth?
+    ) -> [String] {
+        var issues: [String] = []
+        if let error = mic?.firstErrorDescription {
+            issues.append("Falha de escrita no microfone: \(error)")
+        }
+        if let error = mic?.recoveryErrorDescription {
+            issues.append("Falha ao retomar o microfone: \(error)")
+        }
+        if let error = system?.firstErrorDescription {
+            issues.append("Falha de escrita no áudio do sistema: \(error)")
+        }
+        if let error = system?.streamStopErrorDescription {
+            issues.append("A captura do sistema foi interrompida: \(error)")
+        }
+        if let mic, mic.insertedSilenceByteCount > 32_000 {
+            issues.append("O microfone teve um intervalo de captura superior a um segundo; silêncio foi inserido para preservar a linha do tempo.")
+        }
+        if let system, system.insertedSilenceByteCount > 32_000 {
+            issues.append("O áudio do sistema teve um intervalo de captura superior a um segundo; silêncio foi inserido para preservar a linha do tempo.")
+        }
+        return Array(Set(issues)).sorted()
+    }
+
+    private static func hostTimeAgeSeconds(_ hostTime: UInt64?) -> TimeInterval {
+        guard let hostTime else { return .infinity }
+        var info = mach_timebase_info_data_t()
+        mach_timebase_info(&info)
+        let ticks = mach_absolute_time() >= hostTime ? mach_absolute_time() - hostTime : 0
+        return Double(ticks) * Double(info.numer) / Double(info.denom) / 1_000_000_000
     }
 
     private static func uniqueArchiveDirectory(for outputURL: URL) throws -> URL {

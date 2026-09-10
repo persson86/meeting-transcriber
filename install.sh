@@ -65,7 +65,6 @@ defaults write "$BUNDLE_ID" projectRoot "$PROJECT_DIR"
 defaults write "$BUNDLE_ID" pythonPath "$PROJECT_DIR/.venv/bin/python"
 defaults write "$BUNDLE_ID" scriptPath "$PROJECT_DIR/transcribe_meeting.py"
 defaults write "$BUNDLE_ID" defaultOutputDirectory "$OUTPUT_DIR"
-defaults delete "$BUNDLE_ID" outputDirectory >/dev/null 2>&1 || true
 
 open "$APP_PATH"
 

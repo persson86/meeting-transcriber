@@ -19,6 +19,22 @@ Speaker labels are track based: microphone audio is labeled `Você`, system audi
 is labeled `Interlocutor`. Optional local clustering can split the system track
 into heuristic `Remote_A`, `Remote_B`, etc. labels.
 
+## What's New in 1.3
+
+- Durable session manifests and recoverable WAV staging survive app restarts.
+- Capture health exposes missing tracks, writer and conversion failures, stream
+  interruption, microphone rearm problems, and material timeline gaps.
+- Missing callback intervals receive bounded silence so resumed audio keeps its
+  original position in the meeting timeline.
+- Cancelling or dismissing a job preserves its audio, and failed jobs can be
+  retried from the menu.
+- Transcript artifacts are written atomically and validated before a job is
+  marked successful.
+- JSONL keeps the original ASR text when normalization or safety output changes
+  what is displayed.
+- Portable, integration, model-backed ASR, and release verification gates are
+  available through the root `Makefile`.
+
 ## Requirements
 
 - macOS 13 or newer
@@ -50,6 +66,9 @@ For a local checkout, run:
 ```bash
 make install   # install dependencies, app, and local output paths
 make test      # run the local test gate
+make test-integration  # exercise the Swift to Python process boundary
+make test-asr  # run the private, model-backed quality corpus
+make verify-release  # portable tests plus a signed app build
 ```
 
 The app defaults to a source checkout at `~/meeting-transcriber`, with Python at
@@ -61,6 +80,7 @@ defaults write <bundle-id> projectRoot /path/to/meeting-transcriber
 defaults write <bundle-id> pythonPath /path/to/python
 defaults write <bundle-id> scriptPath /path/to/transcribe_meeting.py
 defaults write <bundle-id> defaultOutputDirectory ~/Transcriptions
+defaults write <bundle-id> sessionRoot ~/Library/Application\ Support/MeetingTranscriber/Sessions
 defaults write <bundle-id> contextTerms -array "ProjectName" "CustomerName"
 defaults write <bundle-id> maxConcurrentTranscriptions 2
 defaults write <bundle-id> mlxModel mlx-community/whisper-large-v3-mlx
@@ -116,8 +136,10 @@ curl -fsSL https://raw.githubusercontent.com/persson86/meeting-transcriber/main/
 ```
 
 This pulls the latest changes into `./meeting-transcriber`, rebuilds the app,
-reinstalls it to `~/Applications/MeetingTranscriber.app`, and reopens it — your
-output folder and settings are untouched. If you're not sure which folder you
+reinstalls it to `~/Applications/MeetingTranscriber.app`, and reopens it. The
+installer refuses to replace a running app so it cannot silently interrupt a
+recording; close the app first. Your output folder and settings are untouched.
+If you're not sure which folder you
 used, look in your home folder for a `meeting-transcriber` folder (Finder →
 Go → Home).
 
@@ -186,25 +208,26 @@ and the app shows a warning.
 
 To process an iPhone recording manually, click **Processar arquivo de áudio…**. The
 file picker opens in Downloads by default; choose the 16 kHz WAV and leave the
-app open while the job runs. The app copies the selected file into its temporary
-queue and never changes or deletes the original in Downloads. A single imported
+app open while the job runs. The app copies the selected file into its durable
+session storage and never changes or deletes the original in Downloads. A single imported
 track uses the neutral speaker label `Áudio`.
 
-After a recording stops, the app saves the WAV files, returns to the ready state,
-and keeps processing previous jobs in the background. This lets you start another
-meeting while earlier recordings are still being transcribed.
+Each recording gets a stable session directory with a durable manifest and WAV
+files. After a recording stops, the app returns to the ready state and keeps
+processing previous jobs in the background. If the app closes unexpectedly,
+recoverable audio remains available and queued jobs return after relaunch.
 
 The wider menu uses native large controls and larger action targets for better
-readability. It shows recent jobs as queued, running, completed, or failed. A running
-job shows a live progress percentage. A running or queued job is always visible
-in the list, no matter how many older completed jobs pile up in the same session —
-only the most recent finished jobs are kept around (older ones, along with their
-temporary audio, are pruned automatically).
+readability. It shows recent jobs as queued, running, cancelling, completed, or
+failed. A running job shows a live progress percentage. Active jobs are always
+visible. Only the most recent finished jobs remain in the menu; pruning the menu
+does not delete their preserved audio or durable manifests.
 
-Every job has a dismiss button: for a completed job it's a plain ✕ that just
-removes it from the list, no confirmation needed. For a running or queued job
-it's a red stop icon that asks for confirmation before cancelling — it stops the
-Python process and deletes the temporary audio, which cannot be undone.
+Every job has a dismiss button. For a completed job it hides the item from the
+list without deleting audio. For a running or queued job, the red stop icon asks
+for confirmation before cancelling. Cancellation waits for the Python process
+to terminate and preserves the input audio. Failed jobs with preserved audio can
+be queued again with the retry button.
 
 Completed jobs can be opened with the 📄 button, or sent to a configured
 second-brain vault with the 🧠 button (only shown when `secondBrainPath` is set;
@@ -237,6 +260,17 @@ open "meetingtranscriber://recommend?title=Steering%20Client%20X&reason=external
 Each stopped recording becomes a local transcription job containing the WAV
 paths, language, title, track offset, and output directory. Queued jobs do not
 block new recordings.
+
+The manifest also records capture integrity. Writer failures, stream termination,
+microphone rearm failures, missing tracks, and material duration differences mark
+the capture as degraded. The app still transcribes recoverable audio, but the
+Markdown and JSONL outputs carry an explicit partial-capture warning instead of
+silently presenting the result as complete.
+
+The portable `make test` gate does not load a speech model, request macOS
+permissions, use audio hardware, or require the private quality corpus. The
+separate `make test-asr` gate fails explicitly when that local corpus is absent;
+it is the required semantic check when transcription behavior changes.
 
 Only one job runs by default to reduce CPU, Metal/GPU, memory, and disk
 contention. Increase `maxConcurrentTranscriptions` only after measuring how your
