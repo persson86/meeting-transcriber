@@ -48,9 +48,6 @@ final class SystemAudioRecorder: @unchecked Sendable {
         config.excludesCurrentProcessAudio = false
         config.sampleRate = 48000
         config.channelCount = 2
-        if #available(macOS 15, *) {
-            config.captureMicrophone = false
-        }
         config.width = 2; config.height = 2
         config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
         config.showsCursor = false
