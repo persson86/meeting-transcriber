@@ -754,7 +754,8 @@ class TranscribeMeetingTests(unittest.TestCase):
             tm.Segment(2.0, 3.0, "alto", "Interlocutor"),
         ]
 
-        tm.relabel_system_speakers(segments, system_audio, 0.0)
+        with patch.dict(sys.modules, {"resemblyzer": None}):
+            tm.relabel_system_speakers(segments, system_audio, 0.0)
 
         self.assertEqual(segments[0].speaker, "Remote_A")
         self.assertEqual(segments[1].speaker, "Remote_A")

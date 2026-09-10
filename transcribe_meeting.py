@@ -45,7 +45,7 @@ CHUNK_OVERLAP_SEC = 3.0
 CHUNK_DEDUP_TOLERANCE_SEC = 0.5
 TEXT_DENSITY_SUSPECT_CHARS_PER_SEC = 80.0
 
-PIPELINE_VERSION = "0.7.0"
+PIPELINE_VERSION = "0.7.1"
 DEFAULT_HOTWORD_LIMIT = 60
 PROMPT_TAIL_MAX_CHARS = 240
 RUNAWAY_UNICODE_MIN_REPEATS = 8
@@ -632,6 +632,12 @@ def relabel_system_speakers(
 
     Falls back to lightweight RMS/ZCR/pitch heuristics if resemblyzer is not available.
     """
+    system_segments = [seg for seg in segments if seg.speaker == "Interlocutor"]
+    if len(system_segments) < 4:
+        for segment in system_segments:
+            segment.speaker = _speaker_label(0)
+        return
+
     try:
         _relabel_resemblyzer(segments, system_audio, sys_offset_sec, max_speakers)
     except ImportError:
@@ -652,13 +658,18 @@ def _relabel_resemblyzer(
     max_speakers: int,
 ) -> None:
     """GE2E embeddings + agglomerative clustering (cosine, average linkage)."""
-    from resemblyzer import VoiceEncoder, preprocess_wav
-    from sklearn.cluster import AgglomerativeClustering
-    from sklearn.metrics import silhouette_score
-
     system_segs = [seg for seg in segments if seg.speaker == "Interlocutor"]
     if not system_segs:
         return
+
+    if len(system_segs) < 4:
+        for seg in system_segs:
+            seg.speaker = _speaker_label(0)
+        return
+
+    from resemblyzer import VoiceEncoder, preprocess_wav
+    from sklearn.cluster import AgglomerativeClustering
+    from sklearn.metrics import silhouette_score
 
     encoder = VoiceEncoder("cpu")
     min_chunk_samples = int(SAMPLE_RATE * 0.4)
@@ -676,11 +687,6 @@ def _relabel_resemblyzer(
 
     X = np.array(embeddings, dtype=np.float32)
     n = len(system_segs)
-
-    if n < 4:
-        for seg in system_segs:
-            seg.speaker = _speaker_label(0)
-        return
 
     # A split needs repeated evidence for each label. In particular, do not
     # force two clusters just because multiple segments exist.
@@ -729,11 +735,17 @@ def _relabel_heuristic(
     sys_offset_sec: float,
 ) -> None:
     """Fallback: lightweight RMS + ZCR + pitch greedy centroid clustering."""
-    clusters: list[SpeakerCluster] = []
-    for segment in sorted(
+    system_segments = sorted(
         (seg for seg in segments if seg.speaker == "Interlocutor"),
         key=lambda item: item.start,
-    ):
+    )
+    if len(system_segments) < 4:
+        for segment in system_segments:
+            segment.speaker = _speaker_label(0)
+        return
+
+    clusters: list[SpeakerCluster] = []
+    for segment in system_segments:
         start_sample = max(0, int(round((segment.start - sys_offset_sec) * SAMPLE_RATE)))
         end_sample = min(
             len(system_audio),
@@ -768,6 +780,13 @@ def _relabel_heuristic(
             c.centroid = tuple((old * c.count + new) / n for old, new in zip(c.centroid, features))  # type: ignore[assignment]
             c.count = n
             segment.speaker = c.label
+
+    assigned_counts: dict[str, int] = {}
+    for segment in system_segments:
+        assigned_counts[segment.speaker] = assigned_counts.get(segment.speaker, 0) + 1
+    if len(assigned_counts) < 2 or any(count < 2 for count in assigned_counts.values()):
+        for segment in system_segments:
+            segment.speaker = _speaker_label(0)
 
 
 def trim_prompt_tail(text: str, max_chars: int = PROMPT_TAIL_MAX_CHARS) -> str:
