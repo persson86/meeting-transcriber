@@ -19,6 +19,12 @@ Speaker labels are track based: microphone audio is labeled `Você`, system audi
 is labeled `Interlocutor`. Optional local clustering can split the system track
 into heuristic `Remote_A`, `Remote_B`, etc. labels.
 
+## What's New in 1.4.1
+
+- Recording times keep the UTC offset they were recorded with, whatever the
+  time zone of the machine that processes them. Only UTC timestamps from older
+  versions are converted to local time. (Pipeline 0.8.1.)
+
 ## What's New in 1.4
 
 - Re-arming the microphone after an audio route change no longer crashes the

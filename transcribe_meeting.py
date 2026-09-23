@@ -19,7 +19,7 @@ import tempfile
 import unicodedata
 import wave
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -47,7 +47,7 @@ CHUNK_OVERLAP_SEC = 3.0
 CHUNK_DEDUP_TOLERANCE_SEC = 0.5
 TEXT_DENSITY_SUSPECT_CHARS_PER_SEC = 80.0
 
-PIPELINE_VERSION = "0.8.0"
+PIPELINE_VERSION = "0.8.1"
 DEFAULT_HOTWORD_LIMIT = 60
 PROMPT_TAIL_MAX_CHARS = 240
 RUNAWAY_UNICODE_MIN_REPEATS = 8
@@ -1953,7 +1953,12 @@ def build_markdown(
 # ---------------------------------------------------------------------------
 
 def local_datetime(value: str | None) -> datetime | None:
-    """ISO-8601 (inclusive com 'Z') → datetime no fuso local do Mac."""
+    """ISO-8601 → datetime com fuso explícito.
+
+    Offset explícito diferente de zero (o app envia o fuso local da gravação) é
+    preservado: o horário não muda conforme a máquina que processa. UTC ('Z',
+    enviado por versões anteriores) e horário sem fuso viram o fuso local.
+    """
     if not value:
         return None
     try:
@@ -1961,8 +1966,10 @@ def local_datetime(value: str | None) -> datetime | None:
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.astimezone()
-    return parsed.astimezone()
+        return parsed.astimezone()
+    if parsed.utcoffset() == timedelta(0):
+        return parsed.astimezone()
+    return parsed
 
 
 def format_local_datetime(value: datetime) -> str:

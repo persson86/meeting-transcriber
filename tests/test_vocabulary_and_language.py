@@ -228,6 +228,13 @@ class DateAndNamingTests(unittest.TestCase):
         self.assertEqual(tm.format_local_datetime(value), "2026-09-23 09:10 (UTC-03:00)")
         self.assertIsNone(tm.local_datetime("não é data"))
 
+    def test_explicit_offset_is_preserved_regardless_of_machine_timezone(self):
+        for tz in ("UTC", "America/Sao_Paulo", "Asia/Tokyo"):
+            os.environ["TZ"] = tz
+            time.tzset()
+            value = tm.local_datetime("2026-09-10T09:00:00-03:00")
+            self.assertEqual(value.isoformat(timespec="seconds"), "2026-09-10T09:00:00-03:00", tz)
+
     def test_output_stem_uses_recording_start_not_processing_time(self):
         stem = tm.output_stem(
             "Reunião 2026-09-22 16:18",
