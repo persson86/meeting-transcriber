@@ -8,6 +8,7 @@ Diarização grátis: trilha mic = "Você", trilha system = "Interlocutor".
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import math
 import os
@@ -15,6 +16,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import wave
 from dataclasses import dataclass
 from datetime import datetime
@@ -45,10 +47,38 @@ CHUNK_OVERLAP_SEC = 3.0
 CHUNK_DEDUP_TOLERANCE_SEC = 0.5
 TEXT_DENSITY_SUSPECT_CHARS_PER_SEC = 80.0
 
-PIPELINE_VERSION = "0.7.1"
+PIPELINE_VERSION = "0.8.0"
 DEFAULT_HOTWORD_LIMIT = 60
 PROMPT_TAIL_MAX_CHARS = 240
 RUNAWAY_UNICODE_MIN_REPEATS = 8
+
+# Orçamento do prompt em tokens do Whisper. O decoder aceita no máximo 223
+# tokens de prompt (n_text_ctx // 2 - 1) e o mlx-whisper descarta o excesso
+# pelo início; a margem evita que o corte silencioso atinja o vocabulário.
+PROMPT_TOKEN_BUDGET = 200
+HOTWORDS_TOKEN_BUDGET = 130
+PARTICIPANTS_TOKEN_BUDGET = 40
+TITLE_TOKEN_BUDGET = 25
+GLOSSARY_TOKEN_BUDGET = 100
+MAX_PROMPT_PARTICIPANTS = 12
+MAX_PARTICIPANT_WORDS = 3
+
+VOCABULARY_MAX_BYTES = 64 * 1024
+VOCABULARY_MAX_TERMS = 120
+VOCABULARY_MAX_TERM_CHARS = 60
+
+LANGUAGE_DETECTION_SAMPLES = 3
+LANGUAGE_DETECTION_MIN_SEC = 2.0
+
+# Guarda de cobertura: se os segmentos de um bloco cobrem menos que isso da fala
+# detectada pelo VAD, o bloco é retranscrito sem o vocabulário no prompt (prompts
+# longos podem fazer o Whisper pular trechos) e fica o resultado que cobre mais.
+CHUNK_COVERAGE_MIN_RATIO = 0.5
+CHUNK_COVERAGE_MIN_SPEECH_SEC = 6.0
+CHUNK_COVERAGE_RETRY_GAIN = 1.2
+
+DEFAULT_TITLE_RE = re.compile(r"^Reuni[aã]o(?: \d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})?)?$")
+CALENDAR_TITLE_SUFFIX_RE = re.compile(r"\s+—\s+\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
 
 _last_progress = -1
 
@@ -138,12 +168,18 @@ class TranscriptionConfig:
     replacements: dict[str, str] | None = None
     hotwords: list[str] | None = None
     known_names: list[str] | None = None
+    glossary: list[str] | None = None        # vocabulário do usuário (--vocabulary)
+    participants: list[str] | None = None    # nomes esperados (convite/CLI), só para o prompt
+    title_hint: str | None = None            # título da reunião, só para o prompt
+    use_default_replacements: bool = True
 
     def __post_init__(self) -> None:
         self.context_terms = self.context_terms or []
         self.replacements = self.replacements or {}
         self.hotwords = self.hotwords or []
         self.known_names = self.known_names or []
+        self.glossary = self.glossary or []
+        self.participants = self.participants or []
 
 
 # ---------------------------------------------------------------------------
@@ -154,41 +190,28 @@ LANGUAGE_CONFIG = {
     "pt": {
         "whisper_lang": "pt",
         "base_prompt": "Reunião de trabalho em português brasileiro.",
+        # Termos genéricos de reunião de produto/tecnologia. Ficam com a menor
+        # prioridade do prompt: o vocabulário do usuário e da reunião vence.
+        # "Cloud" saiu da lista porque competia com "Claude".
         "default_hotwords": (
-            "Azure",
-            "UAT",
-            "Dev",
-            "homologação",
-            "staging",
-            "VNet",
-            "Kubernetes",
-            "namespace",
-            "DevOps",
-            "SRE",
-            "Cloud",
-            "endpoint",
+            "API",
             "backend",
             "frontend",
-            "API",
-            "JSON",
-            "Markdown",
-            "custom metadata",
-            "worker",
-            "subscription",
-            "webhook",
-            "database",
             "deploy",
+            "homologação",
             "produção",
-            "pull request",
+            "endpoint",
+            "webhook",
             "sprint",
             "roadmap",
+            "pull request",
+            "JSON",
+            "Markdown",
+            "LLM",
             "GPT",
             "Claude",
-            "LLM",
             "MCP",
             "RAG",
-            "Databricks",
-            "data lake",
         ),
         "default_replacements": {
             "OAT": "UAT",
@@ -214,7 +237,11 @@ LANGUAGE_CONFIG = {
 
 
 def get_lang_config(language: str) -> dict:
-    return LANGUAGE_CONFIG.get(language, LANGUAGE_CONFIG["pt"])
+    if language in LANGUAGE_CONFIG:
+        return LANGUAGE_CONFIG[language]
+    # Idioma detectado fora dos perfis conhecidos (ex.: "es"): decodifica no
+    # idioma certo, sem herdar prompt, hotwords ou correções do português.
+    return {"whisper_lang": language or None, "base_prompt": None}
 
 
 def build_initial_prompt(config: TranscriptionConfig) -> str | None:
@@ -230,33 +257,142 @@ def default_hotwords_for_language(language: str) -> list[str]:
     return [str(term).strip() for term in raw_terms if str(term).strip()]
 
 
-def build_hotwords(config: TranscriptionConfig, limit: int = DEFAULT_HOTWORD_LIMIT) -> str | None:
-    """Prioriza termos da reunião e completa com poucos termos padrão."""
-    raw_terms = [*config.context_terms, *config.hotwords]
-    raw_terms.extend(default_hotwords_for_language(config.language))
+_PROMPT_TOKENIZER = None
 
-    hotwords = []
-    seen = set()
-    for term in raw_terms:
-        normalized = term.strip()
+
+def count_prompt_tokens(text: str) -> int:
+    """Conta tokens como o decoder do Whisper verá o prompt.
+
+    Usa o tokenizer multilíngue do mlx-whisper quando disponível; sem ele,
+    estima de forma conservadora (1 token a cada 2,5 bytes UTF-8).
+    """
+    global _PROMPT_TOKENIZER
+    text = text.strip()
+    if not text:
+        return 0
+    if _PROMPT_TOKENIZER is None:
+        try:
+            from mlx_whisper.tokenizer import get_tokenizer
+            _PROMPT_TOKENIZER = get_tokenizer(multilingual=True, num_languages=100)
+        except Exception:
+            _PROMPT_TOKENIZER = False
+    if _PROMPT_TOKENIZER:
+        return len(_PROMPT_TOKENIZER.encode(" " + text))
+    return math.ceil(len(text.encode("utf-8")) / 2.5)
+
+
+def _dedupe_terms(terms: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique = []
+    for term in terms:
+        normalized = re.sub(r"\s+", " ", str(term)).strip()
         key = normalized.casefold()
         if not normalized or key in seen:
             continue
         seen.add(key)
-        hotwords.append(normalized)
-        if len(hotwords) >= limit:
-            break
+        unique.append(normalized)
+    return unique
 
-    return ", ".join(hotwords) if hotwords else None
+
+def _fit_terms(terms: list[str], token_budget: int, prefix: str = "", limit: int | None = None) -> str:
+    """Inclui termos na ordem de prioridade enquanto couberem no orçamento."""
+    chosen: list[str] = []
+    for term in terms:
+        if limit is not None and len(chosen) >= limit:
+            break
+        candidate = f"{prefix}{', '.join([*chosen, term])}."
+        if count_prompt_tokens(candidate) <= token_budget:
+            chosen.append(term)
+    return f"{prefix}{', '.join(chosen)}." if chosen else ""
+
+
+def clean_title_hint(title: str | None) -> str | None:
+    """Título útil para o prompt: sem sufixo de data e sem título padrão."""
+    if not title:
+        return None
+    text = unicodedata.normalize("NFC", title).strip()
+    text = CALENDAR_TITLE_SUFFIX_RE.sub("", text).strip()
+    if not text or DEFAULT_TITLE_RE.match(text):
+        return None
+    return text
+
+
+def _short_participant(name: str) -> str:
+    words = re.sub(r"\s+", " ", name).strip().split(" ")
+    return " ".join(words[:MAX_PARTICIPANT_WORDS])
+
+
+def build_hotwords(config: TranscriptionConfig, token_budget: int = HOTWORDS_TOKEN_BUDGET) -> str | None:
+    """Vocabulário do prompt, do menos para o mais importante.
+
+    O mlx-whisper corta o prompt pelo início e o decoder pesa mais o fim: os
+    termos genéricos vêm primeiro, depois o glossário do usuário, o título e,
+    por último, os participantes esperados. Cada parte tem teto próprio para
+    que uma lista longa de convidados não expulse o glossário.
+    """
+    remaining = token_budget
+
+    participants = _dedupe_terms([_short_participant(name) for name in config.participants])
+    participants_part = _fit_terms(
+        participants,
+        min(remaining, PARTICIPANTS_TOKEN_BUDGET),
+        prefix="Participantes: ",
+        limit=MAX_PROMPT_PARTICIPANTS,
+    )
+    remaining -= count_prompt_tokens(participants_part)
+
+    title_part = ""
+    title = clean_title_hint(config.title_hint)
+    if title:
+        words = title.split()
+        while words:
+            candidate = f"Reunião: {' '.join(words)}."
+            if count_prompt_tokens(candidate) <= min(remaining, TITLE_TOKEN_BUDGET):
+                title_part = candidate
+                break
+            words = words[:-1]
+    remaining -= count_prompt_tokens(title_part)
+
+    user_terms = _dedupe_terms([*config.context_terms, *config.hotwords, *config.glossary])
+    glossary_part = _fit_terms(
+        user_terms,
+        min(remaining, GLOSSARY_TOKEN_BUDGET),
+        prefix="Termos: ",
+        limit=DEFAULT_HOTWORD_LIMIT,
+    )
+    remaining -= count_prompt_tokens(glossary_part)
+
+    user_keys = {term.casefold() for term in user_terms}
+    generic_terms = [
+        term for term in _dedupe_terms(default_hotwords_for_language(config.language))
+        if term.casefold() not in user_keys
+    ]
+    generic_part = _fit_terms(generic_terms, max(0, remaining), limit=DEFAULT_HOTWORD_LIMIT)
+
+    parts = [part for part in (generic_part, glossary_part, title_part, participants_part) if part]
+    return " ".join(parts) if parts else None
+
+
+def _bounded_replacement_pattern(source: str) -> str:
+    """Casa a origem só como palavra/expressão inteira (não dentro de outra)."""
+    pattern = re.escape(source)
+    if re.match(r"\w", source):
+        pattern = r"(?<!\w)" + pattern
+    if re.search(r"\w$", source):
+        pattern = pattern + r"(?!\w)"
+    return pattern
 
 
 def apply_text_replacements(text: str, replacements: dict[str, str]) -> str:
-    """Aplica normalizações determinísticas e explícitas."""
+    """Aplica normalizações determinísticas e explícitas, com fronteira de palavra."""
     sources = [source for source in replacements if source]
     if not sources:
         return text
     pattern = re.compile(
-        "|".join(re.escape(source) for source in sorted(sources, key=len, reverse=True))
+        "|".join(
+            _bounded_replacement_pattern(source)
+            for source in sorted(sources, key=len, reverse=True)
+        )
     )
     return pattern.sub(lambda match: replacements[match.group(0)], text)
 
@@ -491,7 +627,7 @@ def load_transcription_config(
     hotwords: list[str] | None = None,
     use_default_replacements: bool = True,
 ) -> TranscriptionConfig:
-    config = TranscriptionConfig(language=language)
+    config = TranscriptionConfig(language=language, use_default_replacements=use_default_replacements)
     if use_default_replacements:
         config.replacements.update(default_replacements_for_language(language))
 
@@ -506,6 +642,74 @@ def load_transcription_config(
     config.replacements.update(dict(replacement_pairs or []))
     config.hotwords.extend(hotwords or [])
     return config
+
+
+class VocabularyError(ValueError):
+    pass
+
+
+def load_vocabulary(path: str) -> tuple[list[str], dict[str, str]]:
+    """Lê o vocabulário local do usuário (termos + correções explícitas).
+
+    Formato: {"version": 1, "terms": [...], "replacements": {"origem": "destino"}}.
+    Só termos e correções com fronteira de palavra; nunca correção fuzzy de
+    nomes. Arquivo inválido é erro explícito, não vocabulário vazio silencioso.
+    """
+    file_path = Path(path).expanduser()
+    try:
+        size = file_path.stat().st_size
+    except OSError as exc:
+        raise VocabularyError(f"vocabulário não encontrado: {file_path} ({exc})") from exc
+    if size > VOCABULARY_MAX_BYTES:
+        raise VocabularyError(f"vocabulário maior que {VOCABULARY_MAX_BYTES} bytes: {file_path}")
+    try:
+        raw = json.loads(file_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise VocabularyError(f"vocabulário ilegível: {file_path} ({exc})") from exc
+    if not isinstance(raw, dict):
+        raise VocabularyError("vocabulário deve ser um objeto JSON")
+
+    terms_raw = raw.get("terms", [])
+    if not isinstance(terms_raw, list) or not all(isinstance(term, str) for term in terms_raw):
+        raise VocabularyError("'terms' deve ser uma lista de textos")
+    terms = [
+        term for term in _dedupe_terms(terms_raw)
+        if len(term) <= VOCABULARY_MAX_TERM_CHARS
+    ][:VOCABULARY_MAX_TERMS]
+
+    replacements_raw = raw.get("replacements", {})
+    if not isinstance(replacements_raw, dict) or not all(
+        isinstance(key, str) and isinstance(value, str) for key, value in replacements_raw.items()
+    ):
+        raise VocabularyError("'replacements' deve mapear texto para texto")
+    replacements = {
+        key.strip(): value.strip()
+        for key, value in replacements_raw.items()
+        if key.strip() and len(key.strip()) >= 3
+    }
+    return terms, replacements
+
+
+def config_for_language(config: TranscriptionConfig, language: str) -> TranscriptionConfig:
+    """Cópia da config com o idioma travado e as correções padrão dele.
+
+    Correções explícitas do usuário continuam vencendo as padrão.
+    """
+    replacements = dict(config.replacements)
+    if config.use_default_replacements and language in LANGUAGE_CONFIG:
+        merged = default_replacements_for_language(language)
+        merged.update(replacements)
+        replacements = merged
+    return dataclasses.replace(
+        config,
+        language=language,
+        replacements=replacements,
+        context_terms=list(config.context_terms),
+        hotwords=list(config.hotwords),
+        known_names=list(config.known_names),
+        glossary=list(config.glossary),
+        participants=list(config.participants),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -594,6 +798,39 @@ def group_speech_islands(islands: list[dict]) -> list[dict]:
         else:
             grouped.append({**island, "overlap": gap <= max_gap_samples})
     return grouped
+
+
+def speech_seconds_in_range(islands: list[dict], start_sample: int, end_sample: int) -> float:
+    """Segundos de fala (ilhas do VAD) dentro de [start_sample, end_sample)."""
+    total = 0
+    for island in islands:
+        overlap = min(island["end"], end_sample) - max(island["start"], start_sample)
+        if overlap > 0:
+            total += overlap
+    return total / SAMPLE_RATE
+
+
+def covered_seconds(segments: list[Segment], range_start: float, range_end: float) -> float:
+    """Duração da união dos segmentos dentro da janela (em segundos)."""
+    intervals = sorted(
+        (max(seg.start, range_start), min(seg.end, range_end))
+        for seg in segments
+        if seg.end > range_start and seg.start < range_end
+    )
+    total = 0.0
+    current_start, current_end = None, None
+    for start, end in intervals:
+        if end <= start:
+            continue
+        if current_end is None or start > current_end:
+            if current_end is not None:
+                total += current_end - current_start
+            current_start, current_end = start, end
+        else:
+            current_end = max(current_end, end)
+    if current_end is not None:
+        total += current_end - current_start
+    return total
 
 
 def drop_overlap_duplicates(
@@ -821,12 +1058,34 @@ def build_contextual_initial_prompt(
     return prompt
 
 
+def fit_prompt_tail(prompt_tail: str | None, token_budget: int) -> str | None:
+    """Encurta a cauda de contexto pelo início até caber no orçamento."""
+    if not prompt_tail or token_budget <= 0:
+        return None
+    words = prompt_tail.split()
+    while words:
+        candidate = f"Contexto anterior recente: {' '.join(words)}"
+        if count_prompt_tokens(candidate) <= token_budget:
+            return " ".join(words)
+        words = words[max(1, len(words) // 8):]
+    return None
+
+
 def transcription_kwargs(
     config: TranscriptionConfig,
     vad_filter: bool,
     prompt_tail: str | None = None,
+    hotwords: str | None = None,
+    include_hotwords: bool = True,
 ) -> dict:
     lang_cfg = get_lang_config(config.language)
+    if not include_hotwords:
+        hotwords = None
+    elif hotwords is None:
+        hotwords = build_hotwords(config)
+    base_prompt = build_initial_prompt(config)
+    reserved = count_prompt_tokens(hotwords or "") + count_prompt_tokens(base_prompt or "") + 2
+    prompt_tail = fit_prompt_tail(prompt_tail, PROMPT_TOKEN_BUDGET - reserved)
     kwargs = dict(
         language=lang_cfg["whisper_lang"],
         initial_prompt=build_contextual_initial_prompt(config, prompt_tail),
@@ -837,7 +1096,7 @@ def transcription_kwargs(
         beam_size=5,
         word_timestamps=True,
         hallucination_silence_threshold=2.0,
-        hotwords=build_hotwords(config),
+        hotwords=hotwords,
     )
     if vad_filter:
         kwargs["vad_parameters"] = VAD_PARAMETERS
@@ -929,6 +1188,86 @@ class MlxBackend:
         )
         return segments, info
 
+    def detect_language(self, audio_chunk: np.ndarray) -> str | None:
+        """Idioma dominante de um trecho, pela detecção nativa do Whisper.
+
+        Decodifica o trecho sem prompt nem idioma fixo e devolve só o idioma;
+        o texto é descartado. mlx-whisper não expõe a probabilidade.
+        """
+        import mlx_whisper
+
+        result = mlx_whisper.transcribe(
+            audio_chunk,
+            path_or_hf_repo=self._resolve_model_path(),
+            language=None,
+            initial_prompt=None,
+            condition_on_previous_text=False,
+            word_timestamps=False,
+            verbose=None,
+        )
+        language = result.get("language")
+        return str(language) if language else None
+
+
+def detect_chunk_language(model, audio_chunk: np.ndarray) -> str | None:
+    """Detecta o idioma de um trecho em qualquer backend suportado."""
+    detector = getattr(model, "detect_language", None)
+    if callable(detector):
+        detected = detector(audio_chunk)
+        if isinstance(detected, tuple):   # faster-whisper: (idioma, prob, todas)
+            detected = detected[0]
+        return str(detected) if detected else None
+    _, info = model.transcribe(
+        audio_chunk,
+        language=None,
+        initial_prompt=None,
+        vad_filter=False,
+        condition_on_previous_text=False,
+        word_timestamps=False,
+    )
+    language = getattr(info, "language", None)
+    return str(language) if language else None
+
+
+def detect_track_language(
+    model,
+    audio: np.ndarray,
+    chunks: list[dict],
+    samples: int = LANGUAGE_DETECTION_SAMPLES,
+) -> tuple[str | None, dict[str, float]]:
+    """Vota o idioma da trilha nos trechos de fala mais longos.
+
+    Trechos curtos ("ok", "sim") enganam a detecção; por isso só entram os mais
+    longos, com peso pela duração. Devolve (idioma, votos em segundos).
+    """
+    candidates = []
+    for chunk_info in chunks:
+        duration = (chunk_info["end"] - chunk_info["start"]) / SAMPLE_RATE
+        if duration < LANGUAGE_DETECTION_MIN_SEC:
+            continue
+        candidates.append((duration, chunk_info))
+    if not candidates and chunks:
+        longest = max(chunks, key=lambda item: item["end"] - item["start"])
+        candidates = [((longest["end"] - longest["start"]) / SAMPLE_RATE, longest)]
+    candidates.sort(key=lambda item: item[0], reverse=True)
+
+    votes: dict[str, float] = {}
+    for duration, chunk_info in candidates[:samples]:
+        chunk = audio[chunk_info["start"]:chunk_info["end"]]
+        if not chunk_has_speech(chunk):
+            continue
+        try:
+            language = detect_chunk_language(model, chunk)
+        except Exception as exc:
+            print(f"    [lang] detecção falhou ({type(exc).__name__})", flush=True)
+            continue
+        if language:
+            votes[language] = votes.get(language, 0.0) + duration
+    if not votes:
+        return None, {}
+    best = max(votes.items(), key=lambda item: item[1])[0]
+    return best, {language: round(seconds, 1) for language, seconds in votes.items()}
+
 
 def collect_segments(
     raw_segments,
@@ -978,6 +1317,8 @@ def transcribe_track(
     profile_memory: bool = False,
     progress_base_sec: float = 0.0,
     total_sec: float = 1.0,
+    language_report: dict | None = None,
+    quality_report: dict | None = None,
 ) -> list[Segment]:
     config = config or TranscriptionConfig()
 
@@ -1021,6 +1362,22 @@ def transcribe_track(
         return []
 
     chunks = group_speech_islands(islands)
+    if config.language == "auto":
+        locked_language, votes = detect_track_language(model, audio, chunks)
+        if language_report is not None:
+            language_report["detected"] = locked_language
+            language_report["votes"] = votes
+        if locked_language:
+            # Uma decisão por trilha: detectar a cada bloco de 28 s trocava
+            # "sim"/"uhum" por "sí"/"thank you" e desligava o vocabulário.
+            config = config_for_language(config, locked_language)
+            print(f"    Idioma travado na trilha: {locked_language} (votos: {votes})", flush=True)
+    track_hotwords = build_hotwords(config)
+    # O guarda de cobertura só vale quando há vocabulário do usuário no prompt
+    # (glossário, título ou participantes): é o prompt longo que pode pular fala.
+    coverage_guard = bool(track_hotwords) and bool(
+        config.glossary or config.participants or clean_title_hint(config.title_hint)
+    )
     segments = []
     detected_languages = []
     overlap_samples = int(CHUNK_OVERLAP_SEC * SAMPLE_RATE)
@@ -1045,11 +1402,54 @@ def transcribe_track(
         prompt_tail = build_prompt_tail(segments)
         raw_segments, info = model.transcribe(
             chunk,
-            **transcription_kwargs(config, vad_filter=False, prompt_tail=prompt_tail),
+            **transcription_kwargs(
+                config,
+                vad_filter=False,
+                prompt_tail=prompt_tail,
+                hotwords=track_hotwords,
+            ),
         )
         if config.language == "auto":
             detected_languages.append((info.language, info.language_probability))
         chunk_segments = collect_segments(raw_segments, speaker, chunk_offset_sec, config)
+        if coverage_guard:
+            speech_sec = speech_seconds_in_range(islands, slice_start, end_sample)
+            covered_sec = covered_seconds(
+                chunk_segments,
+                chunk_offset_sec,
+                chunk_offset_sec + (end_sample - slice_start) / SAMPLE_RATE,
+            )
+            if (
+                speech_sec >= CHUNK_COVERAGE_MIN_SPEECH_SEC
+                and covered_sec < CHUNK_COVERAGE_MIN_RATIO * speech_sec
+            ):
+                retry_raw, _ = model.transcribe(
+                    chunk,
+                    **transcription_kwargs(
+                        config,
+                        vad_filter=False,
+                        prompt_tail=prompt_tail,
+                        include_hotwords=False,
+                    ),
+                )
+                retry_segments = collect_segments(retry_raw, speaker, chunk_offset_sec, config)
+                retry_covered = covered_seconds(
+                    retry_segments,
+                    chunk_offset_sec,
+                    chunk_offset_sec + (end_sample - slice_start) / SAMPLE_RATE,
+                )
+                used = retry_covered > covered_sec * CHUNK_COVERAGE_RETRY_GAIN
+                if used:
+                    chunk_segments = retry_segments
+                if quality_report is not None:
+                    quality_report["coverage_retries"] = quality_report.get("coverage_retries", 0) + 1
+                    if used:
+                        quality_report["coverage_retries_used"] = quality_report.get("coverage_retries_used", 0) + 1
+                print(
+                    f"    chunk {i}: cobertura {covered_sec:.1f}s de {speech_sec:.1f}s de fala; "
+                    f"sem vocabulário {retry_covered:.1f}s ({'usado' if used else 'mantido'})",
+                    flush=True,
+                )
         if use_overlap and covered_until_sec is not None:
             before = len(chunk_segments)
             chunk_segments = drop_overlap_duplicates(
@@ -1281,11 +1681,18 @@ def build_meeting_meta(
     capture_integrity: str = "unknown",
     capture_issues: list[str] | None = None,
     recorded_at: str | None = None,
+    language_detected: dict | None = None,
+    calendar_event: dict | None = None,
+    audio_duration_ms: int | None = None,
 ) -> dict:
     processed_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    recorded_local = local_datetime(recorded_at)
     meta = {
         "title": title,
-        "date": recorded_at or processed_at,
+        "date": (
+            recorded_local.isoformat(timespec="seconds")
+            if recorded_local else (recorded_at or processed_at)
+        ),
         "processed_at": processed_at,
         "duration_ms": max((turn.end_ms for turn in turns), default=0),
         "language": language,
@@ -1296,6 +1703,12 @@ def build_meeting_meta(
         "pipeline_version": PIPELINE_VERSION,
         "capture_integrity": capture_integrity,
     }
+    if audio_duration_ms:
+        meta["audio_duration_ms"] = audio_duration_ms
+    if language_detected:
+        meta["language_detected"] = language_detected
+    if calendar_event:
+        meta["calendar_event"] = calendar_event
     if session_id:
         meta["session_id"] = session_id
     if capture_issues:
@@ -1483,19 +1896,40 @@ def build_markdown(
     capture_integrity: str = "unknown",
     capture_issues: list[str] | None = None,
     recorded_at: str | None = None,
+    language_detected: dict | None = None,
+    calendar_event: dict | None = None,
 ) -> str:
-    now = datetime.now()
+    now = datetime.now().astimezone()
     duration = max((turn.end_ms for turn in turns), default=0) / 1000.0
     lang_label = {"pt": "PT-BR", "en": "EN", "auto": "auto-detect"}.get(language, language)
+    if language == "auto" and language_detected:
+        detected = ", ".join(
+            f"{track} {value or '?'}" for track, value in sorted(language_detected.items())
+        )
+        lang_label = f"auto-detect ({detected})"
+    recorded_local = local_datetime(recorded_at)
 
     lines = [
         f"# {title}", "",
-        f"**Data:** {recorded_at or now.strftime('%Y-%m-%d %H:%M')}",
+        f"**Data:** {format_local_datetime(recorded_local or now)}",
         f"**Duração:** {format_time(duration)}",
         f"**Trilhas:** {'mic + sistema' if dual_track else 'única'}",
         f"**Idioma:** {lang_label}",
-        "", "---", "",
     ]
+    if calendar_event:
+        event_title = calendar_event.get("title")
+        start = local_datetime(calendar_event.get("start"))
+        end = local_datetime(calendar_event.get("end"))
+        window = ""
+        if start and end:
+            window = f" ({start.strftime('%H:%M')}–{end.strftime('%H:%M')})"
+        if event_title:
+            lines.append(f"**Evento do Calendar:** {event_title}{window}")
+        attendees = calendar_event.get("attendees_expected") or []
+        if attendees:
+            # Convite não prova presença nem autoria de fala.
+            lines.append(f"**Convidados (convite, não confirma presença):** {', '.join(attendees)}")
+    lines.extend(["", "---", ""])
     if capture_integrity == "degraded":
         lines.extend([
             "> ⚠ Captura parcial. O conteúdo abaixo pode estar incompleto.",
@@ -1518,11 +1952,52 @@ def build_markdown(
 # Helpers
 # ---------------------------------------------------------------------------
 
+def local_datetime(value: str | None) -> datetime | None:
+    """ISO-8601 (inclusive com 'Z') → datetime no fuso local do Mac."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()
+    return parsed.astimezone()
+
+
+def format_local_datetime(value: datetime) -> str:
+    """Ex.: '2026-09-23 09:10 (UTC-03:00)' — legível e sem ambiguidade de fuso."""
+    offset = value.strftime("%z")
+    offset_label = f"UTC{offset[:3]}:{offset[3:]}" if offset else "local"
+    return f"{value.strftime('%Y-%m-%d %H:%M')} ({offset_label})"
+
+
 def slugify(text: str) -> str:
-    text = text.lower()
+    # Remove acentos de forma determinística (NFC ou NFD): "Reunião" → "reuniao".
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(char for char in text if not unicodedata.combining(char)).lower()
     text = re.sub(r"[^\w\s-]", "", text, flags=re.UNICODE)
     text = re.sub(r"[\s_]+", "-", text)
     return text.strip("-")[:60]
+
+
+def output_stem(
+    title: str,
+    recorded_at: str | None = None,
+    session_id: str | None = None,
+    now: datetime | None = None,
+) -> str:
+    """Nome base dos artefatos pelo início da gravação (não pelo processamento).
+
+    A data do arquivo precisa ser a da reunião mesmo quando a fila atrasa.
+    """
+    stem_time = local_datetime(recorded_at) or now or datetime.now()
+    stem = f"{stem_time.strftime('%Y-%m-%d_%H-%M')}_{slugify(title)}"
+    if session_id:
+        safe_session_id = re.sub(r"[^a-zA-Z0-9]", "", session_id)[:8]
+        if safe_session_id:
+            stem = f"{stem}-{safe_session_id}"
+    return stem
 
 
 def format_time(seconds: float) -> str:
@@ -1705,7 +2180,33 @@ def main() -> None:
     )
     parser.add_argument(
         "--participant", action="append", default=[],
-        help="Participante esperado da reunião para metadata de análise (pode repetir)",
+        help=(
+            "Participante esperado (ex.: convidado do Calendar). Entra no meta; não "
+            "confirma presença (pode repetir)"
+        ),
+    )
+    parser.add_argument(
+        "--participant-prompt", action="store_true",
+        help=(
+            "Também usa os participantes no prompt do Whisper (experimental: pode "
+            "induzir nomes em trechos ambíguos)"
+        ),
+    )
+    parser.add_argument(
+        "--vocabulary", metavar="JSON",
+        help=(
+            "Vocabulário local do usuário: {\"terms\": [...], \"replacements\": {...}}. "
+            "Termos entram no prompt; correções exigem palavra inteira. Arquivo inválido "
+            "é ignorado com aviso"
+        ),
+    )
+    parser.add_argument("--calendar-title", help="Título do evento do Calendar escolhido")
+    parser.add_argument("--calendar-start", help="Início ISO-8601 do evento do Calendar")
+    parser.add_argument("--calendar-end", help="Fim ISO-8601 do evento do Calendar")
+    parser.add_argument("--calendar-organizer", help="Organizador do evento do Calendar")
+    parser.add_argument(
+        "--no-title-prompt", action="store_true",
+        help="Não usa o título da reunião no prompt do Whisper",
     )
     parser.add_argument(
         "--no-meta", action="store_true",
@@ -1751,6 +2252,27 @@ def main() -> None:
         use_default_replacements=not args.no_default_replacements,
     )
     config.known_names.extend(args.known_names)
+    vocabulary_status: dict | None = None
+    if args.vocabulary:
+        try:
+            vocabulary_terms, vocabulary_replacements = load_vocabulary(args.vocabulary)
+        except VocabularyError as exc:
+            # Vocabulário quebrado não pode impedir a transcrição da reunião.
+            print(f"[vocabulary] ignorado: {exc}", file=sys.stderr, flush=True)
+            vocabulary_status = {"status": "invalid"}
+        else:
+            config.glossary.extend(vocabulary_terms)
+            config.replacements.update(vocabulary_replacements)
+            config.replacements.update(dict(args.replace))   # --replace explícito vence
+            vocabulary_status = {
+                "status": "loaded",
+                "terms": len(vocabulary_terms),
+                "replacements": len(vocabulary_replacements),
+            }
+    if args.participant_prompt:
+        config.participants.extend(args.participant)
+    if not args.no_title_prompt:
+        config.title_hint = args.calendar_title or args.title
 
     mic_duration_sec = audio_duration_sec(args.mic)
     system_duration_sec = audio_duration_sec(args.system)
@@ -1770,10 +2292,14 @@ def main() -> None:
     segments: list[Segment] = []
     dual_track = bool(args.mic and args.system)
     sys_offset_sec = args.sys_offset / 1000.0
+    language_reports: dict[str, dict] = {}
+    quality_reports: dict[str, dict] = {}
 
     if args.mic:
         mic_offset_sec = args.mic_offset / 1000.0   # compat retroativa
         speaker = "Você" if dual_track else ""
+        language_reports["mic"] = {}
+        quality_reports["mic"] = {}
         segments.extend(transcribe_track(
             args.mic, speaker, model,
             config=config,
@@ -1784,11 +2310,15 @@ def main() -> None:
             profile_memory=args.profile_memory,
             progress_base_sec=0,
             total_sec=total_sec,
+            language_report=language_reports["mic"],
+            quality_report=quality_reports["mic"],
         ))
         _mem("mic-track-done", args.profile_memory)
 
     if args.system:
         speaker = "Interlocutor" if dual_track else ""
+        language_reports["system"] = {}
+        quality_reports["system"] = {}
         segments.extend(transcribe_track(
             args.system, speaker, model,
             config=config,
@@ -1799,8 +2329,38 @@ def main() -> None:
             profile_memory=args.profile_memory,
             progress_base_sec=mic_duration_sec,
             total_sec=total_sec,
+            language_report=language_reports["system"],
+            quality_report=quality_reports["system"],
         ))
         _mem("system-track-done", args.profile_memory)
+
+    language_detected = None
+    if args.language == "auto":
+        language_detected = {
+            track: report.get("detected")
+            for track, report in language_reports.items()
+            if "detected" in report
+        } or None
+
+    calendar_event = None
+    if args.calendar_title:
+        calendar_event = {"title": args.calendar_title, "source": "calendar_selection"}
+        for key, value in (
+            ("start", args.calendar_start),
+            ("end", args.calendar_end),
+        ):
+            local_value = local_datetime(value)
+            if local_value:
+                calendar_event[key] = local_value.isoformat(timespec="seconds")
+        if args.calendar_organizer:
+            calendar_event["organizer"] = args.calendar_organizer
+        if args.participant:
+            calendar_event["attendees_expected"] = list(args.participant)
+
+    audio_duration_ms = int(round(max(
+        mic_duration_sec,
+        (system_duration_sec + sys_offset_sec) if args.system else 0.0,
+    ) * 1000))
 
     if args.cluster_system_speakers and args.system and dual_track:
         _mem("relabel-before", args.profile_memory)
@@ -1842,16 +2402,19 @@ def main() -> None:
         capture_integrity=args.capture_integrity,
         capture_issues=args.capture_issue,
         recorded_at=args.recorded_at,
+        language_detected=language_detected,
+        calendar_event=calendar_event,
+        audio_duration_ms=audio_duration_ms,
     )
+    if vocabulary_status:
+        meta["vocabulary"] = vocabulary_status
+    coverage = {track: report for track, report in quality_reports.items() if report}
+    if coverage:
+        meta["coverage_retries"] = coverage
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    now = datetime.now()
-    filename_stem = f"{now.strftime('%Y-%m-%d_%H-%M')}_{slugify(args.title)}"
-    if args.session_id:
-        safe_session_id = re.sub(r"[^a-zA-Z0-9]", "", args.session_id)[:8]
-        if safe_session_id:
-            filename_stem = f"{filename_stem}-{safe_session_id}"
+    filename_stem = output_stem(args.title, recorded_at=args.recorded_at, session_id=args.session_id)
     output_paths: list[Path] = []
 
     jsonl_path = out_dir / f"{filename_stem}.jsonl"
@@ -1882,6 +2445,8 @@ def main() -> None:
                 capture_integrity=args.capture_integrity,
                 capture_issues=args.capture_issue,
                 recorded_at=args.recorded_at,
+                language_detected=language_detected,
+                calendar_event=calendar_event,
             ),
         )
         output_paths.append(md_path)

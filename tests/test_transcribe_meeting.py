@@ -286,7 +286,7 @@ class TranscribeMeetingTests(unittest.TestCase):
         self.assertNotIn("Meeting Transcriber", prompt)
         self.assertLess(len(prompt), 80)
 
-    def test_build_hotwords_prioritizes_context_terms(self):
+    def test_build_hotwords_puts_user_terms_after_generic_terms(self):
         config = tm.TranscriptionConfig(
             language="pt",
             context_terms=["Markdown", "Meeting Transcriber"],
@@ -295,9 +295,65 @@ class TranscribeMeetingTests(unittest.TestCase):
 
         hotwords = tm.build_hotwords(config)
 
-        self.assertTrue(hotwords.startswith("Markdown, Meeting Transcriber, Jira"))
-        self.assertIn("Kubernetes", hotwords)
-        self.assertLessEqual(len(hotwords.split(", ")), tm.DEFAULT_HOTWORD_LIMIT)
+        # O fim do prompt pesa mais e sobrevive ao corte: termos do usuário
+        # vêm depois dos genéricos, sem duplicar "Markdown".
+        self.assertTrue(hotwords.endswith("Termos: Markdown, Meeting Transcriber, Jira."))
+        self.assertEqual(hotwords.count("Markdown"), 1)
+        self.assertIn("backend", hotwords)
+        self.assertNotIn("Kubernetes", hotwords)
+        self.assertNotIn("Cloud", hotwords)
+
+    def test_build_hotwords_orders_participants_last_and_title_before_them(self):
+        config = tm.TranscriptionConfig(
+            language="pt",
+            glossary=["Atlas Hub"],
+            participants=["Ana Maria Souza Lima", "Bruno"],
+            title_hint="Cliente X - Checkpoint — 2026-09-23 10:00",
+        )
+
+        hotwords = tm.build_hotwords(config)
+
+        self.assertTrue(hotwords.endswith("Participantes: Ana Maria Souza, Bruno."))
+        self.assertIn("Reunião: Cliente X - Checkpoint. Participantes:", hotwords)
+        self.assertIn("Termos: Atlas Hub. Reunião:", hotwords)
+        self.assertNotIn("2026-09-23", hotwords)
+
+    def test_build_hotwords_ignores_default_titles(self):
+        for title in ("Reunião 2026-09-23 08:29", "Reunião", "Reunião 2026-09-23 08:29"):
+            config = tm.TranscriptionConfig(language="pt", title_hint=title)
+            self.assertNotIn("Reunião:", tm.build_hotwords(config) or "")
+
+    def test_build_hotwords_respects_token_budgets_per_part(self):
+        config = tm.TranscriptionConfig(
+            language="pt",
+            glossary=[f"Termo{index}" for index in range(200)],
+            participants=[f"Pessoa{index} Sobrenome" for index in range(40)],
+            title_hint="Título " * 40,
+        )
+
+        hotwords = tm.build_hotwords(config)
+
+        self.assertLessEqual(tm.count_prompt_tokens(hotwords), tm.HOTWORDS_TOKEN_BUDGET)
+        # Convidados demais não expulsam o glossário.
+        self.assertIn("Termos: Termo0", hotwords)
+        self.assertIn("Participantes: Pessoa0 Sobrenome", hotwords)
+
+    def test_transcription_kwargs_keep_full_prompt_within_whisper_limit(self):
+        config = tm.TranscriptionConfig(
+            language="pt",
+            glossary=[f"Termo{index}" for index in range(200)],
+            participants=[f"Pessoa{index}" for index in range(40)],
+            title_hint="Checkpoint semanal do produto",
+        )
+        long_tail = " ".join(f"palavra{index}" for index in range(400))
+
+        kwargs = tm.transcription_kwargs(config, vad_filter=False, prompt_tail=long_tail)
+        folded = f"{kwargs['initial_prompt']} {kwargs['hotwords']}"
+
+        self.assertLessEqual(tm.count_prompt_tokens(folded), tm.PROMPT_TOKEN_BUDGET)
+        # A cauda perde o começo, nunca o fim (contexto mais recente).
+        self.assertIn("palavra399", kwargs["initial_prompt"])
+        self.assertNotIn("palavra0 ", kwargs["initial_prompt"])
 
     def test_default_replacements_correct_common_work_terms(self):
         config = tm.load_transcription_config(
