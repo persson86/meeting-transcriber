@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import ObjCExceptionCatcher
 
 final class MicRecorder: @unchecked Sendable {
     private let engine = AVAudioEngine()
@@ -79,10 +80,18 @@ final class MicRecorder: @unchecked Sendable {
 
     private func installTapAndStart() throws {
         try lock.withLock {
-            let inputNode = engine.inputNode
-            let srcFmt = inputNode.outputFormat(forBus: 0)
-
-            guard srcFmt.sampleRate > 0, srcFmt.channelCount > 0 else {
+            // AVAudioEngine sinaliza estados inválidos (ex.: formato do hardware em
+            // transição quando o app de call assume o mic) com NSException, que Swift
+            // não captura: foi o crash de 16/set. O shim ObjC converte em erro, e o
+            // rearme falho vira aviso de captura parcial em vez de derrubar o app.
+            var inputNode: AVAudioInputNode?
+            var srcFmt: AVAudioFormat?
+            try MTObjCExceptionCatcher.perform {
+                let node = self.engine.inputNode
+                inputNode = node
+                srcFmt = node.outputFormat(forBus: 0)
+            }
+            guard let inputNode, let srcFmt, srcFmt.sampleRate > 0, srcFmt.channelCount > 0 else {
                 throw NSError(domain: "MicRecorder", code: 2,
                               userInfo: [NSLocalizedDescriptionKey: "Nenhum dispositivo de entrada de áudio disponível"])
             }
@@ -92,22 +101,27 @@ final class MicRecorder: @unchecked Sendable {
                               userInfo: [NSLocalizedDescriptionKey: "Cannot create mic audio converter"])
             }
 
-            inputNode.removeTap(onBus: 0)
-            inputNode.installTap(onBus: 0, bufferSize: 4096, format: srcFmt) { [weak self] buf, time in
-                guard let self else { return }
-                let hostTime = time.isHostTimeValid ? time.hostTime : nil
-                self.recordReceivedBuffer(hostTime: hostTime)
-                switch convertToInt16MonoResult(buf, using: converter) {
-                case .success(let data):
-                    self.appendConvertedPCM(data, hostTime: hostTime)
-                case .failure(let error):
-                    self.recordProcessingFailure(error)
+            try MTObjCExceptionCatcher.perform {
+                inputNode.removeTap(onBus: 0)
+                inputNode.installTap(onBus: 0, bufferSize: 4096, format: srcFmt) { [weak self] buf, time in
+                    guard let self else { return }
+                    let hostTime = time.isHostTimeValid ? time.hostTime : nil
+                    self.recordReceivedBuffer(hostTime: hostTime)
+                    switch convertToInt16MonoResult(buf, using: converter) {
+                    case .success(let data):
+                        self.appendConvertedPCM(data, hostTime: hostTime)
+                    case .failure(let error):
+                        self.recordProcessingFailure(error)
+                    }
                 }
             }
 
-            if !engine.isRunning {
-                try engine.start()
+            var startError: Error?
+            try MTObjCExceptionCatcher.perform {
+                guard !self.engine.isRunning else { return }
+                do { try self.engine.start() } catch { startError = error }
             }
+            if let startError { throw startError }
         }
     }
 
@@ -184,8 +198,10 @@ final class MicRecorder: @unchecked Sendable {
             self.configObserver = nil
         }
         lock.withLock {
-            engine.stop()
-            engine.inputNode.removeTap(onBus: 0)
+            try? MTObjCExceptionCatcher.perform {
+                self.engine.stop()
+                self.engine.inputNode.removeTap(onBus: 0)
+            }
         }
         if !writer.isEmpty || writer.firstErrorDescription != nil {
             try writer.save(to: url)
