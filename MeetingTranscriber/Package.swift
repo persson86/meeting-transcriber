@@ -5,12 +5,17 @@ let package = Package(
     name: "MeetingTranscriber",
     platforms: [.macOS(.v13)],
     targets: [
-        // Shim ObjC: converte NSException (ex.: do AVAudioEngine no rearme do mic)
-        // em NSError antes de voltar ao Swift, que não captura exceções ObjC.
+        // Shim ObjC: único lugar onde o AVAudioEngine pode levantar NSException.
+        // Converte a exceção em NSError antes de voltar ao Swift.
         .target(
             name: "ObjCExceptionCatcher",
             path: "Sources/ObjCExceptionCatcher",
-            publicHeadersPath: "include"
+            publicHeadersPath: "include",
+            linkerSettings: [
+                .linkedFramework("AVFoundation"),
+                .linkedFramework("AudioToolbox"),
+                .linkedFramework("CoreAudio")
+            ]
         ),
         .executableTarget(
             name: "MeetingTranscriber",

@@ -40,6 +40,21 @@ struct AudioCaptureHealth: Equatable, Sendable {
     let streamStopErrorDescription: String?
     let insertedSilenceByteCount: UInt32
     let cappedGapCount: UInt64
+    /// Recuperação do mic: `recoveryAttemptCount` = rebuilds tentados; `rebuildCount` =
+    /// engines novos que iniciaram; `recoverySuccessCount` = engines novos que escreveram PCM.
+    let rebuildCount: UInt64
+    let recoverySuccessCount: UInt64
+    let lastRebuildReason: String?
+    let currentDeviceName: String?
+    let currentDeviceUID: String?
+    let currentDeviceTransport: String?
+    /// Captura ativa e sem buffer recebido há mais que o limiar do watchdog.
+    let isStalled: Bool
+    /// Backend em uso ("audioEngine" ou "captureSession") e quantas vezes o fallback entrou.
+    let captureBackend: String?
+    let fallbackActivatedCount: UInt64
+    /// Rebuilds disparados por buffers só com zeros exatos (stream quebrado).
+    let digitalSilenceStallCount: UInt64
 
     var hasAudio: Bool { writtenByteCount > 0 }
 
@@ -56,7 +71,17 @@ struct AudioCaptureHealth: Equatable, Sendable {
         lastSuccessfulWriteHostTime: UInt64? = nil,
         processingErrorDescription: String? = nil,
         insertedSilenceByteCount: UInt32 = 0,
-        cappedGapCount: UInt64 = 0
+        cappedGapCount: UInt64 = 0,
+        rebuildCount: UInt64 = 0,
+        recoverySuccessCount: UInt64 = 0,
+        lastRebuildReason: String? = nil,
+        currentDeviceName: String? = nil,
+        currentDeviceUID: String? = nil,
+        currentDeviceTransport: String? = nil,
+        isStalled: Bool = false,
+        captureBackend: String? = nil,
+        fallbackActivatedCount: UInt64 = 0,
+        digitalSilenceStallCount: UInt64 = 0
     ) {
         self.receivedBufferCount = receivedBufferCount
         self.writtenByteCount = writtenByteCount
@@ -71,6 +96,16 @@ struct AudioCaptureHealth: Equatable, Sendable {
         self.streamStopErrorDescription = streamStopErrorDescription
         self.insertedSilenceByteCount = insertedSilenceByteCount
         self.cappedGapCount = cappedGapCount
+        self.rebuildCount = rebuildCount
+        self.recoverySuccessCount = recoverySuccessCount
+        self.lastRebuildReason = lastRebuildReason
+        self.currentDeviceName = currentDeviceName
+        self.currentDeviceUID = currentDeviceUID
+        self.currentDeviceTransport = currentDeviceTransport
+        self.isStalled = isStalled
+        self.captureBackend = captureBackend
+        self.fallbackActivatedCount = fallbackActivatedCount
+        self.digitalSilenceStallCount = digitalSilenceStallCount
     }
 }
 
@@ -95,25 +130,34 @@ enum AudioConversionError: LocalizedError {
 }
 
 struct PCMGapFill: Equatable {
-    let silence: Data
+    let byteCount: Int
     let wasCapped: Bool
+
+    /// Zeros materializados (compatibilidade). Gaps longos devem usar `byteCount`
+    /// com `WAVWriter.appendSilence`, que escreve em blocos limitados.
+    var silence: Data { Data(count: byteCount) }
 }
 
-/// Mantém o relógio do WAV alinhado a timestamps de host. Gaps muito longos são
+/// Mantém o relógio do WAV alinhado a timestamps de host. Gaps acima do teto são
 /// limitados para evitar crescimento ilimitado do arquivo e ficam explícitos em
 /// `AudioCaptureHealth.cappedGapCount`.
 enum PCMGapFiller {
     static let bytesPerSecond = 32_000
+    /// Teto padrão (trilha do sistema).
     static let maxSilenceSeconds = 30.0
+    /// Teto em escala de sessão para o mic: uma recuperação longa não pode deslocar
+    /// a trilha "Você" contra a do sistema.
+    static let sessionMaxSilenceSeconds = 30.0 * 60.0
 
     static func silenceBeforeBuffer(
         lastSuccessfulWriteHostTime: UInt64?,
         lastSuccessfulWriteByteCount: Int,
-        nextBufferHostTime: UInt64?
+        nextBufferHostTime: UInt64?,
+        maxSilenceSeconds: Double = PCMGapFiller.maxSilenceSeconds
     ) -> PCMGapFill {
         guard let lastSuccessfulWriteHostTime, let nextBufferHostTime,
               lastSuccessfulWriteByteCount >= 0 else {
-            return PCMGapFill(silence: Data(), wasCapped: false)
+            return PCMGapFill(byteCount: 0, wasCapped: false)
         }
 
         let previousStart = CMClockMakeHostTimeFromSystemUnits(lastSuccessfulWriteHostTime)
@@ -122,13 +166,13 @@ enum PCMGapFiller {
         let nextStart = CMClockMakeHostTimeFromSystemUnits(nextBufferHostTime)
         let gapSeconds = CMTimeGetSeconds(CMTimeSubtract(nextStart, expectedNextStart))
         guard gapSeconds.isFinite, gapSeconds > 1.0 / Double(bytesPerSecond) else {
-            return PCMGapFill(silence: Data(), wasCapped: false)
+            return PCMGapFill(byteCount: 0, wasCapped: false)
         }
 
         let cappedSeconds = min(gapSeconds, maxSilenceSeconds)
         var byteCount = Int((cappedSeconds * Double(bytesPerSecond)).rounded())
         byteCount -= byteCount % 2 // PCM Int16 sempre termina em amostra completa.
-        return PCMGapFill(silence: Data(count: byteCount), wasCapped: gapSeconds > maxSilenceSeconds)
+        return PCMGapFill(byteCount: byteCount, wasCapped: gapSeconds > maxSilenceSeconds)
     }
 }
 
@@ -235,6 +279,36 @@ final class WAVWriter: @unchecked Sendable {
     }
 
     var isEmpty: Bool { lock.withLock { byteCount == 0 } }
+
+    /// Bloco de zeros reutilizado: silêncio longo vai ao disco em fatias de até 1 MB,
+    /// sem materializar o gap inteiro na memória.
+    static let silenceBlockSize = 1 << 20
+    private static let silenceBlock = Data(count: silenceBlockSize)
+
+    @discardableResult
+    func appendSilence(byteCount count: Int) -> Bool {
+        guard count > 0 else { return true }
+        return lock.withLock {
+            do {
+                guard count <= Int(UInt32.max) - Int(byteCount) else {
+                    throw WAVWriterError.fileTooLarge(tempURL ?? stagingDirectory ?? FileManager.default.temporaryDirectory)
+                }
+                try ensureOpen()
+                var remaining = count
+                while remaining > 0 {
+                    let sliceSize = min(remaining, Self.silenceBlockSize)
+                    try handle?.write(contentsOf: Self.silenceBlock.prefix(sliceSize))
+                    byteCount &+= UInt32(sliceSize)
+                    remaining -= sliceSize
+                }
+                appendCount &+= 1
+                return true
+            } catch {
+                _ = rememberFirstError(error)
+                return false
+            }
+        }
+    }
 
     func save(to url: URL) throws {
         try lock.withLock {
@@ -353,4 +427,57 @@ func convertToInt16MonoResult(
 func convertToInt16Mono(_ input: AVAudioPCMBuffer, using converter: AVAudioConverter) -> Data? {
     guard case .success(let data) = convertToInt16MonoResult(input, using: converter) else { return nil }
     return data
+}
+
+/// Silêncio digital: todo o PCM do buffer, no formato de entrada, é zero exato.
+/// Mic real sempre tem ruído de fundo; zeros exatos contínuos indicam stream quebrado
+/// (ex.: dispositivo pego na transição de voice processing de outro app).
+func pcmBufferIsDigitalSilence(_ buffer: AVAudioPCMBuffer) -> Bool {
+    guard buffer.frameLength > 0 else { return true }
+    let list = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
+    for audioBuffer in list {
+        guard let data = audioBuffer.mData else { continue }
+        let bytes = UnsafeRawBufferPointer(start: data, count: Int(audioBuffer.mDataByteSize))
+        var offset = 0
+        while offset + 8 <= bytes.count {
+            if bytes.loadUnaligned(fromByteOffset: offset, as: UInt64.self) != 0 { return false }
+            offset += 8
+        }
+        while offset < bytes.count {
+            if bytes[offset] != 0 { return false }
+            offset += 1
+        }
+    }
+    return true
+}
+
+/// Conversor de uma geração do tap: nasce do formato do primeiro buffer e é recriado
+/// se o formato mudar (o tap usa `format: nil`, então o formato só aparece no callback).
+/// Só a thread de render do engine daquela geração o usa.
+final class TapConverter {
+    private let destination: AVAudioFormat
+    private var converter: AVAudioConverter?
+
+    init(destination: AVAudioFormat) {
+        self.destination = destination
+    }
+
+    var inputFormat: AVAudioFormat? { converter?.inputFormat }
+
+    func convert(_ buffer: AVAudioPCMBuffer) -> Result<Data, AudioConversionError> {
+        let format = buffer.format
+        guard format.sampleRate > 0, format.channelCount > 0 else {
+            return .failure(.invalidInputFormat)
+        }
+        if let converter, converter.inputFormat == format {
+            return convertToInt16MonoResult(buffer, using: converter)
+        }
+        guard let created = AVAudioConverter(from: format, to: destination) else {
+            return .failure(.converterFailed(
+                "não foi possível criar conversor para \(Int(format.sampleRate)) Hz / \(format.channelCount) canal(is)"
+            ))
+        }
+        converter = created
+        return convertToInt16MonoResult(buffer, using: created)
+    }
 }
