@@ -80,7 +80,7 @@ final class CaptureSessionEngine: NSObject, MicCaptureEngine, AVCaptureAudioData
         guard let handler else { return }
         // Erro de runtime da sessão conta como mudança: o recorder confere buffers em 500 ms.
         observer = NotificationCenter.default.addObserver(
-            forName: AVCaptureSession.runtimeErrorNotification,
+            forName: NSNotification.Name.AVCaptureSessionRuntimeError,
             object: shim.session,
             queue: nil
         ) { _ in handler() }
