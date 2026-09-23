@@ -1,9 +1,15 @@
 import EventKit
 import Foundation
 
-struct CalendarMeeting: Equatable, Sendable {
+struct CalendarMeeting: Equatable, Sendable, Codable {
     let title: String
     let startDate: Date
+    /// Campos opcionais (v1.4): identidade e convidados do evento escolhido.
+    /// Convidado não prova presença nem autoria de fala.
+    var endDate: Date? = nil
+    var eventIdentifier: String? = nil
+    var organizerName: String? = nil
+    var attendeeNames: [String]? = nil
 }
 
 enum CalendarParticipation: Equatable, Sendable {
@@ -20,9 +26,73 @@ struct CalendarMeetingCandidate: Equatable, Sendable {
     let participation: CalendarParticipation
     let calendarIdentifier: String
     let eventIdentifier: String
+    var endDate: Date? = nil
+    /// Mesmo evento em dois calendários (ex.: Exchange + Google) tem o mesmo id externo.
+    var externalIdentifier: String? = nil
+    var organizerName: String? = nil
+    var attendeeNames: [String] = []
 }
 
 enum CalendarMeetingSelector {
+    /// Eventos mais longos que isso (blocos de foco, dia inteiro disfarçado) não são reunião.
+    static let maxMeetingDuration: TimeInterval = 8 * 60 * 60
+    static let maxAttendeeNames = 20
+
+    /// Evento para o botão do Calendar: o em andamento ou o próximo, pelo início
+    /// mais próximo de agora. Clicar alguns minutos depois do início pega a
+    /// reunião atual, não a seguinte; reunião que estourou perde para a que
+    /// está começando.
+    static func forRecording(
+        from candidates: [CalendarMeetingCandidate],
+        now: Date,
+        horizon: TimeInterval = 24 * 60 * 60
+    ) -> CalendarMeeting? {
+        var seenExternal = Set<String>()
+        let eligible = candidates
+            .filter { candidate in
+                guard !candidate.isAllDay, !candidate.isCancelled,
+                      candidate.participation != .ineligible else { return false }
+                let end = candidate.endDate ?? candidate.startDate
+                if end.timeIntervalSince(candidate.startDate) > maxMeetingDuration { return false }
+                let inProgress = candidate.startDate <= now && end > now
+                let upcoming = candidate.startDate >= now && candidate.startDate < now.addingTimeInterval(horizon)
+                return inProgress || upcoming
+            }
+            .sorted { lhs, rhs in
+                let lhsDistance = abs(lhs.startDate.timeIntervalSince(now))
+                let rhsDistance = abs(rhs.startDate.timeIntervalSince(now))
+                if lhsDistance != rhsDistance { return lhsDistance < rhsDistance }
+                return isOrderedBefore(lhs, rhs)
+            }
+            .filter { candidate in
+                guard let external = candidate.externalIdentifier, !external.isEmpty else { return true }
+                return seenExternal.insert(external).inserted
+            }
+
+        return eligible.first.map { candidate in
+            CalendarMeeting(
+                title: normalizedTitle(candidate.title),
+                startDate: candidate.startDate,
+                endDate: candidate.endDate,
+                eventIdentifier: candidate.eventIdentifier.isEmpty ? nil : candidate.eventIdentifier,
+                organizerName: candidate.organizerName,
+                attendeeNames: Array(candidate.attendeeNames.prefix(maxAttendeeNames))
+            )
+        }
+    }
+
+    /// Nomes de exibição limpos: sem e-mail, sem duplicata, sem vazio.
+    static func displayNames(_ names: [String?]) -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        for raw in names {
+            let name = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !name.isEmpty, !name.contains("@") else { continue }
+            if seen.insert(name.lowercased()).inserted { result.append(name) }
+        }
+        return result
+    }
+
     static func next(
         from candidates: [CalendarMeetingCandidate],
         now: Date,
@@ -95,18 +165,14 @@ actor CalendarLookup {
     func nextConfirmedMeeting(now: Date = Date()) async throws -> CalendarMeeting? {
         try await ensureCalendarAccess()
 
-        let endDate = now.addingTimeInterval(24 * 60 * 60)
+        // Inclui eventos já em andamento (começaram até 8 h antes) além das próximas 24 h.
         let predicate = eventStore.predicateForEvents(
-            withStart: now,
-            end: endDate,
+            withStart: now.addingTimeInterval(-CalendarMeetingSelector.maxMeetingDuration),
+            end: now.addingTimeInterval(24 * 60 * 60),
             calendars: nil
         )
         let candidates = eventStore.events(matching: predicate).compactMap(candidate)
-        return CalendarMeetingSelector.next(
-            from: candidates,
-            now: now,
-            endDate: endDate
-        )
+        return CalendarMeetingSelector.forRecording(from: candidates, now: now)
     }
 
     private func candidate(from event: EKEvent) -> CalendarMeetingCandidate? {
@@ -128,6 +194,7 @@ actor CalendarLookup {
             participation = .ineligible
         }
 
+        let organizerName = event.organizer?.isCurrentUser == true ? nil : event.organizer?.name
         return CalendarMeetingCandidate(
             title: event.title,
             startDate: startDate,
@@ -135,7 +202,13 @@ actor CalendarLookup {
             isCancelled: event.status == .canceled,
             participation: participation,
             calendarIdentifier: event.calendar.calendarIdentifier,
-            eventIdentifier: event.eventIdentifier ?? ""
+            eventIdentifier: event.eventIdentifier ?? "",
+            endDate: event.endDate,
+            externalIdentifier: event.calendarItemExternalIdentifier,
+            organizerName: CalendarMeetingSelector.displayNames([organizerName]).first,
+            attendeeNames: CalendarMeetingSelector.displayNames(
+                attendees.filter { !$0.isCurrentUser }.map(\.name)
+            )
         )
     }
 

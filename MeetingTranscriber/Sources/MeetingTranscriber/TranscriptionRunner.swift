@@ -95,6 +95,7 @@ final class TranscriptionRunner {
         sessionID: UUID? = nil,
         captureIntegrity: CaptureIntegrity = .unknown,
         recordedAt: Date? = nil,
+        calendarMeeting: CalendarMeeting? = nil,
         onProgress: @escaping (Int) -> Void = { _ in }
     ) async throws -> URL {
         guard FileManager.default.isExecutableFile(atPath: python) else {
@@ -105,9 +106,16 @@ final class TranscriptionRunner {
         }
 
         return try await withCheckedThrowingContinuation { continuation in
-            var args = [script, "--out", outputDir.path, "--title", title, "--language", language]
-            if let sessionID { args += ["--session-id", sessionID.uuidString] }
-            if let recordedAt { args += ["--recorded-at", ISO8601DateFormatter().string(from: recordedAt)] }
+            var args = Self.arguments(
+                script: script,
+                title: title,
+                language: language,
+                outputDir: outputDir,
+                sessionID: sessionID,
+                recordedAt: recordedAt,
+                calendarMeeting: calendarMeeting,
+                vocabularyURL: AppConfig.vocabularyURL
+            )
             args += ["--capture-integrity", captureIntegrity.status.rawValue]
             for issue in captureIntegrity.details { args += ["--capture-issue", issue] }
             for term in AppConfig.contextTerms {
@@ -218,6 +226,43 @@ final class TranscriptionRunner {
                 continuation.resume(throwing: error)
             }
         }
+    }
+
+    /// Argumentos da CLI comuns a todo job. Datas saem com o fuso local
+    /// (ex.: -03:00) para a transcrição mostrar o horário da reunião.
+    static func arguments(
+        script: String,
+        title: String,
+        language: String,
+        outputDir: URL,
+        sessionID: UUID?,
+        recordedAt: Date?,
+        calendarMeeting: CalendarMeeting?,
+        vocabularyURL: URL?,
+        fileManager: FileManager = .default
+    ) -> [String] {
+        var args = [script, "--out", outputDir.path, "--title", title, "--language", language]
+        if let sessionID { args += ["--session-id", sessionID.uuidString] }
+        let isoFormatter = ISO8601DateFormatter()
+        isoFormatter.timeZone = .current
+        if let recordedAt { args += ["--recorded-at", isoFormatter.string(from: recordedAt)] }
+        if let vocabularyURL, fileManager.fileExists(atPath: vocabularyURL.path) {
+            args += ["--vocabulary", vocabularyURL.path]
+        }
+        if let calendarMeeting {
+            args += ["--calendar-title", calendarMeeting.title]
+            args += ["--calendar-start", isoFormatter.string(from: calendarMeeting.startDate)]
+            if let end = calendarMeeting.endDate {
+                args += ["--calendar-end", isoFormatter.string(from: end)]
+            }
+            if let organizer = calendarMeeting.organizerName, !organizer.isEmpty {
+                args += ["--calendar-organizer", organizer]
+            }
+            for name in calendarMeeting.attendeeNames ?? [] {
+                args += ["--participant", name]
+            }
+        }
+        return args
     }
 
     private static func validateOutput(

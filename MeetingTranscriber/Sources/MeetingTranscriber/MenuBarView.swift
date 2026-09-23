@@ -91,7 +91,7 @@ struct MenuBarView: View {
                             Label(
                                 state.isCalendarSyncing
                                     ? "Sincronizando…"
-                                    : "Usar próxima reunião do Calendar",
+                                    : "Usar reunião atual ou próxima do Calendar",
                                 systemImage: "calendar"
                             )
                             .frame(
@@ -102,7 +102,7 @@ struct MenuBarView: View {
                         .buttonStyle(.bordered)
                         .controlSize(.large)
                         .disabled(state.isCalendarSyncing)
-                        .help("Preencher com a próxima reunião confirmada")
+                        .help("Preencher com a reunião confirmada em andamento ou a próxima; se você editar o título, o evento deixa de ser associado")
                     }
 
                     HStack {
@@ -163,6 +163,13 @@ struct MenuBarView: View {
                         Text(languageLabel(state.language))
                             .font(.subheadline)
                             .foregroundColor(.secondary)
+                    }
+
+                    if state.status.isRecording, let alert = state.captureAlert {
+                        Label(alert, systemImage: "exclamationmark.triangle.fill")
+                            .font(.callout.weight(.medium))
+                            .foregroundColor(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
 
                     if state.status.isRecording {

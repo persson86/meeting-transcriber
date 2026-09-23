@@ -9,6 +9,7 @@ import Foundation
 ///   defaults write <bundle-id> maxConcurrentTranscriptions 2
 ///   defaults write <bundle-id> secondBrainPath /path/to/second-brain
 ///   defaults write <bundle-id> sessionRoot /path/to/recoverable/sessions
+///   defaults write <bundle-id> vocabularyPath /path/to/vocabulary.json
 enum AppConfig {
     static var projectRoot: String {
         if let configured = UserDefaults.standard.string(forKey: "projectRoot"), !configured.isEmpty {
@@ -88,6 +89,17 @@ enum AppConfig {
         }
         return FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/MeetingTranscriber/Sessions")
+    }
+
+    /// Vocabulário local do usuário (termos para o prompt do Whisper). Fica fora
+    /// do repositório de propósito: contém nomes de clientes e pessoas.
+    ///   defaults write <bundle-id> vocabularyPath /path/to/vocabulary.json
+    static var vocabularyURL: URL {
+        if let configured = UserDefaults.standard.string(forKey: "vocabularyPath"), !configured.isEmpty {
+            return URL(fileURLWithPath: NSString(string: configured).expandingTildeInPath)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/MeetingTranscriber/vocabulary.json")
     }
 
     // MARK: - Modelo de transcrição (memória)

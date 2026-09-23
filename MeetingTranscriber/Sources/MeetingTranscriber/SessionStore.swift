@@ -80,6 +80,9 @@ struct DurableSessionManifest: Codable, Equatable {
     var exportedToSecondBrain: Bool
     var hidden: Bool
     var captureIntegrity: CaptureIntegrity
+    /// Evento escolhido pelo usuário no botão do Calendar, congelado no início
+    /// da gravação (v1.4). Ausente em manifests antigos.
+    var calendarMeeting: CalendarMeeting? = nil
 }
 
 struct SessionStore {
@@ -99,7 +102,8 @@ struct SessionStore {
         title: String,
         language: String,
         outputDirectory: URL,
-        createdAt: Date
+        createdAt: Date,
+        calendarMeeting: CalendarMeeting? = nil
     ) throws -> URL {
         let directory = sessionDirectory(for: id)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -120,7 +124,8 @@ struct SessionStore {
             error: nil,
             exportedToSecondBrain: false,
             hidden: false,
-            captureIntegrity: .unknown
+            captureIntegrity: .unknown,
+            calendarMeeting: calendarMeeting
         )
         try write(manifest)
         return directory
@@ -161,7 +166,8 @@ struct SessionStore {
             error: error,
             exportedToSecondBrain: job.exportedToSecondBrain,
             hidden: hidden ?? previous?.hidden ?? false,
-            captureIntegrity: job.captureIntegrity
+            captureIntegrity: job.captureIntegrity,
+            calendarMeeting: job.calendarMeeting ?? previous?.calendarMeeting
         )
         try write(manifest)
     }
@@ -243,7 +249,8 @@ struct SessionStore {
                 status: status,
                 progress: manifest.progress,
                 exportedToSecondBrain: manifest.exportedToSecondBrain,
-                captureIntegrity: manifest.captureIntegrity
+                captureIntegrity: manifest.captureIntegrity,
+                calendarMeeting: manifest.calendarMeeting
             )
         }.sorted { $0.createdAt < $1.createdAt }
     }

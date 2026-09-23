@@ -8,6 +8,9 @@ struct MeetingTranscriberApp: App {
     @NSApplicationDelegateAdaptor(URLSchemeDelegate.self) private var urlSchemeDelegate
 
     init() {
+        #if MT_HARDWARE_SELFTEST
+        HardwareSelfTest.runIfRequested()
+        #endif
         NotificationManager.shared.requestAuthorization()
         let dir = UserDefaults.standard.url(forKey: "outputDirectory")
             ?? AppConfig.defaultOutputDirectory
@@ -21,10 +24,22 @@ struct MeetingTranscriberApp: App {
             MenuBarView()
                 .environmentObject(appState)
         } label: {
-            Image(systemName: appState.status.isRecording ? "record.circle.fill" : "mic.circle")
+            // Alerta visível mesmo em call/compartilhamento de tela, quando a
+            // notificação costuma ficar suprimida.
+            Image(systemName: menuBarSymbol)
                 .symbolRenderingMode(.hierarchical)
-                .foregroundStyle(appState.status.isRecording ? .red : .primary)
+                .foregroundStyle(menuBarColor)
         }
         .menuBarExtraStyle(.window)
+    }
+
+    private var menuBarSymbol: String {
+        guard appState.status.isRecording else { return "mic.circle" }
+        return appState.captureAlert == nil ? "record.circle.fill" : "exclamationmark.triangle.fill"
+    }
+
+    private var menuBarColor: Color {
+        guard appState.status.isRecording else { return .primary }
+        return appState.captureAlert == nil ? .red : .orange
     }
 }

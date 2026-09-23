@@ -76,6 +76,8 @@ struct TranscriptionJob: Identifiable, Equatable {
     var progress: Int = 0
     var exportedToSecondBrain: Bool = false
     var captureIntegrity: CaptureIntegrity = .unknown
+    /// Evento do Calendar escolhido pelo usuário para esta gravação (v1.4).
+    var calendarMeeting: CalendarMeeting? = nil
 }
 
 @MainActor
@@ -88,6 +90,9 @@ final class AppState: ObservableObject {
     @Published var language: String  // "pt" | "en" | "auto"
     @Published var transcriptionJobs: [TranscriptionJob] = []
     @Published var isCalendarSyncing = false
+    /// Mensagem de alerta enquanto o microfone está sem entregar áudio durante a
+    /// gravação. O ícone da barra de menu muda enquanto não for nil.
+    @Published var captureAlert: String?
 
     private var mic: MicRecorder?
     private var sys: SystemAudioRecorder?
@@ -103,6 +108,13 @@ final class AppState: ObservableObject {
     private let sessionLease: SessionStoreLease?
     private let storageLeaseAvailable: Bool
     private var calendarWarning: String?
+    /// Evento escolhido no botão do Calendar e o título que ele preencheu. Se o
+    /// usuário editar o título depois, a associação é descartada: evento errado
+    /// é pior que nenhum.
+    private var selectedCalendarMeeting: CalendarMeeting?
+    private var selectedCalendarTitle: String?
+    private var currentCalendarMeeting: CalendarMeeting?
+    private var currentTitle: String?
 
     /// Quantas transcrições concluídas ficam retidas (na lista e em memória).
     /// Jobs ativos não contam para esse limite — eles são sempre visíveis.
@@ -114,7 +126,9 @@ final class AppState: ObservableObject {
         outputDirectory = UserDefaults.standard.url(forKey: "outputDirectory")
             ?? AppConfig.defaultOutputDirectory
         language = UserDefaults.standard.string(forKey: "language") ?? "pt"
-        meetingTitle = Self.defaultTitle()
+        // Vazio de propósito: o título padrão é calculado no início da gravação,
+        // não no stop anterior (o horário ficava errado em até 16 h).
+        meetingTitle = ""
         let lease = try? sessionStore.acquireExclusiveLease()
         sessionLease = lease
         storageLeaseAvailable = lease != nil
@@ -204,7 +218,14 @@ final class AppState: ObservableObject {
             lastWarning = "Transcrição em andamento — gravar agora aumenta o uso de memória (o app processa uma por vez). A gravação continua normalmente."
         }
 
-        let title = meetingTitle.isEmpty ? Self.defaultTitle() : meetingTitle
+        let typedTitle = meetingTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        let title = typedTitle.isEmpty ? Self.defaultTitle() : typedTitle
+        let calendarMeeting = Self.calendarMeetingForTitle(
+            title,
+            selected: selectedCalendarMeeting,
+            selectedTitle: selectedCalendarTitle
+        )
+        meetingTitle = title
         let outDir = outputDirectory
         let currentLanguage = language
         let sessionID = UUID()
@@ -216,6 +237,7 @@ final class AppState: ObservableObject {
             var recordingStartedAt: Date?
             do {
                 guard await ensureMicrophoneAccess() else {
+                    if typedTitle.isEmpty { meetingTitle = "" }
                     status = .error("Permissão de microfone necessária. Ative o Meeting Transcriber em Configurações do Sistema → Privacidade e Segurança → Microfone, depois tente novamente.")
                     return
                 }
@@ -228,7 +250,8 @@ final class AppState: ObservableObject {
                     title: title,
                     language: currentLanguage,
                     outputDirectory: outDir,
-                    createdAt: createdAt
+                    createdAt: createdAt,
+                    calendarMeeting: calendarMeeting
                 )
                 pendingDirectory = dir
 
@@ -253,7 +276,12 @@ final class AppState: ObservableObject {
                 tempDir = dir
                 currentSessionID = sessionID
                 captureStartedAt = createdAt
+                currentTitle = title
+                currentCalendarMeeting = calendarMeeting
+                selectedCalendarMeeting = nil
+                selectedCalendarTitle = nil
                 captureHealthWarnings = []
+                captureAlert = nil
                 status = .recording
                 startCaptureMonitor()
 
@@ -281,6 +309,7 @@ final class AppState: ObservableObject {
                     transcriptionJobs.append(failedJob)
                     persist(failedJob)
                 }
+                if typedTitle.isEmpty { meetingTitle = "" }
                 if msg.contains("declined") || msg.contains("not authorized") || msg.contains("userDeclined") {
                     CGRequestScreenCaptureAccess()
                     status = .error("Permissão de gravação de tela necessária. Ative o Meeting Transcriber em Configurações do Sistema → Privacidade e Segurança → Gravação de Tela e Áudio do Sistema, depois tente novamente.")
@@ -303,9 +332,11 @@ final class AppState: ObservableObject {
         captureMonitorTask?.cancel()
         captureMonitorTask = nil
 
-        let title = meetingTitle.isEmpty ? Self.defaultTitle() : meetingTitle
+        let title = currentTitle ?? (meetingTitle.isEmpty ? Self.defaultTitle(at: startedAt) : meetingTitle)
+        let calendarMeeting = currentCalendarMeeting
         let outDir = outputDirectory
         let currentLanguage = language
+        captureAlert = nil
 
         Task {
             do {
@@ -333,6 +364,7 @@ final class AppState: ObservableObject {
 
                 mic = nil; sys = nil; tempDir = nil
                 currentSessionID = nil; captureStartedAt = nil
+                currentTitle = nil; currentCalendarMeeting = nil
                 captureHealthWarnings = []
 
                 let recordedMicURL = Self.existingAudioFileURL(micURL)
@@ -385,7 +417,8 @@ final class AppState: ObservableObject {
                     startedAt: nil,
                     completedAt: nil,
                     status: .queued,
-                    captureIntegrity: captureIssues.isEmpty ? .complete : .degraded(captureIssues)
+                    captureIntegrity: captureIssues.isEmpty ? .complete : .degraded(captureIssues),
+                    calendarMeeting: calendarMeeting
                 )
 
                 transcriptionJobs.append(job)
@@ -393,14 +426,16 @@ final class AppState: ObservableObject {
                 if !captureIssues.isEmpty {
                     warn("Captura parcial: \(captureIssues.joined(separator: " ")) O áudio recuperável foi preservado.")
                 }
-                meetingTitle = Self.defaultTitle()
+                meetingTitle = ""
                 status = .idle
                 scheduleTranscriptionJobs()
 
             } catch {
                 mic = nil; sys = nil; tempDir = nil
                 currentSessionID = nil; captureStartedAt = nil
+                currentTitle = nil; currentCalendarMeeting = nil
                 captureHealthWarnings = []
+                meetingTitle = ""
                 let failedMicURL = dir.map { Self.existingAudioFileURL($0.appendingPathComponent("mic.wav")) } ?? nil
                 let failedSystemURL = dir.map { Self.existingAudioFileURL($0.appendingPathComponent("system.wav")) } ?? nil
                 if !transcriptionJobs.contains(where: { $0.id == sessionID }) {
@@ -457,7 +492,7 @@ final class AppState: ObservableObject {
 
                 transcriptionJobs.append(job)
                 persist(job)
-                meetingTitle = Self.defaultTitle()
+                meetingTitle = ""
                 status = .idle
                 scheduleTranscriptionJobs()
             } catch {
@@ -489,7 +524,10 @@ final class AppState: ObservableObject {
                     return
                 }
 
-                meetingTitle = Self.calendarTitle(for: meeting)
+                let title = Self.calendarTitle(for: meeting)
+                meetingTitle = title
+                selectedCalendarMeeting = meeting
+                selectedCalendarTitle = title
                 clearCalendarWarning()
             } catch let error as CalendarLookupError {
                 showCalendarWarning(error.localizedDescription)
@@ -532,10 +570,14 @@ final class AppState: ObservableObject {
         if let error = systemHealth.streamStopErrorDescription {
             issues.append("A captura do áudio do sistema foi interrompida: \(error)")
         }
-        if Date().timeIntervalSince(captureStartedAt ?? Date()) > 5,
-           micHealth.receivedBufferCount == 0 || Self.hostTimeAgeSeconds(micHealth.lastBufferHostTime) > 5 {
+        let micStalled = Self.micIsStalled(
+            health: micHealth,
+            secondsSinceCaptureStart: Date().timeIntervalSince(captureStartedAt ?? Date())
+        )
+        if micStalled {
             issues.append("O microfone deixou de entregar áudio há mais de cinco segundos.")
         }
+        updateCaptureAlert(micStalled: micStalled)
         for issue in issues where captureHealthWarnings.insert(issue).inserted {
             warn("Captura parcial: \(issue) A gravação recuperável continua sendo preservada.")
         }
@@ -593,6 +635,7 @@ final class AppState: ObservableObject {
                     sessionID: job.id,
                     captureIntegrity: job.captureIntegrity,
                     recordedAt: job.createdAt,
+                    calendarMeeting: job.calendarMeeting,
                     onProgress: { [weak self] pct in
                         Task { @MainActor in
                             self?.updateProgress(id: job.id, pct: pct)
@@ -911,7 +954,7 @@ final class AppState: ObservableObject {
         return Array(Set(issues)).sorted()
     }
 
-    private static func hostTimeAgeSeconds(_ hostTime: UInt64?) -> TimeInterval {
+    static func hostTimeAgeSeconds(_ hostTime: UInt64?) -> TimeInterval {
         guard let hostTime else { return .infinity }
         var info = mach_timebase_info_data_t()
         mach_timebase_info(&info)
@@ -941,8 +984,43 @@ final class AppState: ObservableObject {
         )
     }
 
-    static func defaultTitle() -> String {
-        "Reunião \(formattedTitleDate(Date()))"
+    static func defaultTitle(at date: Date = Date()) -> String {
+        "Reunião \(formattedTitleDate(date))"
+    }
+
+    /// Evento vale para a gravação só se o título ainda é o que o botão preencheu.
+    static func calendarMeetingForTitle(
+        _ title: String,
+        selected: CalendarMeeting?,
+        selectedTitle: String?
+    ) -> CalendarMeeting? {
+        guard let selected, let selectedTitle,
+              title == selectedTitle.trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
+        return selected
+    }
+
+    /// Mic sem áudio: nenhum buffer recebido após 5 s de captura, ou o último
+    /// recebido há mais de 5 s. Usa recepção (callback), não escrita em disco.
+    static func micIsStalled(
+        health: AudioCaptureHealth,
+        secondsSinceCaptureStart: TimeInterval,
+        threshold: TimeInterval = 5
+    ) -> Bool {
+        guard secondsSinceCaptureStart > threshold else { return false }
+        if health.receivedBufferCount == 0 { return true }
+        let lastReceived = health.lastReceivedBufferHostTime ?? health.lastBufferHostTime
+        return hostTimeAgeSeconds(lastReceived) > threshold
+    }
+
+    private func updateCaptureAlert(micStalled: Bool) {
+        if micStalled {
+            if captureAlert == nil {
+                captureAlert = "Microfone sem áudio — tentando recuperar a captura."
+            }
+        } else if captureAlert != nil {
+            captureAlert = nil
+            lastWarning = "O microfone voltou a gravar. O intervalo sem áudio fica registrado na transcrição."
+        }
     }
 
     private static func calendarTitle(for meeting: CalendarMeeting) -> String {
