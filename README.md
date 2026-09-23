@@ -19,6 +19,31 @@ Speaker labels are track based: microphone audio is labeled `Você`, system audi
 is labeled `Interlocutor`. Optional local clustering can split the system track
 into heuristic `Remote_A`, `Remote_B`, etc. labels.
 
+## What's New in 1.4
+
+- Re-arming the microphone after an audio route change no longer crashes the
+  app: the AVAudioEngine calls that can raise Objective-C exceptions run behind
+  an Objective-C shim, so a failed re-arm becomes a partial-capture warning.
+  1.3.2 could abort mid-meeting at this point.
+- The menu bar icon turns into an orange warning while the microphone is not
+  delivering audio during a recording, since notifications are often hidden
+  during calls and screen sharing.
+- **Usar reunião atual ou próxima do Calendar** picks the meeting in progress
+  (or the next one), by the start closest to now. The chosen event's attendees
+  (display names only) are written to the transcript metadata as *expected*
+  participants. Editing the title drops the association.
+- The default title uses the time the recording starts, not the time the
+  previous one stopped. Dates are written in local time with the UTC offset, and
+  file names use the recording start instead of the processing time.
+- `auto` language detects once per track, on the longest speech chunks, and
+  then locks it, instead of detecting every 28-second chunk. A Portuguese track
+  gets the Portuguese prompt and defaults.
+- Whisper prompts now fit a token budget measured with Whisper's own tokenizer,
+  ordered so meeting-specific terms survive truncation. An optional local
+  vocabulary file (`~/Library/Application Support/MeetingTranscriber/vocabulary.json`,
+  never committed) adds names and product terms to the prompt.
+- Text replacements only match whole words (`OAT` no longer changes `GOAT`).
+
 ## What's New in 1.3
 
 - Durable session manifests and recoverable WAV staging survive app restarts.
@@ -87,7 +112,28 @@ defaults write <bundle-id> mlxModel mlx-community/whisper-large-v3-mlx
 defaults write <bundle-id> transcriptionBackend mlx
 defaults write <bundle-id> debugMemoryLogging -bool YES
 defaults write <bundle-id> secondBrainPath /path/to/second-brain
+defaults write <bundle-id> vocabularyPath /path/to/vocabulary.json
 ```
+
+### Vocabulary
+
+Proper nouns (customers, products, colleagues) are the most frequent errors in
+meeting transcripts. Create a local file, outside the repository, and the app
+passes it to the pipeline when it exists:
+
+```json
+{
+  "version": 1,
+  "terms": ["Acme", "Project Atlas", "Jordan"],
+  "replacements": {}
+}
+```
+
+`terms` are added to the Whisper prompt in priority order within a token budget.
+`replacements` are deterministic whole-word corrections: add one only after
+checking every occurrence in your existing transcripts, since a wrong global
+replacement changes meaning. An invalid file is ignored with a warning, and the
+transcription still runs.
 
 `maxConcurrentTranscriptions` controls how many transcription processes run at
 the same time. The default is `1` to keep the Mac responsive; values above `3`
@@ -170,7 +216,7 @@ The pipeline also supports meeting-specific vocabulary through `--context-term`,
 On first launch the app asks for **Screen & System Audio Recording** (used only
 to capture system audio) and, on the first recording, **Microphone** access.
 Calendar access is requested separately, only after clicking
-**Usar próxima reunião do Calendar**.
+**Usar reunião atual ou próxima do Calendar**.
 
 If recording fails with a permission error, enable the app in System Settings →
 Privacy & Security → Screen & System Audio Recording and try again. If the app
@@ -194,17 +240,19 @@ it with `tccutil reset ScreenCapture <bundle-id>` and relaunch.
 
 1. Open `MeetingTranscriber.app`.
 2. Click the microphone icon in the macOS menu bar.
-3. Enter a meeting title or click **Usar próxima reunião do Calendar**.
+3. Enter a meeting title or click **Usar reunião atual ou próxima do Calendar**.
 4. Click **Iniciar gravação** to begin recording.
 5. Click **Parar e adicionar à fila** to save audio and enqueue the transcription.
 6. Follow progress in the **Transcrições** section. JSONL and Markdown files are
    written to the configured output directory.
 
-The Calendar action looks at the next 24 hours and uses the earliest upcoming
-non-cancelled, non-all-day event that you accepted, or that you organized with
-other participants. It fills the title field but never starts recording
-automatically. If no eligible event is found, the existing title is preserved
-and the app shows a warning.
+The Calendar action considers the meeting in progress and the next 24 hours,
+and uses the non-cancelled, non-all-day event (shorter than 8 hours) that you
+accepted, or that you organized with other participants, whose start is closest
+to now. It fills the title field and keeps the event's attendees as expected
+participants, but never starts recording automatically. Editing the title after
+picking an event drops the association. If no eligible event is found, the
+existing title is preserved and the app shows a warning.
 
 To process an iPhone recording manually, click **Processar arquivo de áudio…**. The
 file picker opens in Downloads by default; choose the 16 kHz WAV and leave the
@@ -299,7 +347,7 @@ Main options:
 | `--title` | Meeting title |
 | `--format` | `both` (default), `jsonl`, `markdown`, `llm`, or `analysis` |
 | `--persona-analysis` | Writes `.analysis.jsonl` with extra context and quality signals |
-| `--language` | `pt` (default), `en`, or `auto` |
+| `--language` | `pt` (default), `en`, or `auto` (detects once per track and locks it) |
 | `--backend` | `mlx` (default) or `faster-whisper` |
 | `--model` | Whisper model for faster-whisper, from `tiny` to `large-v3` |
 | `--sys-offset MS` | System-track offset in milliseconds |
@@ -311,7 +359,11 @@ Main options:
 | `--cluster-system-speakers` | Heuristically labels the system track as `Remote_A/B/...` |
 | `--speaker-map L=N,...` | Maps speaker labels to names, for example `Remote_A=Alex` |
 | `--analysis-context KEY=VALUE` | Metadata for analysis output, for example `org=ExampleCo` |
-| `--participant NAME` | Expected participant metadata for analysis output |
+| `--participant NAME` | Expected participant (e.g. calendar invitee) written to the metadata |
+| `--participant-prompt` | Also adds participants to the Whisper prompt (experimental) |
+| `--vocabulary JSON` | Local vocabulary file (`terms`, `replacements`) |
+| `--calendar-title`, `--calendar-start`, `--calendar-end`, `--calendar-organizer` | Calendar event metadata |
+| `--no-title-prompt` | Do not add the meeting title to the Whisper prompt |
 | `--filter-suspect` | Omits suspect turns from JSONL |
 | `--no-sanitize` | Keeps raw suspect text for debugging |
 | `--max-turn-duration SEC` | Maximum consolidated turn duration, default `30` |
