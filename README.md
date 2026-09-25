@@ -19,7 +19,7 @@ Speaker labels are track based: microphone audio is labeled `Você`, system audi
 is labeled `Interlocutor`. Optional local clustering can split the system track
 into heuristic `Remote_A`, `Remote_B`, etc. labels.
 
-## What's New in Pipeline 0.9.0
+## What's New in 1.5
 
 - The app now asks the pipeline for a review companion,
   `<stem>.analysis.jsonl`, next to the Markdown and JSONL. It carries the track
@@ -31,6 +31,10 @@ into heuristic `Remote_A`, `Remote_B`, etc. labels.
   (`track_offsets_ms`).
 - `review_turns.py` lists flagged turns and plays the right track for a turn:
   see [Reviewing a Transcript](#reviewing-a-transcript).
+- The menu footer shows the app version and the pipeline version it will run
+  (`v1.5.0 · pipeline 0.9.0`). They can differ: the app runs the pipeline from
+  the checkout, so a `git pull` updates it without reinstalling the app.
+  (Pipeline 0.9.0.)
 
 ## What's New in 1.4.1
 

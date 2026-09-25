@@ -423,6 +423,12 @@ struct MenuBarView: View {
 
                 Spacer()
 
+                Text(AppVersion.label)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .help("Versão do app e do pipeline de transcrição")
+
                 Button {
                     NSApplication.shared.terminate(nil)
                 } label: {
