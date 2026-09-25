@@ -1142,6 +1142,28 @@ class LlmOutputTests(unittest.TestCase):
         for line in fenced.splitlines():
             json.loads(line)
 
+    def test_build_analysis_jsonl_appends_chunk_diagnostics_for_review(self):
+        turns = [tm.Turn(speaker="Interlocutor", text="oi", start_ms=0, end_ms=900, confidence=0.9, is_suspect=False, track="system")]
+        chunks = {"system": [{"index": 1, "start_ms": 0, "end_ms": 1000, "slice_start_ms": 0, "hotwords": True}]}
+
+        rows = [
+            json.loads(line)
+            for line in tm.build_analysis_jsonl(turns, meta={"title": "t"}, chunks=chunks, purpose="review").splitlines()
+        ]
+
+        self.assertEqual([row["type"] for row in rows], ["meta", "turn", "chunk"])
+        self.assertEqual(rows[0]["purpose"], "review")
+        self.assertEqual(rows[2]["track"], "system")
+        self.assertTrue(rows[2]["hotwords"])
+
+    def test_meeting_meta_records_track_offsets(self):
+        meta = tm.build_meeting_meta(
+            title="t", language="pt", turns=[], tracks="both", backend="mlx", model_name="m",
+            track_offsets_ms={"mic": 0.0, "system": 202.0},
+        )
+
+        self.assertEqual(meta["track_offsets_ms"], {"mic": 0.0, "system": 202.0})
+
     def test_build_analysis_jsonl_preserves_social_and_quality_signals(self):
         turns = [
             tm.Turn(

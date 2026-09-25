@@ -159,6 +159,25 @@ final class MeetingIdentityTests: XCTestCase {
         XCTAssertFalse(args.contains("--vocabulary"))
         XCTAssertFalse(args.contains("--calendar-title"))
         XCTAssertFalse(args.contains("--participant"))
+        XCTAssertTrue(args.contains("--with-analysis"))
+    }
+
+    func testSecondBrainArtifactsIncludeReviewCompanionWhenPresent() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mt-export-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let output = directory.appendingPathComponent("2026-09-25_15-29_reuniao-ABCD1234.md")
+        for name in ["2026-09-25_15-29_reuniao-ABCD1234.md", "2026-09-25_15-29_reuniao-ABCD1234.jsonl"] {
+            try Data("x".utf8).write(to: directory.appendingPathComponent(name))
+        }
+
+        XCTAssertEqual(AppState.secondBrainArtifacts(for: output).map(\.suffix), ["md", "jsonl"])
+
+        try Data("x".utf8).write(to: directory.appendingPathComponent("2026-09-25_15-29_reuniao-ABCD1234.analysis.jsonl"))
+        let artifacts = AppState.secondBrainArtifacts(for: output)
+        XCTAssertEqual(artifacts.map(\.suffix), ["md", "jsonl", "analysis.jsonl"])
+        XCTAssertEqual(artifacts.last?.source.lastPathComponent, "2026-09-25_15-29_reuniao-ABCD1234.analysis.jsonl")
     }
 
     // MARK: - Persistência

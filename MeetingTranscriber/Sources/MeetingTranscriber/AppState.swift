@@ -762,26 +762,40 @@ final class AppState: ObservableObject {
         }
 
         let ts = Int(Date().timeIntervalSince1970)
-        let base = outputURL.deletingPathExtension()
-        let slug = base.lastPathComponent
+        let slug = outputURL.deletingPathExtension().lastPathComponent
 
+        var copied: [URL] = []
         do {
-            var copied = 0
-            for ext in ["md", "jsonl"] {
-                let source = base.appendingPathExtension(ext)
-                guard fm.fileExists(atPath: source.path) else { continue }
-                let destination = queueDir.appendingPathComponent("\(ts)-meeting-\(slug).\(ext)")
+            for (source, suffix) in Self.secondBrainArtifacts(for: outputURL, fileManager: fm) {
+                let destination = queueDir.appendingPathComponent("\(ts)-meeting-\(slug).\(suffix)")
                 try fm.copyItem(at: source, to: destination)
-                copied += 1
+                copied.append(destination)
             }
-            guard copied > 0 else {
+            guard !copied.isEmpty else {
                 status = .error("Nenhum arquivo de transcrição encontrado para enviar")
                 return
             }
             transcriptionJobs[index].exportedToSecondBrain = true
             persist(transcriptionJobs[index])
         } catch {
+            // Pacote incompleto não fica na fila: o retry usa outro timestamp e
+            // o feed trataria as cópias parciais como outra reunião.
+            for url in copied { try? fm.removeItem(at: url) }
             status = .error("Falha ao enviar para o second-brain: \(error.localizedDescription)")
+        }
+    }
+
+    /// Arquivos que vão juntos para o Second Brain, com o mesmo basename: o
+    /// companion `.analysis.jsonl` (revisão) só existe a partir do pipeline 0.9.0.
+    static func secondBrainArtifacts(
+        for outputURL: URL,
+        fileManager fm: FileManager = .default
+    ) -> [(source: URL, suffix: String)] {
+        let directory = outputURL.deletingLastPathComponent()
+        let stem = outputURL.deletingPathExtension().lastPathComponent
+        return ["md", "jsonl", "analysis.jsonl"].compactMap { suffix in
+            let source = directory.appendingPathComponent("\(stem).\(suffix)")
+            return fm.fileExists(atPath: source.path) ? (source, suffix) : nil
         }
     }
 

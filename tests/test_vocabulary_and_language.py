@@ -335,6 +335,64 @@ class CoverageGuardTests(unittest.TestCase):
         self.assertEqual([seg.text for seg in segments], ["primeira parte inteira", "segunda parte inteira"])
         self.assertEqual(report, {"coverage_retries": 1, "coverage_retries_used": 1})
 
+    def test_chunk_log_records_adopted_retry_without_changing_text(self):
+        wav_path = write_wav(self, duration_sec=21.0)
+        model = self.model(short_with_vocabulary=True)
+        chunk_log = []
+        config = tm.TranscriptionConfig(language="pt", glossary=["Atlas Hub"])
+
+        with patch.object(tm, "detect_speech_islands", return_value=self.islands()):
+            segments = tm.transcribe_track(
+                wav_path, "Interlocutor", model, config=config, offset_sec=0.2, chunk_log=chunk_log,
+            )
+
+        self.assertEqual([seg.text for seg in segments], ["primeira parte inteira", "segunda parte inteira"])
+        self.assertEqual(len(chunk_log), 1)
+        entry = chunk_log[0]
+        self.assertEqual((entry["index"], entry["start_ms"], entry["end_ms"]), (1, 200, 20200))
+        # O texto adotado veio da retranscrição, que roda sem vocabulário.
+        self.assertFalse(entry["hotwords"])
+        self.assertTrue(entry["coverage_retry"]["used"])
+        self.assertEqual(entry["coverage_retry"]["covered_ms"], 3000)
+        self.assertEqual(entry["coverage_retry"]["retry_covered_ms"], 19000)
+        self.assertEqual(entry["segments"], 2)
+        self.assertNotIn("text", json.dumps(entry))
+
+    def test_chunk_log_is_json_serializable_with_numpy_values(self):
+        # O decoder real devolve tempos numpy; a decisão do retry vira numpy.bool_.
+        wav_path = write_wav(self, duration_sec=21.0)
+
+        class NumpyModel:
+            def transcribe(self, audio_input, **kwargs):
+                duration = len(audio_input) / tm.SAMPLE_RATE
+                end = np.float32(3.0) if kwargs.get("hotwords") else np.float32(19.5)
+                segments = [SimpleNamespace(start=np.float32(0.0), end=end, text=" parte ", avg_logprob=-0.2, no_speech_prob=0.1)]
+                return segments, SimpleNamespace(duration=duration, language="pt", language_probability=0.9)
+
+        chunk_log = []
+        with patch.object(tm, "detect_speech_islands", return_value=self.islands()):
+            tm.transcribe_track(
+                wav_path, "Você", NumpyModel(),
+                config=tm.TranscriptionConfig(language="pt", glossary=["X"]), chunk_log=chunk_log,
+            )
+
+        self.assertIs(chunk_log[0]["coverage_retry"]["used"], True)
+        json.dumps(chunk_log)
+
+    def test_chunk_log_marks_vocabulary_when_no_retry(self):
+        wav_path = write_wav(self, duration_sec=21.0)
+        model = self.model(short_with_vocabulary=False)
+        chunk_log = []
+
+        with patch.object(tm, "detect_speech_islands", return_value=self.islands()):
+            tm.transcribe_track(
+                wav_path, "Você", model,
+                config=tm.TranscriptionConfig(language="pt", glossary=["X"]), chunk_log=chunk_log,
+            )
+
+        self.assertTrue(chunk_log[0]["hotwords"])
+        self.assertNotIn("coverage_retry", chunk_log[0])
+
     def test_good_coverage_chunk_is_not_retried(self):
         wav_path = write_wav(self, duration_sec=21.0)
         model = self.model(short_with_vocabulary=False)

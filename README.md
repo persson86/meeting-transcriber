@@ -19,6 +19,19 @@ Speaker labels are track based: microphone audio is labeled `Você`, system audi
 is labeled `Interlocutor`. Optional local clustering can split the system track
 into heuristic `Remote_A`, `Remote_B`, etc. labels.
 
+## What's New in Pipeline 0.9.0
+
+- The app now asks the pipeline for a review companion,
+  `<stem>.analysis.jsonl`, next to the Markdown and JSONL. It carries the track
+  of each turn, the quality flags, and one `chunk` record per transcribed block
+  (whether the prompt had user terms, coverage retries and whether they were
+  adopted, segments dropped at the seam). Text is unchanged. **Send to
+  Second Brain** copies it with the other two files.
+- The transcript metadata records each track's offset on the session timeline
+  (`track_offsets_ms`).
+- `review_turns.py` lists flagged turns and plays the right track for a turn:
+  see [Reviewing a Transcript](#reviewing-a-transcript).
+
 ## What's New in 1.4.1
 
 - Recording times keep the UTC offset they were recorded with, whatever the
@@ -394,7 +407,7 @@ default; use `--no-sanitize` to inspect raw output.
 
 ## Analysis Output
 
-Use `--persona-analysis` when you want richer metadata for later analysis of
+Use `--persona-analysis` (analysis JSONL only, no Markdown) when you want richer metadata for later analysis of
 tone, role, interaction style, or meeting dynamics.
 
 ```bash
@@ -409,6 +422,30 @@ python transcribe_meeting.py \
   --participant Alex \
   --participant Jordan
 ```
+
+To keep the Markdown and JSONL and add the analysis file, use `--with-analysis`
+instead (the app does this).
+
+## Reviewing a Transcript
+
+`review_turns.py` finds a turn and plays that part of the right track. It
+takes the `.md`, `.jsonl` or `.analysis.jsonl` (it prefers the companion) and
+only needs the system `python3`.
+
+```bash
+python3 review_turns.py meeting.md                    # flagged turns
+python3 review_turns.py meeting.md --at 48:10          # play the turn shown as [48:10]
+python3 review_turns.py meeting.md --at 48:10 --track system
+python3 review_turns.py meeting.md --range 48:05-48:30 --track system
+python3 review_turns.py meeting.md --chunks --at 48:10 # how that block was transcribed
+```
+
+Audio comes from the app session (`Sessions/<session_id>/`), the archived
+folder next to the transcript, or `--audio-dir`. Clips go to
+`~/Library/Caches/MeetingTranscriber/clips/`. Without audio it exits with code
+3 and says nothing was checked against the recording. The listing leaves out
+`remote_unclustered`, which marks every remote turn when speakers are not split;
+an empty list does not mean the transcript is right.
 
 ## Project Structure
 

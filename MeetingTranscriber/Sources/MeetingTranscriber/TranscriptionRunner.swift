@@ -242,6 +242,9 @@ final class TranscriptionRunner {
         fileManager: FileManager = .default
     ) -> [String] {
         var args = [script, "--out", outputDir.path, "--title", title, "--language", language]
+        // Companion de revisão: trilha por turno, sinais de qualidade e decisão
+        // de cada bloco (vocabulário, retry). Não muda o texto nem o .md/.jsonl.
+        args.append("--with-analysis")
         if let sessionID { args += ["--session-id", sessionID.uuidString] }
         let isoFormatter = ISO8601DateFormatter()
         isoFormatter.timeZone = .current

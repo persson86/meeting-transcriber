@@ -47,7 +47,7 @@ CHUNK_OVERLAP_SEC = 3.0
 CHUNK_DEDUP_TOLERANCE_SEC = 0.5
 TEXT_DENSITY_SUSPECT_CHARS_PER_SEC = 80.0
 
-PIPELINE_VERSION = "0.8.1"
+PIPELINE_VERSION = "0.9.0"
 DEFAULT_HOTWORD_LIMIT = 60
 PROMPT_TAIL_MAX_CHARS = 240
 RUNAWAY_UNICODE_MIN_REPEATS = 8
@@ -1319,6 +1319,7 @@ def transcribe_track(
     total_sec: float = 1.0,
     language_report: dict | None = None,
     quality_report: dict | None = None,
+    chunk_log: list | None = None,
 ) -> list[Segment]:
     config = config or TranscriptionConfig()
 
@@ -1389,8 +1390,19 @@ def transcribe_track(
         slice_start = max(0, start_sample - overlap_samples) if use_overlap else start_sample
         chunk = audio[slice_start:end_sample]
         chunk_offset_sec = offset_sec + (slice_start / SAMPLE_RATE)
+        # Diagnóstico por bloco (tempo da sessão, como os turnos). Sem texto:
+        # só as decisões que explicam de onde veio cada trecho.
+        chunk_entry = {
+            "index": i,
+            "start_ms": int(round((offset_sec + start_sample / SAMPLE_RATE) * 1000)),
+            "end_ms": int(round((offset_sec + end_sample / SAMPLE_RATE) * 1000)),
+            "slice_start_ms": int(round(chunk_offset_sec * 1000)),
+        }
+        if chunk_log is not None:
+            chunk_log.append(chunk_entry)
 
         if not chunk_has_speech(chunk):
+            chunk_entry["skipped"] = "silence"
             print(
                 f"    chunk {i}/{len(chunks)}: "
                 f"{format_time(start_sample / SAMPLE_RATE)}–{format_time(end_sample / SAMPLE_RATE)} "
@@ -1412,6 +1424,8 @@ def transcribe_track(
         if config.language == "auto":
             detected_languages.append((info.language, info.language_probability))
         chunk_segments = collect_segments(raw_segments, speaker, chunk_offset_sec, config)
+        chunk_entry["hotwords"] = bool(track_hotwords)
+        chunk_entry["prompt_tail_chars"] = len(prompt_tail or "")
         if coverage_guard:
             speech_sec = speech_seconds_in_range(islands, slice_start, end_sample)
             covered_sec = covered_seconds(
@@ -1441,6 +1455,16 @@ def transcribe_track(
                 used = retry_covered > covered_sec * CHUNK_COVERAGE_RETRY_GAIN
                 if used:
                     chunk_segments = retry_segments
+                # Tipos nativos: com o modelo real estes valores chegam como numpy.
+                chunk_entry["coverage_retry"] = {
+                    "speech_ms": int(round(float(speech_sec) * 1000)),
+                    "covered_ms": int(round(float(covered_sec) * 1000)),
+                    "retry_covered_ms": int(round(float(retry_covered) * 1000)),
+                    "used": bool(used),
+                }
+                if used:
+                    # O texto adotado veio da retranscrição sem termos no prompt.
+                    chunk_entry["hotwords"] = False
                 if quality_report is not None:
                     quality_report["coverage_retries"] = quality_report.get("coverage_retries", 0) + 1
                     if used:
@@ -1458,6 +1482,9 @@ def transcribe_track(
             dropped = before - len(chunk_segments)
         else:
             dropped = 0
+        chunk_entry["segments"] = len(chunk_segments)
+        if dropped:
+            chunk_entry["seam_dropped"] = int(dropped)
         segments.extend(chunk_segments)
         covered_until_sec = end_sample / SAMPLE_RATE
         emit_progress(90 * (progress_base_sec + covered_until_sec) / total_sec)
@@ -1684,6 +1711,7 @@ def build_meeting_meta(
     language_detected: dict | None = None,
     calendar_event: dict | None = None,
     audio_duration_ms: int | None = None,
+    track_offsets_ms: dict[str, float] | None = None,
 ) -> dict:
     processed_at = datetime.now().astimezone().isoformat(timespec="seconds")
     recorded_local = local_datetime(recorded_at)
@@ -1705,6 +1733,9 @@ def build_meeting_meta(
     }
     if audio_duration_ms:
         meta["audio_duration_ms"] = audio_duration_ms
+    if track_offsets_ms:
+        # Posição de cada WAV na linha do tempo da sessão: t_wav = t_turno - offset.
+        meta["track_offsets_ms"] = track_offsets_ms
     if language_detected:
         meta["language_detected"] = language_detected
     if calendar_event:
@@ -1759,11 +1790,17 @@ def quality_flags_for_turn(turn: Turn, text: str, raw_text: str, safe_text: str)
 def build_analysis_jsonl(
     turns: list[Turn],
     meta: dict | None = None,
+    chunks: dict[str, list[dict]] | None = None,
+    purpose: str = "persona_analysis",
 ) -> str:
-    """JSONL rico para análise de persona, voz, posicionamento e contexto social."""
+    """JSONL rico para análise: trilha, bruto/exibido/seguro e sinais de qualidade.
+
+    Com ``chunks``, acrescenta um registro ``type: chunk`` por bloco transcrito,
+    com a decisão tomada (vocabulário, retry de cobertura, descartes na costura).
+    """
     lines = []
     if meta is not None:
-        analysis_meta = {"type": "meta", "purpose": "persona_analysis", **meta}
+        analysis_meta = {"type": "meta", "purpose": purpose, **meta}
         lines.append(json.dumps(analysis_meta, ensure_ascii=False, separators=(",", ":")))
 
     max_previous_end = 0
@@ -1790,6 +1827,10 @@ def build_analysis_jsonl(
             "quality_flags": quality_flags_for_turn(turn, text, raw_text, safe_text),
         }
         lines.append(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+    for track, entries in (chunks or {}).items():
+        for entry in entries:
+            record = {"type": "chunk", "track": track, **entry}
+            lines.append(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
     return "\n".join(lines) + ("\n" if lines else "")
 
 
@@ -2076,6 +2117,13 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--with-analysis", action="store_true",
+        help=(
+            "Grava também <stem>.analysis.jsonl (trilha, sinais de qualidade e "
+            "diagnóstico por bloco) ao lado do formato escolhido, para revisão"
+        ),
+    )
+    parser.add_argument(
         "--language", default="pt", choices=["pt", "en", "auto"],
         help="Idioma: pt (PT-BR, default), en (inglês), auto (detecção automática)",
     )
@@ -2301,12 +2349,14 @@ def main() -> None:
     sys_offset_sec = args.sys_offset / 1000.0
     language_reports: dict[str, dict] = {}
     quality_reports: dict[str, dict] = {}
+    chunk_logs: dict[str, list[dict]] = {}
 
     if args.mic:
         mic_offset_sec = args.mic_offset / 1000.0   # compat retroativa
         speaker = "Você" if dual_track else ""
         language_reports["mic"] = {}
         quality_reports["mic"] = {}
+        chunk_logs["mic"] = []
         segments.extend(transcribe_track(
             args.mic, speaker, model,
             config=config,
@@ -2319,6 +2369,7 @@ def main() -> None:
             total_sec=total_sec,
             language_report=language_reports["mic"],
             quality_report=quality_reports["mic"],
+            chunk_log=chunk_logs["mic"],
         ))
         _mem("mic-track-done", args.profile_memory)
 
@@ -2326,6 +2377,7 @@ def main() -> None:
         speaker = "Interlocutor" if dual_track else ""
         language_reports["system"] = {}
         quality_reports["system"] = {}
+        chunk_logs["system"] = []
         segments.extend(transcribe_track(
             args.system, speaker, model,
             config=config,
@@ -2338,6 +2390,7 @@ def main() -> None:
             total_sec=total_sec,
             language_report=language_reports["system"],
             quality_report=quality_reports["system"],
+            chunk_log=chunk_logs["system"],
         ))
         _mem("system-track-done", args.profile_memory)
 
@@ -2412,6 +2465,14 @@ def main() -> None:
         language_detected=language_detected,
         calendar_event=calendar_event,
         audio_duration_ms=audio_duration_ms,
+        track_offsets_ms={
+            track: offset
+            for track, offset, path in (
+                ("mic", args.mic_offset, args.mic),
+                ("system", args.sys_offset, args.system),
+            )
+            if path
+        },
     )
     if vocabulary_status:
         meta["vocabulary"] = vocabulary_status
@@ -2465,9 +2526,28 @@ def main() -> None:
     if args.format == "analysis":
         write_text_atomic(
             analysis_path,
-            build_analysis_jsonl(turns, meta=None if args.no_meta else meta),
+            build_analysis_jsonl(
+                turns,
+                meta=None if args.no_meta else meta,
+                chunks=chunk_logs if args.with_analysis else None,
+            ),
         )
         output_paths.append(analysis_path)
+    elif args.with_analysis:
+        # Companion de revisão: nunca derruba um job cujo .md/.jsonl já saiu.
+        try:
+            write_text_atomic(
+                analysis_path,
+                build_analysis_jsonl(
+                    turns,
+                    meta=None if args.no_meta else meta,
+                    chunks=chunk_logs,
+                    purpose="review",
+                ),
+            )
+            output_paths.append(analysis_path)
+        except Exception as exc:  # noqa: BLE001 — companion opcional
+            print(f"Aviso: {analysis_path.name} não foi gravado ({exc})", file=sys.stderr, flush=True)
 
     if args.format == "llm":
         primary_output = llm_path
