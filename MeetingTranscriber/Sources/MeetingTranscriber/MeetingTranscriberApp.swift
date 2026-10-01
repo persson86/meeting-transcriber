@@ -25,21 +25,18 @@ struct MeetingTranscriberApp: App {
                 .environmentObject(appState)
         } label: {
             // Alerta visível mesmo em call/compartilhamento de tela, quando a
-            // notificação costuma ficar suprimida.
-            Image(systemName: menuBarSymbol)
-                .symbolRenderingMode(.hierarchical)
-                .foregroundStyle(menuBarColor)
+            // notificação costuma ficar suprimida: erro = logo com selo vermelho.
+            switch appState.appIndicator {
+            case .error:
+                Image(nsImage: AppIndicatorImage.logoWithErrorBadge())
+            case .recording:
+                Image(systemName: "record.circle.fill")
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(.red)
+            case .idle:
+                Image(systemName: AppIndicatorImage.logoSymbol)
+            }
         }
         .menuBarExtraStyle(.window)
-    }
-
-    private var menuBarSymbol: String {
-        guard appState.status.isRecording else { return "mic.circle" }
-        return appState.captureAlert == nil ? "record.circle.fill" : "exclamationmark.triangle.fill"
-    }
-
-    private var menuBarColor: Color {
-        guard appState.status.isRecording else { return .primary }
-        return appState.captureAlert == nil ? .red : .orange
     }
 }

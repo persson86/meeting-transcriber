@@ -19,6 +19,44 @@ Speaker labels are track based: microphone audio is labeled `Você`, system audi
 is labeled `Interlocutor`. Optional local clustering can split the system track
 into heuristic `Remote_A`, `Remote_B`, etc. labels.
 
+## What's New in 1.6
+
+Microphone capture survives device changes, and when it does not, you see it.
+
+- **The microphone is pinned when recording starts.** By default the app records
+  from the Mac's built-in microphone and ignores later changes to the system
+  default input, so a Bluetooth headset that connects mid-meeting no longer
+  takes over (and silently stalls) the capture. Without a built-in microphone
+  it falls back to the system default, and if the built-in microphone only
+  delivers digital silence (for example, lid closed with an external display),
+  the second recovery attempt switches to the system default input.
+  To follow the system default as in 1.5:
+  `defaults write io.github.meetingtranscriber.app micInputPolicy default`
+  (`builtin` restores the new default).
+- **Recovery is checked by audio, not by "no error".** The configuration
+  observer exists before the engine starts; device-change notifications are
+  coalesced and handled on a dedicated queue; a watchdog re-arms the same
+  engine when no signal arrives for 5 s (no callbacks, or callbacks with only
+  zeros), even without a notification. A HAL listener on the pinned device
+  re-arms immediately on a sample-rate change or disconnection. Only new signal
+  after the engine was re-armed ends a recovery: watchdog attempts back off
+  (3 s, 10 s, 30 s, 60 s) and stop after 6, notification-driven re-arms are
+  limited to 8 per minute, and the alert stays until audio is back.
+- **Visible and actionable.** While the microphone is stalled, the menu bar
+  logo gets a red badge (also shown on any app error), the popover header
+  logo shows the same badge, and a **Reiniciar microfone** button re-arms the
+  capture without stopping the recording. Until the first audio arrives the
+  popover shows "Confirmando o áudio do microfone…".
+- **Diagnostics are kept.** Each session's manifest and archived
+  `metadata.json` carry a short microphone log (`captureIntegrity.diagnostics`
+  / `captureDiagnostics`): pinned device, configuration changes, each re-arm
+  and whether audio came back. Routine re-arms without audio loss stay in the
+  log and do not mark the capture as degraded.
+- **The timeline stays aligned after a long gap.** Silence that fills a stall
+  is no longer capped at 30 s (the cap is now a 6 h sanity limit) and is written
+  in 64 KB blocks, so a recovered microphone track stays in sync with the
+  system track.
+
 ## What's New in 1.5
 
 - The app now asks the pipeline for a review companion,
@@ -305,6 +343,11 @@ second-brain vault with the 🧠 button (only shown when `secondBrainPath` is se
 see [Setup](#setup)). Opening a transcript prefers Sublime Text if it's
 installed; otherwise it prompts you to pick which app to open it with.
 
+While recording, a red badge on the menu bar logo means the microphone is not
+delivering audio (or the app hit an error). Open the menu to see the state and
+use **Reiniciar microfone**; the app also retries on its own. See
+[What's New in 1.6](#whats-new-in-16).
+
 Click the output folder name in the footer to open it directly in Finder;
 click the pencil icon next to it to change the output folder.
 
@@ -463,6 +506,9 @@ meeting-transcriber/
 │       ├── AppState.swift
 │       ├── AppConfig.swift
 │       ├── MicRecorder.swift
+│       ├── MicRecovery.swift
+│       ├── MicInputDevice.swift
+│       ├── AppIndicator.swift
 │       ├── SystemAudioRecorder.swift
 │       ├── TranscriptionRunner.swift
 │       ├── AudioUtils.swift

@@ -43,6 +43,9 @@ enum CaptureIntegrityStatus: String, Codable {
 struct CaptureIntegrity: Codable, Equatable {
     var status: CaptureIntegrityStatus
     var details: [String]
+    /// Diário das transições do microfone (v1.6). Vai ao manifest e ao
+    /// metadata.json do arquivo; ausente em manifests antigos.
+    var diagnostics: [String]? = nil
 
     static let unknown = CaptureIntegrity(status: .unknown, details: [])
     static let complete = CaptureIntegrity(status: .complete, details: [])

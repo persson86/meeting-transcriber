@@ -229,10 +229,10 @@ private final class SysDelegate: NSObject, SCStreamOutput, SCStreamDelegate, @un
                 nextBufferHostTime: hostTime
             )
         }
-        if !gap.silence.isEmpty {
-            guard writer.append(gap.silence) else { return }
+        if !gap.isEmpty {
+            guard writer.appendSilence(byteCount: gap.byteCount) else { return }
             lock.withLock {
-                insertedSilenceByteCount &+= UInt32(gap.silence.count)
+                insertedSilenceByteCount &+= UInt32(gap.byteCount)
                 if gap.wasCapped {
                     cappedGapCount &+= 1
                     if processingErrorDescription == nil {

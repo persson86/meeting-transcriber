@@ -129,4 +129,11 @@ enum AppConfig {
     static var debugMemoryLogging: Bool {
         UserDefaults.standard.bool(forKey: "debugMemoryLogging")
     }
+
+    /// Microfone da gravação: "builtin" (padrão, fixa o microfone do Mac no início)
+    /// ou "default" (segue o dispositivo padrão do macOS, comportamento até a 1.5).
+    /// `defaults write io.github.meetingtranscriber.app micInputPolicy default`
+    static var micInputPolicy: MicInputPolicy {
+        UserDefaults.standard.string(forKey: "micInputPolicy").flatMap(MicInputPolicy.init(rawValue:)) ?? .builtIn
+    }
 }

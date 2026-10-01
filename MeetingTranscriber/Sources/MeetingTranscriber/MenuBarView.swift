@@ -8,7 +8,6 @@ private enum MenuLayout {
     static let sectionSpacing: CGFloat = 16
     static let controlSpacing: CGFloat = 8
     static let compactSpacing: CGFloat = 4
-    static let statusDotSize: CGFloat = 10
     static let buttonLabelMinHeight: CGFloat = 24
     static let iconButtonSize: CGFloat = 28
     static let jobIconWidth: CGFloat = 20
@@ -24,12 +23,7 @@ struct MenuBarView: View {
 
             // ── Status bar ───────────────────────────────────────────────
             HStack(spacing: MenuLayout.controlSpacing) {
-                Circle()
-                    .fill(statusColor)
-                    .frame(
-                        width: MenuLayout.statusDotSize,
-                        height: MenuLayout.statusDotSize
-                    )
+                AppLogoView(indicator: state.appIndicator, statusColor: statusColor)
                 VStack(alignment: .leading, spacing: MenuLayout.compactSpacing) {
                     Text("Meeting Transcriber")
                         .font(.headline)
@@ -166,10 +160,26 @@ struct MenuBarView: View {
                     }
 
                     if state.status.isRecording, let alert = state.captureAlert {
-                        Label(alert, systemImage: "exclamationmark.triangle.fill")
-                            .font(.callout.weight(.medium))
-                            .foregroundColor(.orange)
-                            .fixedSize(horizontal: false, vertical: true)
+                        VStack(alignment: .leading, spacing: MenuLayout.controlSpacing) {
+                            Label(alert, systemImage: "exclamationmark.triangle.fill")
+                                .font(.callout.weight(.medium))
+                                .foregroundColor(.red)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Button {
+                                state.restartMicrophone()
+                            } label: {
+                                Label("Reiniciar microfone", systemImage: "arrow.clockwise")
+                                    .frame(maxWidth: .infinity, minHeight: MenuLayout.buttonLabelMinHeight)
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.large)
+                            .tint(.red)
+                            .help("Rearma a captura do microfone sem parar a gravação; o intervalo sem áudio fica registrado")
+                        }
+                    } else if state.status.isRecording, state.micCaptureState == .waitingForAudio {
+                        Label("Confirmando o áudio do microfone…", systemImage: "waveform")
+                            .font(.callout)
+                            .foregroundColor(.secondary)
                     }
 
                     if state.status.isRecording {
@@ -538,7 +548,7 @@ struct MenuBarView: View {
         case .recording: return .red
         case .stopping:  return .orange
         case .importing: return .blue
-        case .error:     return .orange
+        case .error:     return .red
         }
     }
 

@@ -118,7 +118,16 @@ enum HardwareSelfTest {
             handle?.write(Data("\(stamp) \(line)\n".utf8))
         }
 
-        let mic = MicRecorder(stagingDirectory: directory, stagingFileName: "mic.inprogress.wav", preserveOnDeinit: true)
+        // --mic-policy builtin|default: compara a política nova com a antiga.
+        let policyArg = CommandLine.arguments.firstIndex(of: "--mic-policy").flatMap { index in
+            index + 1 < CommandLine.arguments.count ? MicInputPolicy(rawValue: CommandLine.arguments[index + 1]) : nil
+        }
+        let mic = MicRecorder(
+            stagingDirectory: directory,
+            stagingFileName: "mic.inprogress.wav",
+            preserveOnDeinit: true,
+            policy: policyArg ?? AppConfig.micInputPolicy
+        )
         let system = SystemAudioRecorder(stagingDirectory: directory, stagingFileName: "system.inprogress.wav", preserveOnDeinit: true)
         let startedAt = Date()
         do {
@@ -175,6 +184,7 @@ enum HardwareSelfTest {
         do { try mic.stop(saveTo: micURL); note("mic saved") } catch { note("MIC STOP ERROR: \(error.localizedDescription)") }
         do { try await system.stop(saveTo: systemURL); note("system saved") } catch { note("SYSTEM STOP ERROR: \(error.localizedDescription)") }
         note("final mic \(String(describing: mic.health))")
+        for event in mic.health.events { note("mic event \(event)") }
         note("final system \(String(describing: system.health))")
         // Mesma conta de AppState.computeOffsetMs, sem depender do MainActor
         // (a thread principal está bloqueada durante o autoteste).

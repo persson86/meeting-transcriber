@@ -110,20 +110,20 @@ final class AudioCaptureReliabilityTests: XCTestCase {
             nextBufferHostTime: secondTime
         )
 
-        XCTAssertFalse(gap.silence.isEmpty)
+        XCTAssertFalse(gap.isEmpty)
         XCTAssertFalse(gap.wasCapped)
         let writer = WAVWriter(stagingDirectory: directory, stagingFileName: "gap.inprogress.wav")
         XCTAssertTrue(writer.append(first))
-        XCTAssertTrue(writer.append(gap.silence))
+        XCTAssertTrue(writer.appendSilence(byteCount: gap.byteCount))
         XCTAssertTrue(writer.append(second))
         let output = directory.appendingPathComponent("gap.wav")
         try writer.save(to: output)
 
         let data = try Data(contentsOf: output)
-        XCTAssertEqual(data.count, 44 + first.count + gap.silence.count + second.count)
+        XCTAssertEqual(data.count, 44 + first.count + gap.byteCount + second.count)
         XCTAssertEqual(Double(data.count - 44) / Double(PCMGapFiller.bytesPerSecond), 10, accuracy: 0.01)
         XCTAssertEqual(data[44], 1)
-        XCTAssertEqual(data[44 + first.count + gap.silence.count], 2)
+        XCTAssertEqual(data[44 + first.count + gap.byteCount], 2)
     }
 
     func testGapFillerCapsUnboundedSilence() {
@@ -134,7 +134,7 @@ final class AudioCaptureReliabilityTests: XCTestCase {
         )
 
         XCTAssertTrue(gap.wasCapped)
-        XCTAssertEqual(gap.silence.count, Int(PCMGapFiller.maxSilenceSeconds) * PCMGapFiller.bytesPerSecond)
+        XCTAssertEqual(gap.byteCount, Int(PCMGapFiller.maxSilenceSeconds) * PCMGapFiller.bytesPerSecond)
     }
 
     func testHealthDistinguishesReceivedCallbackFromSuccessfulWrite() {

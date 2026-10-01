@@ -95,7 +95,9 @@ final class AppStateReliabilityTests: XCTestCase {
 
         let issues = AppState.healthIssues(mic: mic, system: system)
 
-        XCTAssertEqual(issues.count, 3)
+        // v1.6: rearme sem áudio de volta também entra como resumo de recuperação.
+        XCTAssertEqual(issues.count, 4)
+        XCTAssertTrue(issues.contains { $0.contains("1 tentativa(s) de recuperação") })
         XCTAssertTrue(issues.contains { $0.contains("disco cheio") })
         XCTAssertTrue(issues.contains { $0.contains("rearm falhou") })
         XCTAssertTrue(issues.contains { $0.contains("stream morreu") })

@@ -93,6 +93,9 @@ final class AppState: ObservableObject {
     /// Mensagem de alerta enquanto o microfone está sem entregar áudio durante a
     /// gravação. O ícone da barra de menu muda enquanto não for nil.
     @Published var captureAlert: String?
+    /// Estado da trilha do microfone durante a gravação (v1.6). Só vira `.ok`
+    /// quando o áudio chega de fato.
+    @Published var micCaptureState: MicCaptureState = .waitingForAudio
 
     private var mic: MicRecorder?
     private var sys: SystemAudioRecorder?
@@ -282,6 +285,7 @@ final class AppState: ObservableObject {
                 selectedCalendarTitle = nil
                 captureHealthWarnings = []
                 captureAlert = nil
+                micCaptureState = .waitingForAudio
                 status = .recording
                 startCaptureMonitor()
 
@@ -337,6 +341,7 @@ final class AppState: ObservableObject {
         let outDir = outputDirectory
         let currentLanguage = language
         captureAlert = nil
+        micCaptureState = .waitingForAudio
 
         Task {
             do {
@@ -355,8 +360,9 @@ final class AppState: ObservableObject {
                 do { try await sysCopy?.stop(saveTo: sysURL) }
                 catch { captureIssues.append("Falha ao finalizar o áudio do sistema: \(error.localizedDescription)") }
 
+                let finalMicHealth = micCopy?.health
                 captureIssues.append(contentsOf: Self.healthIssues(
-                    mic: micCopy?.health,
+                    mic: finalMicHealth,
                     system: sysCopy?.health
                 ))
                 captureIssues.append(contentsOf: captureHealthWarnings)
@@ -417,7 +423,10 @@ final class AppState: ObservableObject {
                     startedAt: nil,
                     completedAt: nil,
                     status: .queued,
-                    captureIntegrity: captureIssues.isEmpty ? .complete : .degraded(captureIssues),
+                    captureIntegrity: Self.captureIntegrity(
+                        issues: captureIssues,
+                        micEvents: finalMicHealth?.events ?? []
+                    ),
                     calendarMeeting: calendarMeeting
                 )
 
@@ -511,6 +520,18 @@ final class AppState: ObservableObject {
         calendarWarning = nil
     }
 
+    /// Botão "Reiniciar microfone": rearma o mesmo engine sem esperar o backoff.
+    func restartMicrophone() {
+        guard status.isRecording, let mic else { return }
+        mic.requestRecovery()
+        captureAlert = "Reiniciando o microfone…"
+    }
+
+    /// Indicador do ícone da barra de menu e do cabeçalho do popover.
+    var appIndicator: AppIndicator {
+        AppIndicator.make(status: status, micState: micCaptureState)
+    }
+
     func syncMeetingTitleFromCalendar() {
         guard status.canStartRecording, !isCalendarSyncing else { return }
         isCalendarSyncing = true
@@ -546,7 +567,7 @@ final class AppState: ObservableObject {
         captureMonitorTask?.cancel()
         captureMonitorTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
                 guard !Task.isCancelled, let self, case .recording = self.status else { return }
                 self.checkCaptureHealth()
             }
@@ -577,7 +598,11 @@ final class AppState: ObservableObject {
         if micStalled {
             issues.append("O microfone deixou de entregar áudio há mais de cinco segundos.")
         }
-        updateCaptureAlert(micStalled: micStalled)
+        if case .failed(let attempts) = micHealth.captureState {
+            issues.append("O microfone não voltou após \(attempts) tentativas automáticas de recuperação.")
+        }
+        micCaptureState = micHealth.captureState
+        updateCaptureAlert(state: micHealth.captureState)
         for issue in issues where captureHealthWarnings.insert(issue).inserted {
             warn("Captura parcial: \(issue) A gravação recuperável continua sendo preservada.")
         }
@@ -853,7 +878,8 @@ final class AppState: ObservableObject {
             "format": outputURL.pathExtension,
             "files": files,
             "captureIntegrity": captureIntegrity.status.rawValue,
-            "captureIssues": captureIntegrity.details
+            "captureIssues": captureIntegrity.details,
+            "captureDiagnostics": captureIntegrity.diagnostics ?? []
         ]
         let data = try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted, .sortedKeys])
         try data.write(to: archiveURL.appendingPathComponent("metadata.json"))
@@ -959,6 +985,15 @@ final class AppState: ObservableObject {
         if let error = system?.streamStopErrorDescription {
             issues.append("A captura do sistema foi interrompida: \(error)")
         }
+        // Rearme de rotina (troca de dispositivo sem perda) fica só no diário; vira
+        // problema de integridade quando houve áudio perdido ou nada voltou.
+        if let mic, mic.recoveryAttemptCount > 0,
+           mic.insertedSilenceByteCount > 32_000 || mic.recoverySuccessCount == 0 {
+            issues.append(
+                "O microfone passou por \(mic.recoveryAttemptCount) tentativa(s) de recuperação; " +
+                "\(mic.recoverySuccessCount) terminou(aram) com áudio de volta."
+            )
+        }
         if let mic, mic.insertedSilenceByteCount > 32_000 {
             issues.append("O microfone teve um intervalo de captura superior a um segundo; silêncio foi inserido para preservar a linha do tempo.")
         }
@@ -1026,15 +1061,32 @@ final class AppState: ObservableObject {
         return hostTimeAgeSeconds(lastReceived) > threshold
     }
 
-    private func updateCaptureAlert(micStalled: Bool) {
-        if micStalled {
-            if captureAlert == nil {
-                captureAlert = "Microfone sem áudio — tentando recuperar a captura."
-            }
+    private func updateCaptureAlert(state: MicCaptureState) {
+        if let message = Self.captureAlertMessage(for: state) {
+            captureAlert = message
         } else if captureAlert != nil {
             captureAlert = nil
             lastWarning = "O microfone voltou a gravar. O intervalo sem áudio fica registrado na transcrição."
         }
+    }
+
+    static func captureAlertMessage(for state: MicCaptureState) -> String? {
+        switch state {
+        case .waitingForAudio, .ok:
+            return nil
+        case .recovering(let attempts):
+            return attempts == 0
+                ? "Microfone sem áudio — tentando recuperar a captura."
+                : "Microfone sem áudio — tentativa \(attempts) de recuperação."
+        case .failed(let attempts):
+            return "Microfone sem áudio após \(attempts) tentativas automáticas. Use Reiniciar microfone ou pare e grave de novo."
+        }
+    }
+
+    static func captureIntegrity(issues: [String], micEvents: [String]) -> CaptureIntegrity {
+        var integrity: CaptureIntegrity = issues.isEmpty ? .complete : .degraded(issues)
+        integrity.diagnostics = micEvents.isEmpty ? nil : micEvents
+        return integrity
     }
 
     private static func calendarTitle(for meeting: CalendarMeeting) -> String {

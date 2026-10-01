@@ -40,6 +40,13 @@ struct AudioCaptureHealth: Equatable, Sendable {
     let streamStopErrorDescription: String?
     let insertedSilenceByteCount: UInt32
     let cappedGapCount: UInt64
+    /// Rearmes que terminaram com áudio novo chegando (v1.6).
+    let recoverySuccessCount: UInt64
+    /// Dispositivo em uso na última configuração, ex.: "MacBook Air Microphone (built-in)".
+    let currentDeviceLabel: String?
+    let captureState: MicCaptureState
+    /// Diário das transições, para o manifest.
+    let events: [String]
 
     var hasAudio: Bool { writtenByteCount > 0 }
 
@@ -56,7 +63,11 @@ struct AudioCaptureHealth: Equatable, Sendable {
         lastSuccessfulWriteHostTime: UInt64? = nil,
         processingErrorDescription: String? = nil,
         insertedSilenceByteCount: UInt32 = 0,
-        cappedGapCount: UInt64 = 0
+        cappedGapCount: UInt64 = 0,
+        recoverySuccessCount: UInt64 = 0,
+        currentDeviceLabel: String? = nil,
+        captureState: MicCaptureState = .ok,
+        events: [String] = []
     ) {
         self.receivedBufferCount = receivedBufferCount
         self.writtenByteCount = writtenByteCount
@@ -71,6 +82,10 @@ struct AudioCaptureHealth: Equatable, Sendable {
         self.streamStopErrorDescription = streamStopErrorDescription
         self.insertedSilenceByteCount = insertedSilenceByteCount
         self.cappedGapCount = cappedGapCount
+        self.recoverySuccessCount = recoverySuccessCount
+        self.currentDeviceLabel = currentDeviceLabel
+        self.captureState = captureState
+        self.events = events
     }
 }
 
@@ -95,16 +110,20 @@ enum AudioConversionError: LocalizedError {
 }
 
 struct PCMGapFill: Equatable {
-    let silence: Data
+    let byteCount: Int
     let wasCapped: Bool
+
+    var isEmpty: Bool { byteCount == 0 }
 }
 
-/// Mantém o relógio do WAV alinhado a timestamps de host. Gaps muito longos são
-/// limitados para evitar crescimento ilimitado do arquivo e ficam explícitos em
-/// `AudioCaptureHealth.cappedGapCount`.
+/// Mantém o relógio do WAV alinhado a timestamps de host. Com a recuperação do
+/// microfone (v1.6), um intervalo sem áudio pode durar minutos; o teto antigo de
+/// 30 s encurtava a trilha e desalinhava o resto da reunião em relação ao sistema.
+/// O teto agora só protege contra relógio absurdo, e o silêncio vai ao disco em
+/// blocos (`WAVWriter.appendSilence`), sem alocar o intervalo inteiro na memória.
 enum PCMGapFiller {
     static let bytesPerSecond = 32_000
-    static let maxSilenceSeconds = 30.0
+    static let maxSilenceSeconds = 6.0 * 3600
 
     static func silenceBeforeBuffer(
         lastSuccessfulWriteHostTime: UInt64?,
@@ -113,7 +132,7 @@ enum PCMGapFiller {
     ) -> PCMGapFill {
         guard let lastSuccessfulWriteHostTime, let nextBufferHostTime,
               lastSuccessfulWriteByteCount >= 0 else {
-            return PCMGapFill(silence: Data(), wasCapped: false)
+            return PCMGapFill(byteCount: 0, wasCapped: false)
         }
 
         let previousStart = CMClockMakeHostTimeFromSystemUnits(lastSuccessfulWriteHostTime)
@@ -122,13 +141,13 @@ enum PCMGapFiller {
         let nextStart = CMClockMakeHostTimeFromSystemUnits(nextBufferHostTime)
         let gapSeconds = CMTimeGetSeconds(CMTimeSubtract(nextStart, expectedNextStart))
         guard gapSeconds.isFinite, gapSeconds > 1.0 / Double(bytesPerSecond) else {
-            return PCMGapFill(silence: Data(), wasCapped: false)
+            return PCMGapFill(byteCount: 0, wasCapped: false)
         }
 
         let cappedSeconds = min(gapSeconds, maxSilenceSeconds)
         var byteCount = Int((cappedSeconds * Double(bytesPerSecond)).rounded())
         byteCount -= byteCount % 2 // PCM Int16 sempre termina em amostra completa.
-        return PCMGapFill(silence: Data(count: byteCount), wasCapped: gapSeconds > maxSilenceSeconds)
+        return PCMGapFill(byteCount: byteCount, wasCapped: gapSeconds > maxSilenceSeconds)
     }
 }
 
@@ -232,6 +251,21 @@ final class WAVWriter: @unchecked Sendable {
                 return false
             }
         }
+    }
+
+    /// Escreve silêncio em blocos de até 64 KB: um intervalo de minutos não vira
+    /// uma alocação de centenas de MB dentro do callback de áudio.
+    @discardableResult
+    func appendSilence(byteCount count: Int) -> Bool {
+        guard count > 0 else { return true }
+        let chunk = Data(count: min(count, 65_536))
+        var remaining = count
+        while remaining > 0 {
+            let size = min(remaining, chunk.count)
+            guard append(size == chunk.count ? chunk : chunk.prefix(size)) else { return false }
+            remaining -= size
+        }
+        return true
     }
 
     var isEmpty: Bool { lock.withLock { byteCount == 0 } }
@@ -348,6 +382,14 @@ func convertToInt16MonoResult(
         return .failure(.emptyOutput)
     }
     return .success(Data(bytes: ch[0], count: Int(outBuf.frameLength) * 2))
+}
+
+/// PCM Int16 com alguma amostra diferente de zero. Ruído de fundo de um
+/// microfone real nunca é zero exato; zeros contínuos indicam captura muda.
+func pcmHasSignal(_ data: Data) -> Bool {
+    data.withUnsafeBytes { raw in
+        raw.bindMemory(to: Int16.self).contains { $0 != 0 }
+    }
 }
 
 func convertToInt16Mono(_ input: AVAudioPCMBuffer, using converter: AVAudioConverter) -> Data? {
