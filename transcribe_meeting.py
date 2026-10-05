@@ -47,7 +47,7 @@ CHUNK_OVERLAP_SEC = 3.0
 CHUNK_DEDUP_TOLERANCE_SEC = 0.5
 TEXT_DENSITY_SUSPECT_CHARS_PER_SEC = 80.0
 
-PIPELINE_VERSION = "0.9.0"
+PIPELINE_VERSION = "0.9.1"
 DEFAULT_HOTWORD_LIMIT = 60
 PROMPT_TAIL_MAX_CHARS = 240
 RUNAWAY_UNICODE_MIN_REPEATS = 8
@@ -837,6 +837,7 @@ def drop_overlap_duplicates(
     segments: list[Segment],
     covered_until_sec: float,
     tolerance_sec: float = CHUNK_DEDUP_TOLERANCE_SEC,
+    covered_segments: list[Segment] | None = None,
 ) -> list[Segment]:
     """Dedup na costura: descarta segmentos TOTALMENTE dentro da janela já
     transcrita pelo chunk anterior (o overlap reapresenta esses segundos).
@@ -844,13 +845,20 @@ def drop_overlap_duplicates(
     Segmento que começa na janela coberta mas termina além dela contém conteúdo
     novo e é mantido — descartá-lo perderia fala real (um único segmento longo
     pode cobrir o chunk inteiro). O custo é uma pequena repetição de texto na
-    costura, preferível à perda de conteúdo.
+    costura, preferível à perda de conteúdo. Quando os segmentos anteriores
+    estão disponíveis, o fim do chunk não prova cobertura: só descarta trechos
+    inteiramente representados por segmentos já emitidos.
     """
     return [
         seg for seg in segments
         if not (
             seg.start < covered_until_sec
             and seg.end <= covered_until_sec + tolerance_sec
+            and (
+                covered_segments is None
+                or covered_seconds(covered_segments, seg.start, seg.end)
+                >= seg.end - seg.start - 1e-6
+            )
         )
     ]
 
@@ -1358,6 +1366,12 @@ def transcribe_track(
     _mem("load-audio-after", profile_memory)
     islands = detect_speech_islands(audio)
     _mem("detect-islands-after", profile_memory)
+    if quality_report is not None:
+        quality_report["audio_ms"] = int(round(len(audio) / SAMPLE_RATE * 1000))
+        quality_report["vad_islands"] = len(islands)
+        quality_report["vad_speech_ms"] = int(round(
+            speech_seconds_in_range(islands, 0, len(audio)) * 1000
+        ))
     if not islands:
         print(f"    0 speech islands, {round(len(audio) / SAMPLE_RATE, 1)}s audio", flush=True)
         return []
@@ -1397,16 +1411,22 @@ def transcribe_track(
             "start_ms": int(round((offset_sec + start_sample / SAMPLE_RATE) * 1000)),
             "end_ms": int(round((offset_sec + end_sample / SAMPLE_RATE) * 1000)),
             "slice_start_ms": int(round(chunk_offset_sec * 1000)),
+            "speech_ms": int(round(speech_seconds_in_range(
+                islands, slice_start, end_sample
+            ) * 1000)),
+            "rms": float(np.sqrt(np.mean(np.square(chunk, dtype=np.float64))))
+            if chunk.size else 0.0,
         }
         if chunk_log is not None:
             chunk_log.append(chunk_entry)
 
         if not chunk_has_speech(chunk):
-            chunk_entry["skipped"] = "silence"
+            # VAD já apontou fala; baixa energia não prova silêncio.
+            chunk_entry["skipped"] = "low_energy"
             print(
                 f"    chunk {i}/{len(chunks)}: "
                 f"{format_time(start_sample / SAMPLE_RATE)}–{format_time(end_sample / SAMPLE_RATE)} "
-                "(silence skipped)",
+                "(low energy skipped)",
                 flush=True,
             )
             continue
@@ -1426,13 +1446,14 @@ def transcribe_track(
         chunk_segments = collect_segments(raw_segments, speaker, chunk_offset_sec, config)
         chunk_entry["hotwords"] = bool(track_hotwords)
         chunk_entry["prompt_tail_chars"] = len(prompt_tail or "")
+        speech_sec = chunk_entry["speech_ms"] / 1000.0
+        covered_sec = covered_seconds(
+            chunk_segments,
+            chunk_offset_sec,
+            chunk_offset_sec + (end_sample - slice_start) / SAMPLE_RATE,
+        )
+        chunk_entry["initial_covered_ms"] = int(round(covered_sec * 1000))
         if coverage_guard:
-            speech_sec = speech_seconds_in_range(islands, slice_start, end_sample)
-            covered_sec = covered_seconds(
-                chunk_segments,
-                chunk_offset_sec,
-                chunk_offset_sec + (end_sample - slice_start) / SAMPLE_RATE,
-            )
             if (
                 speech_sec >= CHUNK_COVERAGE_MIN_SPEECH_SEC
                 and covered_sec < CHUNK_COVERAGE_MIN_RATIO * speech_sec
@@ -1474,10 +1495,20 @@ def transcribe_track(
                     f"sem vocabulário {retry_covered:.1f}s ({'usado' if used else 'mantido'})",
                     flush=True,
                 )
+        chunk_entry["covered_ms"] = int(round(covered_seconds(
+            chunk_segments,
+            chunk_offset_sec,
+            chunk_offset_sec + (end_sample - slice_start) / SAMPLE_RATE,
+        ) * 1000))
+        chunk_entry["low_coverage"] = bool(
+            speech_sec >= CHUNK_COVERAGE_MIN_SPEECH_SEC
+            and chunk_entry["covered_ms"] < CHUNK_COVERAGE_MIN_RATIO * speech_sec * 1000
+        )
         if use_overlap and covered_until_sec is not None:
             before = len(chunk_segments)
             chunk_segments = drop_overlap_duplicates(
-                chunk_segments, offset_sec + covered_until_sec
+                chunk_segments, offset_sec + covered_until_sec,
+                covered_segments=segments,
             )
             dropped = before - len(chunk_segments)
         else:
@@ -1803,13 +1834,13 @@ def build_analysis_jsonl(
         analysis_meta = {"type": "meta", "purpose": purpose, **meta}
         lines.append(json.dumps(analysis_meta, ensure_ascii=False, separators=(",", ":")))
 
-    max_previous_end = 0
+    max_previous_end = None
     for turn in turns:
         text = turn.text
         raw_text = turn.raw_text or turn.text
         safe_text = turn_output_text(turn, sanitize_suspect=True)
-        overlap_ms = max(0, max_previous_end - turn.start_ms)
-        max_previous_end = max(max_previous_end, turn.end_ms)
+        overlap_ms = max(0, max_previous_end - turn.start_ms) if max_previous_end is not None else 0
+        max_previous_end = max(max_previous_end, turn.end_ms) if max_previous_end is not None else turn.end_ms
 
         record = {
             "type": "turn",
@@ -2476,7 +2507,14 @@ def main() -> None:
     )
     if vocabulary_status:
         meta["vocabulary"] = vocabulary_status
-    coverage = {track: report for track, report in quality_reports.items() if report}
+    diagnostics = {track: report for track, report in quality_reports.items() if report}
+    if diagnostics:
+        meta["transcription_diagnostics"] = diagnostics
+    coverage = {
+        track: {key: value for key, value in report.items() if key.startswith("coverage_retries")}
+        for track, report in quality_reports.items()
+        if report.get("coverage_retries")
+    }
     if coverage:
         meta["coverage_retries"] = coverage
 

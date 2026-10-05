@@ -333,7 +333,10 @@ class CoverageGuardTests(unittest.TestCase):
         self.assertIn("Termos: Atlas Hub.", model.calls[0]["hotwords"])
         self.assertIsNone(model.calls[1]["hotwords"])
         self.assertEqual([seg.text for seg in segments], ["primeira parte inteira", "segunda parte inteira"])
-        self.assertEqual(report, {"coverage_retries": 1, "coverage_retries_used": 1})
+        self.assertEqual(report, {
+            "audio_ms": 21000, "vad_islands": 1, "vad_speech_ms": 20000,
+            "coverage_retries": 1, "coverage_retries_used": 1,
+        })
 
     def test_chunk_log_records_adopted_retry_without_changing_text(self):
         wav_path = write_wav(self, duration_sec=21.0)
@@ -402,7 +405,7 @@ class CoverageGuardTests(unittest.TestCase):
             tm.transcribe_track(wav_path, "Você", model, config=tm.TranscriptionConfig(language="pt", glossary=["X"]), quality_report=report)
 
         self.assertEqual(len(model.calls), 1)
-        self.assertEqual(report, {})
+        self.assertEqual(report, {"audio_ms": 21000, "vad_islands": 1, "vad_speech_ms": 20000})
 
     def test_covered_seconds_merges_overlapping_segments(self):
         segments = [

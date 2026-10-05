@@ -19,6 +19,31 @@ Speaker labels are track based: microphone audio is labeled `Você`, system audi
 is labeled `Interlocutor`. Optional local clustering can split the system track
 into heuristic `Remote_A`, `Remote_B`, etc. labels.
 
+## What's New in 1.6.1
+
+- Startup/configuration notifications no longer restart an engine that is
+  already running at the expected sample rate and channel count. The watchdog
+  waits for the input to settle before retrying; switching away from the
+  built-in microphone requires a confirmed signal stall.
+- Repeated clicks on **Reiniciar microfone** are coalesced, with a minimum
+  three-second interval to let the device settle.
+- A recovery is confirmed only after nonzero PCM is written successfully.
+  Initial signal delays and a final recovery still awaiting audio are included
+  in partial-capture warnings. Previous successful recoveries cannot hide an
+  unfinished final attempt.
+- Session recovery preserves the microphone diagnostic log and warns when a
+  previously recorded audio file is missing. Track-end comparisons account for
+  a microphone that started later than system audio.
+- Pipeline 0.9.1 only removes seam segments when earlier transcription actually
+  covers that interval. An empty/partial previous result cannot erase speech
+  recovered by the next chunk. Analysis records VAD duration, chunk energy and
+  coverage, distinguishes low energy from proven silence, and handles a first
+  turn with a negative track offset without inventing an overlap.
+
+These changes address failures observed on 5 October. Missing microphone audio
+cannot be reconstructed from a system-only recording; hardware validation is
+separate from the automated regression suite.
+
 ## What's New in 1.6
 
 Microphone capture survives device changes, and when it does not, you see it.

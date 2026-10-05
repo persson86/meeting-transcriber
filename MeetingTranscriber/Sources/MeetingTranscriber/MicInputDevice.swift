@@ -34,13 +34,15 @@ enum MicInputPolicy: String, Sendable {
     /// O microfone embutido pode continuar listado e entregar só zeros (tampa
     /// fechada com monitor externo). Da segunda tentativa de um episódio sem
     /// sinal em diante, troca para o padrão do sistema, se for outro dispositivo.
+    /// Notificações de configuração, sozinhas, não demonstram ausência de sinal.
     static func fallbackForSilentDevice(
         policy: MicInputPolicy,
         pinned: MicInputDevice?,
         systemDefault: MicInputDevice?,
-        attemptsInEpisode: Int
+        attemptsInEpisode: Int,
+        signalIsStalled: Bool
     ) -> MicInputDevice? {
-        guard policy == .builtIn, attemptsInEpisode >= 2,
+        guard policy == .builtIn, attemptsInEpisode >= 2, signalIsStalled,
               let pinned, pinned.isBuiltIn,
               let systemDefault, systemDefault.uid != pinned.uid else { return nil }
         return systemDefault

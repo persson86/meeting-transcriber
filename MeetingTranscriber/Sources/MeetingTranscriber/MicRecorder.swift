@@ -38,6 +38,10 @@ final class MicRecorder: @unchecked Sendable {
     private var pinnedDevice: MicInputDevice?
     private var configChangeToken: UInt64 = 0
     private var startedAtUptime: TimeInterval = 0
+    private var lastConfiguredAtUptime: TimeInterval = 0
+    private var configuredInputFormat: AVAudioFormat?
+    private var lastManualRecoveryAtUptime: TimeInterval?
+    static let manualRecoveryCooldown: TimeInterval = 3
     /// Rearmes por notificação na janela recente: o teto e o backoff do planner
     /// valem para o watchdog; notificações têm limite próprio, contra laço de
     /// rearme que gera nova notificação.
@@ -53,6 +57,9 @@ final class MicRecorder: @unchecked Sendable {
     /// como "áudio" para o watchdog: microfone embutido com a tampa fechada, ou
     /// engine preso em voice processing, entrega callbacks só com zeros.
     private var lastSignalUptime: TimeInterval?
+    private var firstSignalHostTime: UInt64?
+    private var lastSignalHostTime: UInt64?
+    private var initialAudioDelaySeconds: TimeInterval?
     private var lastSuccessfulWriteHostTime: UInt64?
     private var lastSuccessfulWriteByteCount: Int = 0
     private var receivedBufferCount: UInt64 = 0
@@ -67,6 +74,7 @@ final class MicRecorder: @unchecked Sendable {
     private var eventLog = MicEventLog()
     /// Marca a próxima chegada de áudio depois de uma tentativa, para registrá-la uma vez.
     private var awaitingAudioAfterAttempt = false
+    private var tapGeneration: UInt64 = 0
 
     /// Debounce das notificações de configuração: uma troca de rota Bluetooth
     /// dispara várias em menos de um segundo. Curto, porque o engine já parou
@@ -77,9 +85,9 @@ final class MicRecorder: @unchecked Sendable {
     var firstBufferTime: UInt64? { healthLock.withLock { firstBufferHostTime } }
 
     var health: AudioCaptureHealth {
-        let writerHealth = writer.health
         return healthLock.withLock {
-            AudioCaptureHealth(
+            let writerHealth = writer.health
+            return AudioCaptureHealth(
                 receivedBufferCount: receivedBufferCount,
                 writtenByteCount: writerHealth.byteCount,
                 firstBufferHostTime: firstBufferHostTime,
@@ -96,6 +104,10 @@ final class MicRecorder: @unchecked Sendable {
                 recoverySuccessCount: recoverySuccessCount,
                 currentDeviceLabel: currentDeviceLabel,
                 captureState: captureState,
+                firstSignalHostTime: firstSignalHostTime,
+                lastSignalHostTime: lastSignalHostTime,
+                recoveryPending: awaitingAudioAfterAttempt,
+                initialAudioDelaySeconds: initialAudioDelaySeconds,
                 events: eventLog.lines
             )
         }
@@ -153,14 +165,21 @@ final class MicRecorder: @unchecked Sendable {
     func requestRecovery() {
         controlQueue.async { [weak self] in
             guard let self, self.active else { return }
+            let now = Self.uptime()
+            if let last = self.lastManualRecoveryAtUptime, now - last < Self.manualRecoveryCooldown {
+                self.note("rearme manual já solicitado; aguardando a rota estabilizar")
+                return
+            }
             self.planner.resetForManualAttempt()
             self.rearm(reason: "manual")
+            self.lastManualRecoveryAtUptime = Self.uptime()
         }
     }
 
     func stop(saveTo url: URL) throws {
         controlQueue.sync {
             // Fecha a conta de um rearme cujo áudio voltou depois do último tick.
+            _ = beginTapGeneration()
             reconcileRecoveredAudio()
             active = false
             watchdog?.cancel()
@@ -213,6 +232,10 @@ final class MicRecorder: @unchecked Sendable {
             do { try self.engine.start() } catch { startError = error }
         }
         if let startError { throw startError }
+        // Mesmo acessor da comparação em `scheduleConfigurationRearm`: o formato
+        // de saída do nó pode diferir do de entrada em canais.
+        configuredInputFormat = (try? currentInputFormat(hardware: true)) ?? srcFmt
+        lastConfiguredAtUptime = Self.uptime()
         if let pinnedDevice { listen(to: pinnedDevice) }
         note("configurado: \(device?.label ?? "dispositivo padrão") \(Int(srcFmt.sampleRate)) Hz/\(srcFmt.channelCount) ch")
     }
@@ -239,17 +262,18 @@ final class MicRecorder: @unchecked Sendable {
                           userInfo: [NSLocalizedDescriptionKey: "Cannot create mic audio converter"])
         }
         let inputNode = engine.inputNode
+        let generation = beginTapGeneration()
         try MTObjCExceptionCatcher.perform {
             inputNode.removeTap(onBus: 0)
             inputNode.installTap(onBus: 0, bufferSize: 4096, format: srcFmt) { [weak self] buf, time in
                 guard let self else { return }
                 let hostTime = time.isHostTimeValid ? time.hostTime : nil
-                self.recordReceivedBuffer(hostTime: hostTime)
+                guard self.recordReceivedBuffer(hostTime: hostTime, generation: generation) else { return }
                 switch convertToInt16MonoResult(buf, using: converter) {
                 case .success(let data):
-                    self.appendConvertedPCM(data, hostTime: hostTime)
+                    self.appendConvertedPCM(data, hostTime: hostTime, generation: generation)
                 case .failure(let error):
-                    self.recordProcessingFailure(error)
+                    self.recordProcessingFailure(error, generation: generation)
                 }
             }
         }
@@ -293,6 +317,15 @@ final class MicRecorder: @unchecked Sendable {
             throw NSError(domain: "MicRecorder", code: 4,
                           userInfo: [NSLocalizedDescriptionKey: "Unidade de entrada do microfone indisponível"])
         }
+        // Um rearme do mesmo dispositivo não precisa pedir outra troca ao HAL.
+        // Depois de reset/reconexão, confira o ID efetivo em vez de confiar no UID.
+        var currentID = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        if AudioUnitGetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
+                                kAudioUnitScope_Global, 0, &currentID, &size) == noErr,
+           currentID == device.id {
+            return
+        }
         var id = device.id
         let status = AudioUnitSetProperty(
             unit,
@@ -334,6 +367,17 @@ final class MicRecorder: @unchecked Sendable {
             self.note("notificado: \(reason)")
             self.controlQueue.asyncAfter(deadline: .now() + Self.configChangeDebounce) { [weak self] in
                 guard let self, self.active, token == self.configChangeToken else { return }
+                let currentFormat = try? self.currentInputFormat(hardware: true)
+                let formatChanged = currentFormat?.sampleRate != self.configuredInputFormat?.sampleRate
+                    || currentFormat?.channelCount != self.configuredInputFormat?.channelCount
+                    || currentFormat == nil
+                guard MicRecoveryPlanner.needsConfigurationRearm(
+                    engineRunning: self.engine.isRunning,
+                    inputFormatChanged: formatChanged
+                ) else {
+                    self.note("configuração já aplicada; engine continua rodando")
+                    return
+                }
                 let now = Self.uptime()
                 self.configRearmTimes = self.configRearmTimes.filter { now - $0 < Self.configRearmWindow }
                 guard self.configRearmTimes.count < Self.maxConfigRearmsPerWindow else {
@@ -348,25 +392,26 @@ final class MicRecorder: @unchecked Sendable {
 
     private func rearm(reason: String) {
         let running = engine.isRunning
-        // Para antes de marcar a tentativa: depois do stop o tap antigo não entrega
-        // mais nada, então só um buffer do tap novo pode encerrar o episódio.
+        // Para antes da nova geração; a geração também rejeita uma conversão
+        // antiga ainda em andamento quando o stop retorna.
         try? MTObjCExceptionCatcher.perform {
             if self.engine.isRunning { self.engine.stop() }
         }
+        recordRecoveryAttempt()
         let now = Self.uptime()
         planner.noteAttempt(at: now)
-        healthLock.withLock {
-            recoveryAttemptCount &+= 1
-            awaitingAudioAfterAttempt = true
-        }
         note("rearme (\(reason)), tentativa \(planner.attemptsInEpisode); engine rodando=\(running)")
         do {
             pinnedDevice = resolveDevice(previous: pinnedDevice)
+            let lastSignal = healthLock.withLock { lastSignalUptime }
+            let signalIsStalled = MicRecoveryPlanner.isStalled(now: now, lastAudioAt: lastSignal ?? startedAtUptime)
+                && MicRecoveryPlanner.hasSettled(now: now, configuredAt: lastConfiguredAtUptime)
             if let fallback = MicInputPolicy.fallbackForSilentDevice(
                 policy: policy,
                 pinned: pinnedDevice,
                 systemDefault: MicInputDevices.systemDefault(),
-                attemptsInEpisode: planner.attemptsInEpisode
+                attemptsInEpisode: planner.attemptsInEpisode,
+                signalIsStalled: signalIsStalled
             ) {
                 note("\(pinnedDevice?.label ?? "microfone") sem sinal; usando \(fallback.label)")
                 pinnedDevice = fallback
@@ -393,7 +438,8 @@ final class MicRecorder: @unchecked Sendable {
         reconcileRecoveredAudio()
         let (lastSignal, lastCallback) = healthLock.withLock { (lastSignalUptime, lastReceivedUptime) }
         let wasExhausted = planner.exhausted
-        if planner.evaluate(now: now, lastAudioAt: lastSignal ?? startedAtUptime) == .attempt {
+        if MicRecoveryPlanner.hasSettled(now: now, configuredAt: lastConfiguredAtUptime),
+           planner.evaluate(now: now, lastAudioAt: lastSignal ?? startedAtUptime) == .attempt {
             let reason: String
             if lastCallback.map({ now - $0 <= MicRecoveryPlanner.stallThreshold }) == true {
                 reason = "callbacks só com zeros"
@@ -431,6 +477,22 @@ final class MicRecorder: @unchecked Sendable {
 
     // MARK: - Callback do tap
 
+    @discardableResult
+    func beginTapGeneration() -> UInt64 {
+        healthLock.withLock {
+            tapGeneration &+= 1
+            return tapGeneration
+        }
+    }
+
+    func recordRecoveryAttempt() {
+        healthLock.withLock {
+            tapGeneration &+= 1
+            recoveryAttemptCount &+= 1
+            awaitingAudioAfterAttempt = true
+        }
+    }
+
     func recordRearmFailure(_ error: Error) {
         healthLock.withLock {
             if recoveryErrorDescription == nil {
@@ -439,39 +501,44 @@ final class MicRecorder: @unchecked Sendable {
         }
     }
 
-    func recordReceivedBuffer(hostTime: UInt64?) {
+    @discardableResult
+    func recordReceivedBuffer(hostTime: UInt64?, generation: UInt64? = nil) -> Bool {
         let now = Self.uptime()
-        let firstAfterAttempt: Bool = healthLock.withLock {
+        let accepted: Bool = healthLock.withLock {
+            if let generation, generation != tapGeneration { return false }
             if firstBufferHostTime == nil { firstBufferHostTime = hostTime }
             if let hostTime { lastReceivedBufferHostTime = hostTime }
             lastReceivedUptime = now
             receivedBufferCount &+= 1
-            let first = awaitingAudioAfterAttempt || receivedBufferCount == 1
-            awaitingAudioAfterAttempt = false
-            return first
+            if receivedBufferCount == 1 {
+                eventLog.append(at: max(0, now - startedAtUptime), "buffers chegando")
+            }
+            return true
         }
-        if firstAfterAttempt { note("áudio chegando") }
+        return accepted
     }
 
-    func recordProcessingFailure(_ error: Error) {
+    func recordProcessingFailure(_ error: Error, generation: UInt64? = nil) {
         healthLock.withLock {
+            if let generation, generation != tapGeneration { return }
             if processingErrorDescription == nil {
                 processingErrorDescription = error.localizedDescription
             }
         }
     }
 
-    private func appendConvertedPCM(_ data: Data, hostTime: UInt64?) {
-        let gap = healthLock.withLock {
-            PCMGapFiller.silenceBeforeBuffer(
+    func appendConvertedPCM(_ data: Data, hostTime: UInt64?, generation: UInt64? = nil) {
+        // A validação da geração e o write são atômicos em relação ao rearme.
+        // Uma conversão iniciada no tap antigo não pode escrever/confirmar o novo.
+        healthLock.withLock {
+            if let generation, generation != tapGeneration { return }
+            let gap = PCMGapFiller.silenceBeforeBuffer(
                 lastSuccessfulWriteHostTime: lastSuccessfulWriteHostTime,
                 lastSuccessfulWriteByteCount: lastSuccessfulWriteByteCount,
                 nextBufferHostTime: hostTime
             )
-        }
-        if !gap.isEmpty {
-            guard writer.appendSilence(byteCount: gap.byteCount) else { return }
-            healthLock.withLock {
+            if !gap.isEmpty {
+                guard writer.appendSilence(byteCount: gap.byteCount) else { return }
                 insertedSilenceByteCount &+= UInt32(clamping: gap.byteCount)
                 if gap.wasCapped {
                     cappedGapCount &+= 1
@@ -479,16 +546,30 @@ final class MicRecorder: @unchecked Sendable {
                         processingErrorDescription = "Um intervalo sem callbacks excedeu \(Int(PCMGapFiller.maxSilenceSeconds)) segundos e foi limitado."
                     }
                 }
+                let seconds = Double(gap.byteCount) / Double(PCMGapFiller.bytesPerSecond)
+                if seconds >= 0.25 {
+                    eventLog.append(at: max(0, Self.uptime() - startedAtUptime),
+                                    String(format: "silêncio inserido: %.1f s", seconds))
+                }
             }
-            let seconds = Double(gap.byteCount) / Double(PCMGapFiller.bytesPerSecond)
-            if seconds >= 0.25 { note(String(format: "silêncio inserido: %.1f s", seconds)) }
+            guard writer.append(data) else { return }
+            if pcmHasSignal(data) {
+                let now = Self.uptime()
+                let first = awaitingAudioAfterAttempt || lastSignalUptime == nil
+                if lastSignalUptime == nil {
+                    firstSignalHostTime = hostTime
+                    initialAudioDelaySeconds = max(0, now - startedAtUptime)
+                }
+                lastSignalUptime = now
+                lastSignalHostTime = hostTime
+                awaitingAudioAfterAttempt = false
+                if first {
+                    eventLog.append(at: max(0, now - startedAtUptime), "áudio com sinal chegando")
+                }
+            }
+            lastSuccessfulWriteHostTime = hostTime
+            lastSuccessfulWriteByteCount = data.count
         }
-        if pcmHasSignal(data) {
-            let now = Self.uptime()
-            healthLock.withLock { lastSignalUptime = now }
-        }
-        guard writer.append(data) else { return }
-        recordSuccessfulWrite(hostTime: hostTime, byteCount: data.count)
     }
 
     func recordSuccessfulWrite(hostTime: UInt64?, byteCount: Int) {

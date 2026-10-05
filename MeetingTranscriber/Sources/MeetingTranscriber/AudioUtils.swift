@@ -45,6 +45,12 @@ struct AudioCaptureHealth: Equatable, Sendable {
     /// Dispositivo em uso na última configuração, ex.: "MacBook Air Microphone (built-in)".
     let currentDeviceLabel: String?
     let captureState: MicCaptureState
+    /// Sinal não nulo efetivamente escrito, distinto de callbacks contendo zeros.
+    let firstSignalHostTime: UInt64?
+    let lastSignalHostTime: UInt64?
+    /// Último rearme ainda sem sinal confirmado, mesmo após recuperações anteriores.
+    let recoveryPending: Bool
+    let initialAudioDelaySeconds: TimeInterval?
     /// Diário das transições, para o manifest.
     let events: [String]
 
@@ -67,6 +73,10 @@ struct AudioCaptureHealth: Equatable, Sendable {
         recoverySuccessCount: UInt64 = 0,
         currentDeviceLabel: String? = nil,
         captureState: MicCaptureState = .ok,
+        firstSignalHostTime: UInt64? = nil,
+        lastSignalHostTime: UInt64? = nil,
+        recoveryPending: Bool = false,
+        initialAudioDelaySeconds: TimeInterval? = nil,
         events: [String] = []
     ) {
         self.receivedBufferCount = receivedBufferCount
@@ -85,6 +95,10 @@ struct AudioCaptureHealth: Equatable, Sendable {
         self.recoverySuccessCount = recoverySuccessCount
         self.currentDeviceLabel = currentDeviceLabel
         self.captureState = captureState
+        self.firstSignalHostTime = firstSignalHostTime
+        self.lastSignalHostTime = lastSignalHostTime
+        self.recoveryPending = recoveryPending
+        self.initialAudioDelaySeconds = initialAudioDelaySeconds
         self.events = events
     }
 }

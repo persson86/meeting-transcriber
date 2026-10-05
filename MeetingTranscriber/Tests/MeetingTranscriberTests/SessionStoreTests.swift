@@ -96,6 +96,72 @@ final class SessionStoreTests: XCTestCase {
         XCTAssertEqual(loaded.captureIntegrity.status, .degraded)
     }
 
+    func testRecoveredTrackPreservesCaptureDiagnostics() throws {
+        var integrity = CaptureIntegrity.complete
+        integrity.diagnostics = ["+1.0s rearme", "+2.0s áudio chegando"]
+        let job = try makeJob(status: .queued, integrity: integrity)
+        try store.save(job)
+        do {
+            let writer = WAVWriter(
+                stagingDirectory: store.sessionDirectory(for: job.id),
+                stagingFileName: "system.inprogress.wav"
+            )
+            XCTAssertTrue(writer.append(Data([1, 0, 2, 0])))
+        }
+
+        let loaded = try XCTUnwrap(store.loadJobs().first)
+
+        XCTAssertEqual(loaded.captureIntegrity.status, .degraded)
+        XCTAssertEqual(loaded.captureIntegrity.diagnostics, integrity.diagnostics)
+        XCTAssertTrue(loaded.captureIntegrity.details.contains { $0.contains("sistema") })
+        XCTAssertEqual(try XCTUnwrap(store.loadJobs().first).captureIntegrity, loaded.captureIntegrity)
+    }
+
+    func testInterruptedRecordingPreservesCaptureDiagnostics() throws {
+        var integrity = CaptureIntegrity.complete
+        integrity.diagnostics = ["+1.0s rearme"]
+        let job = try makeJob(status: .queued, integrity: integrity)
+        try store.save(job)
+        let manifestURL = store.sessionDirectory(for: job.id).appendingPathComponent("manifest.json")
+        var manifest = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: manifestURL)) as? [String: Any]
+        )
+        manifest["state"] = "recording"
+        try JSONSerialization.data(withJSONObject: manifest).write(to: manifestURL)
+
+        let loaded = try XCTUnwrap(store.loadJobs().first)
+
+        guard case .failed = loaded.status else { return XCTFail("expected interrupted recording") }
+        XCTAssertEqual(loaded.captureIntegrity.status, .degraded)
+        XCTAssertEqual(loaded.captureIntegrity.diagnostics, integrity.diagnostics)
+    }
+
+    func testMissingRecordedTrackDegradesIntegrityWithoutDroppingDiagnostics() throws {
+        var integrity = CaptureIntegrity.complete
+        integrity.diagnostics = ["+1.0s áudio chegando"]
+        let job = try makeJob(status: .queued, integrity: integrity)
+        try store.save(job)
+        try FileManager.default.removeItem(at: XCTUnwrap(job.micURL))
+
+        let loaded = try XCTUnwrap(store.loadJobs().first)
+
+        XCTAssertNil(loaded.micURL)
+        XCTAssertEqual(loaded.captureIntegrity.status, .degraded)
+        XCTAssertEqual(loaded.captureIntegrity.diagnostics, integrity.diagnostics)
+        XCTAssertTrue(loaded.captureIntegrity.details.contains { $0.contains("microfone não foi encontrado") })
+        XCTAssertEqual(try XCTUnwrap(store.loadJobs().first).captureIntegrity, loaded.captureIntegrity)
+    }
+
+    func testOptionalUnrecordedTrackDoesNotDegradeIntegrity() throws {
+        let job = try makeJob(status: .queued)
+        try store.save(job)
+
+        let loaded = try XCTUnwrap(store.loadJobs().first)
+
+        XCTAssertNil(loaded.systemURL)
+        XCTAssertEqual(loaded.captureIntegrity, .complete)
+    }
+
     func testExclusiveLeaseRejectsSecondOwnerUntilRelease() throws {
         var first: SessionStoreLease? = try store.acquireExclusiveLease()
 

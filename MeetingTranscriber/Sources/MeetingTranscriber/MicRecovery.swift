@@ -22,7 +22,7 @@ enum MicCaptureState: Equatable, Sendable {
 /// só áudio novo encerra o episódio (sessão de 01/out/2026, em que o rearme
 /// retornou sem erro e o tap nunca mais recebeu buffers).
 struct MicRecoveryPlanner: Equatable {
-    /// Sem callback por mais que isso, a trilha é considerada parada.
+    /// Sem sinal escrito por mais que isso, a trilha é considerada parada.
     static let stallThreshold: TimeInterval = 5
     /// Espera mínima entre uma tentativa e a próxima, para o HAL assentar a rota.
     static let backoff: [TimeInterval] = [3, 10, 30, 60]
@@ -41,7 +41,18 @@ struct MicRecoveryPlanner: Equatable {
         now - lastAudioAt > stallThreshold
     }
 
-    /// `lastAudioAt`: último callback do tap; antes do primeiro, o início da captura.
+    /// Uma notificação pode estar na fila desde o próprio start/rearme. Se o
+    /// engine já roda no formato instalado, pará-lo de novo só interrompe a
+    /// estabilização da rota. Falta de áudio continua coberta pelo watchdog.
+    static func needsConfigurationRearm(engineRunning: Bool, inputFormatChanged: Bool) -> Bool {
+        !engineRunning || inputFormatChanged
+    }
+
+    static func hasSettled(now: TimeInterval, configuredAt: TimeInterval) -> Bool {
+        now - configuredAt > stallThreshold
+    }
+
+    /// `lastAudioAt`: último sinal escrito; antes do primeiro, o início da captura.
     mutating func evaluate(now: TimeInterval, lastAudioAt: TimeInterval) -> Decision {
         guard Self.isStalled(now: now, lastAudioAt: lastAudioAt), !exhausted else { return .none }
         guard attemptsInEpisode > 0, let lastAttemptAt else { return .attempt }

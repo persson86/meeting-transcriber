@@ -193,11 +193,20 @@ struct SessionStore {
             guard var manifest = try? readManifest(at: directory), !manifest.hidden else { return nil }
 
             let recovery = recoverInProgressAudio(in: directory, manifest: &manifest)
-            if !recovery.recoveredRoles.isEmpty || !recovery.issues.isEmpty {
+            var missingAudioIssues: [String] = []
+            if let path = manifest.micPath, !fileManager.fileExists(atPath: path) {
+                missingAudioIssues.append("O arquivo de áudio registrado do microfone não foi encontrado.")
+            }
+            if let path = manifest.systemPath, !fileManager.fileExists(atPath: path) {
+                missingAudioIssues.append("O arquivo de áudio registrado do sistema não foi encontrado.")
+            }
+            if !recovery.recoveredRoles.isEmpty || !recovery.issues.isEmpty || !missingAudioIssues.isEmpty {
                 let details = manifest.captureIntegrity.details
                     + recovery.recoveredRoles.map { "Áudio parcial de \($0) recuperado após interrupção." }
                     + recovery.issues
-                manifest.captureIntegrity = .degraded(Array(Set(details)).sorted())
+                    + missingAudioIssues
+                manifest.captureIntegrity.status = .degraded
+                manifest.captureIntegrity.details = Array(Set(details)).sorted()
                 try? write(manifest)
             }
 
@@ -207,9 +216,8 @@ struct SessionStore {
                 manifest.error = recovery.issues.isEmpty
                     ? "A gravação foi interrompida. O áudio recuperável foi preservado."
                     : "A gravação foi interrompida. " + recovery.issues.joined(separator: " ")
-                manifest.captureIntegrity = .degraded(
-                    Array(Set(manifest.captureIntegrity.details + [manifest.error!])).sorted()
-                )
+                manifest.captureIntegrity.status = .degraded
+                manifest.captureIntegrity.details = Array(Set(manifest.captureIntegrity.details + [manifest.error!])).sorted()
                 try? write(manifest)
             }
 

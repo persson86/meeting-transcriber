@@ -96,6 +96,8 @@ final class AppState: ObservableObject {
     /// Estado da trilha do microfone durante a gravação (v1.6). Só vira `.ok`
     /// quando o áudio chega de fato.
     @Published var micCaptureState: MicCaptureState = .waitingForAudio
+    @Published private(set) var canRestartMicrophone = true
+    private var manualMicRecoveryAt: TimeInterval?
 
     private var mic: MicRecorder?
     private var sys: SystemAudioRecorder?
@@ -286,6 +288,8 @@ final class AppState: ObservableObject {
                 captureHealthWarnings = []
                 captureAlert = nil
                 micCaptureState = .waitingForAudio
+                manualMicRecoveryAt = nil
+                canRestartMicrophone = true
                 status = .recording
                 startCaptureMonitor()
 
@@ -520,9 +524,11 @@ final class AppState: ObservableObject {
         calendarWarning = nil
     }
 
-    /// Botão "Reiniciar microfone": rearma o mesmo engine sem esperar o backoff.
+    /// O intervalo mínimo deixa o dispositivo estabilizar antes de novo pedido.
     func restartMicrophone() {
-        guard status.isRecording, let mic else { return }
+        guard status.isRecording, canRestartMicrophone, let mic else { return }
+        manualMicRecoveryAt = ProcessInfo.processInfo.systemUptime
+        canRestartMicrophone = false
         mic.requestRecovery()
         captureAlert = "Reiniciando o microfone…"
     }
@@ -576,6 +582,9 @@ final class AppState: ObservableObject {
 
     private func checkCaptureHealth() {
         guard let mic, let sys else { return }
+        if let requestedAt = manualMicRecoveryAt {
+            canRestartMicrophone = ProcessInfo.processInfo.systemUptime - requestedAt >= MicRecorder.manualRecoveryCooldown
+        }
         let micHealth = mic.health
         let systemHealth = sys.health
         var issues: [String] = []
@@ -949,8 +958,12 @@ final class AppState: ObservableObject {
     ) -> [String] {
         guard let micDuration = audioDuration(micURL),
               let systemDuration = audioDuration(systemURL) else { return [] }
-        let micEnd = micDuration
-        let systemEnd = sysOffsetMs / 1_000 + systemDuration
+        // A duração da sessão começa na captura, não no primeiro buffer do mic.
+        // Se o mic demorou a chegar, o offset do sistema é negativo: normalize
+        // ambas as trilhas antes de comparar seus finais com a sessão.
+        let offset = sysOffsetMs / 1_000
+        let micEnd = max(0, -offset) + micDuration
+        let systemEnd = max(0, offset) + systemDuration
         let reference = max(micEnd, systemEnd, sessionDuration)
         let tolerance = max(5.0, reference * 0.05)
         if sessionDuration - max(micEnd, systemEnd) > tolerance {
@@ -979,11 +992,29 @@ final class AppState: ObservableObject {
         if let error = mic?.recoveryErrorDescription {
             issues.append("Falha ao retomar o microfone: \(error)")
         }
+        if let error = mic?.processingErrorDescription {
+            issues.append("Falha ao converter o áudio do microfone: \(error)")
+        }
         if let error = system?.firstErrorDescription {
             issues.append("Falha de escrita no áudio do sistema: \(error)")
         }
         if let error = system?.streamStopErrorDescription {
             issues.append("A captura do sistema foi interrompida: \(error)")
+        }
+        if let error = system?.processingErrorDescription {
+            issues.append("Falha ao converter o áudio do sistema: \(error)")
+        }
+        if let mic, mic.recoveryPending {
+            issues.append("A gravação terminou com uma recuperação do microfone pendente, sem confirmação de áudio após a última tentativa.")
+        }
+        if let delay = mic?.initialAudioDelaySeconds, delay > MicRecoveryPlanner.stallThreshold {
+            issues.append("O microfone só entregou sinal após \(Int(delay.rounded())) segundos do início da captura.")
+        }
+        if let mic, mic.cappedGapCount > 0 {
+            issues.append("Um intervalo do microfone excedeu o limite de preenchimento; a sincronização das trilhas pode estar comprometida.")
+        }
+        if let system, system.cappedGapCount > 0 {
+            issues.append("Um intervalo do áudio do sistema excedeu o limite de preenchimento; a sincronização das trilhas pode estar comprometida.")
         }
         // Rearme de rotina (troca de dispositivo sem perda) fica só no diário; vira
         // problema de integridade quando houve áudio perdido ou nada voltou.
@@ -1048,16 +1079,17 @@ final class AppState: ObservableObject {
         return selected
     }
 
-    /// Mic sem áudio: nenhum buffer recebido após 5 s de captura, ou o último
-    /// recebido há mais de 5 s. Usa recepção (callback), não escrita em disco.
+    /// Além dos callbacks, considera o estado do watchdog de sinal: callbacks
+    /// contendo apenas zeros não comprovam que o microfone voltou a gravar.
     static func micIsStalled(
         health: AudioCaptureHealth,
         secondsSinceCaptureStart: TimeInterval,
         threshold: TimeInterval = 5
     ) -> Bool {
         guard secondsSinceCaptureStart > threshold else { return false }
+        if health.captureState.needsAttention { return true }
         if health.receivedBufferCount == 0 { return true }
-        let lastReceived = health.lastReceivedBufferHostTime ?? health.lastBufferHostTime
+        let lastReceived = health.lastSignalHostTime ?? health.lastReceivedBufferHostTime ?? health.lastBufferHostTime
         return hostTimeAgeSeconds(lastReceived) > threshold
     }
 

@@ -71,6 +71,18 @@ final class AppStateReliabilityTests: XCTestCase {
         ).isEmpty)
     }
 
+    func testLateMicrophoneStartDoesNotLookLikeBothTracksStoppedEarly() throws {
+        let mic = try writeWAV(name: "mic.wav", seconds: 30)
+        let system = try writeWAV(name: "system.wav", seconds: 60)
+
+        XCTAssertTrue(AppState.durationIntegrityIssues(
+            micURL: mic,
+            systemURL: system,
+            sessionDuration: 60,
+            sysOffsetMs: -30_000
+        ).isEmpty)
+    }
+
     func testHealthIssuesExposeWriterRearmAndStreamFailures() {
         let mic = AudioCaptureHealth(
             receivedBufferCount: 2,
@@ -119,6 +131,70 @@ final class AppStateReliabilityTests: XCTestCase {
         let issues = AppState.healthIssues(mic: mic, system: nil)
 
         XCTAssertTrue(issues.contains { $0.contains("silêncio foi inserido") })
+    }
+
+    func testEarlierRecoveryDoesNotHidePendingFinalRecovery() {
+        let mic = captureHealth(recoveryPending: true)
+        let issues = AppState.healthIssues(mic: mic, system: nil)
+
+        XCTAssertTrue(issues.contains { $0.contains("recuperação do microfone pendente") })
+        XCTAssertEqual(AppState.captureIntegrity(issues: issues, micEvents: []).status, .degraded)
+    }
+
+    func testConfirmedRoutineRecoveryKeepsCaptureComplete() {
+        let mic = captureHealth(recoveryPending: false)
+        XCTAssertTrue(AppState.healthIssues(mic: mic, system: nil).isEmpty)
+    }
+
+    func testInitialSignalDelayRemainsVisibleAfterRecovery() {
+        let mic = captureHealth(initialAudioDelaySeconds: 74.8)
+        XCTAssertTrue(AppState.healthIssues(mic: mic, system: nil).contains {
+            $0.contains("75 segundos do início")
+        })
+        XCTAssertTrue(AppState.healthIssues(
+            mic: captureHealth(initialAudioDelaySeconds: 0.5), system: nil
+        ).isEmpty)
+    }
+
+    func testProcessingFailuresAndCappedGapsDegradeCapture() {
+        let mic = captureHealth(processingErrorDescription: "formato inválido", cappedGapCount: 1)
+        let issues = AppState.healthIssues(mic: mic, system: mic)
+        XCTAssertEqual(issues.filter { $0.contains("Falha ao converter") }.count, 2)
+        XCTAssertEqual(issues.filter { $0.contains("sincronização") }.count, 2)
+    }
+
+    func testFreshSilentCallbacksCannotHideSignalWatchdogFailure() {
+        let mic = captureHealth(
+            captureState: .recovering(attempts: 1),
+            lastBufferHostTime: mach_absolute_time()
+        )
+        XCTAssertTrue(AppState.micIsStalled(health: mic, secondsSinceCaptureStart: 10))
+    }
+
+    private func captureHealth(
+        recoveryPending: Bool = false,
+        initialAudioDelaySeconds: TimeInterval? = nil,
+        processingErrorDescription: String? = nil,
+        cappedGapCount: UInt64 = 0,
+        captureState: MicCaptureState = .ok,
+        lastBufferHostTime: UInt64 = 100
+    ) -> AudioCaptureHealth {
+        AudioCaptureHealth(
+            receivedBufferCount: 100,
+            writtenByteCount: 320_000,
+            firstBufferHostTime: 1,
+            lastBufferHostTime: lastBufferHostTime,
+            firstErrorDescription: nil,
+            recoveryAttemptCount: 2,
+            recoveryErrorDescription: nil,
+            streamStopErrorDescription: nil,
+            processingErrorDescription: processingErrorDescription,
+            cappedGapCount: cappedGapCount,
+            recoverySuccessCount: 1,
+            captureState: captureState,
+            recoveryPending: recoveryPending,
+            initialAudioDelaySeconds: initialAudioDelaySeconds
+        )
     }
 
     private func writeWAV(name: String, seconds: Int) throws -> URL {

@@ -174,6 +174,7 @@ struct MenuBarView: View {
                             .buttonStyle(.bordered)
                             .controlSize(.large)
                             .tint(.red)
+                            .disabled(!state.canRestartMicrophone)
                             .help("Rearma a captura do microfone sem parar a gravação; o intervalo sem áudio fica registrado")
                         }
                     } else if state.status.isRecording, state.micCaptureState == .waitingForAudio {

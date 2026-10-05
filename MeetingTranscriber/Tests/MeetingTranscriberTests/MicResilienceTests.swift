@@ -95,6 +95,22 @@ final class MicResilienceTests: XCTestCase {
         XCTAssertEqual(planner.state(now: 6, lastAudioAt: nil, captureStartedAt: 0), .recovering(attempts: 0))
     }
 
+    func testStartupNotificationsDoNotInterruptRunningEngineWithCurrentFormat() {
+        // 05/out: notificações após o próprio start/rearme causavam novas
+        // paradas mesmo com engine rodando, antes de chegar o primeiro buffer.
+        XCTAssertFalse(MicRecoveryPlanner.needsConfigurationRearm(engineRunning: true, inputFormatChanged: false))
+        XCTAssertTrue(MicRecoveryPlanner.needsConfigurationRearm(engineRunning: false, inputFormatChanged: false))
+        XCTAssertTrue(MicRecoveryPlanner.needsConfigurationRearm(engineRunning: true, inputFormatChanged: true))
+    }
+
+    func testStartupAndSlowRearmGetTimeToSettleBeforeWatchdogRetries() {
+        // A sessão 12:06 levou 8,9 s num start. O relógio da tentativa anterior
+        // não deve provocar outro stop assim que esse start termina.
+        XCTAssertFalse(MicRecoveryPlanner.hasSettled(now: 14.2, configuredAt: 14.2))
+        XCTAssertFalse(MicRecoveryPlanner.hasSettled(now: 19.2, configuredAt: 14.2))
+        XCTAssertTrue(MicRecoveryPlanner.hasSettled(now: 19.3, configuredAt: 14.2))
+    }
+
     // MARK: Política de dispositivo
 
     private let builtIn = MicInputDevice(id: 10, uid: "BuiltInMicrophoneDevice", name: "MacBook Air Microphone", transport: "built-in")
@@ -116,12 +132,21 @@ final class MicResilienceTests: XCTestCase {
     }
 
     func testSilentBuiltInFallsBackToDefaultFromSecondAttempt() {
-        XCTAssertNil(MicInputPolicy.fallbackForSilentDevice(policy: .builtIn, pinned: builtIn, systemDefault: webcam, attemptsInEpisode: 1))
-        XCTAssertEqual(MicInputPolicy.fallbackForSilentDevice(policy: .builtIn, pinned: builtIn, systemDefault: webcam, attemptsInEpisode: 2), webcam)
+        XCTAssertNil(MicInputPolicy.fallbackForSilentDevice(policy: .builtIn, pinned: builtIn, systemDefault: webcam, attemptsInEpisode: 1, signalIsStalled: true))
+        XCTAssertEqual(MicInputPolicy.fallbackForSilentDevice(policy: .builtIn, pinned: builtIn, systemDefault: webcam, attemptsInEpisode: 2, signalIsStalled: true), webcam)
         // Padrão é o próprio embutido, ou já saiu do embutido, ou política antiga: nada a trocar.
-        XCTAssertNil(MicInputPolicy.fallbackForSilentDevice(policy: .builtIn, pinned: builtIn, systemDefault: builtIn, attemptsInEpisode: 3))
-        XCTAssertNil(MicInputPolicy.fallbackForSilentDevice(policy: .builtIn, pinned: webcam, systemDefault: headset, attemptsInEpisode: 3))
-        XCTAssertNil(MicInputPolicy.fallbackForSilentDevice(policy: .systemDefault, pinned: builtIn, systemDefault: webcam, attemptsInEpisode: 3))
+        XCTAssertNil(MicInputPolicy.fallbackForSilentDevice(policy: .builtIn, pinned: builtIn, systemDefault: builtIn, attemptsInEpisode: 3, signalIsStalled: true))
+        XCTAssertNil(MicInputPolicy.fallbackForSilentDevice(policy: .builtIn, pinned: webcam, systemDefault: headset, attemptsInEpisode: 3, signalIsStalled: true))
+        XCTAssertNil(MicInputPolicy.fallbackForSilentDevice(policy: .systemDefault, pinned: builtIn, systemDefault: webcam, attemptsInEpisode: 3, signalIsStalled: true))
+    }
+
+    func testConfigurationAttemptsBeforeRealStallDoNotAbandonBuiltInMic() {
+        // 10:54 e 12:06 trocaram para Bluetooth com 1,3 e 3,1 s de captura,
+        // apenas porque duas notificações já tinham disparado rearmes.
+        XCTAssertNil(MicInputPolicy.fallbackForSilentDevice(
+            policy: .builtIn, pinned: builtIn, systemDefault: headset,
+            attemptsInEpisode: 2, signalIsStalled: false
+        ))
     }
 
     func testDigitalSilenceIsNotSignal() {
@@ -159,7 +184,7 @@ final class MicResilienceTests: XCTestCase {
         let recorder = MicRecorder(writer: WAVWriter())
         recorder.recordReceivedBuffer(hostTime: 1)
         recorder.recordReceivedBuffer(hostTime: 2)
-        let arrivals = recorder.health.events.filter { $0.hasSuffix("áudio chegando") }
+        let arrivals = recorder.health.events.filter { $0.hasSuffix("buffers chegando") }
         XCTAssertEqual(arrivals.count, 1)
     }
 

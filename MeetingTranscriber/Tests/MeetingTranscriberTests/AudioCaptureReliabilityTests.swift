@@ -152,6 +152,77 @@ final class AudioCaptureReliabilityTests: XCTestCase {
         XCTAssertEqual(recorder.health.lastBufferHostTime, 120)
     }
 
+    func testSilentCallbacksDoNotReportSignalOrRecovery() {
+        let recorder = MicRecorder(writer: WAVWriter())
+        recorder.recordRecoveryAttempt()
+        recorder.recordReceivedBuffer(hostTime: 100)
+        recorder.appendConvertedPCM(Data(count: 2_048), hostTime: 100)
+
+        XCTAssertEqual(recorder.health.receivedBufferCount, 1)
+        XCTAssertEqual(recorder.health.writtenByteCount, 2_048)
+        XCTAssertNil(recorder.health.firstSignalHostTime)
+        XCTAssertNil(recorder.health.lastSignalHostTime)
+        XCTAssertNil(recorder.health.initialAudioDelaySeconds)
+        XCTAssertTrue(recorder.health.recoveryPending)
+        XCTAssertFalse(recorder.health.events.contains { $0.contains("áudio com sinal chegando") })
+
+        recorder.recordReceivedBuffer(hostTime: 200)
+        recorder.appendConvertedPCM(Data([1, 0]), hostTime: 200)
+        XCTAssertEqual(recorder.health.firstSignalHostTime, 200)
+        XCTAssertEqual(recorder.health.lastSignalHostTime, 200)
+        XCTAssertNotNil(recorder.health.initialAudioDelaySeconds)
+        XCTAssertFalse(recorder.health.recoveryPending)
+        XCTAssertEqual(recorder.health.events.filter { $0.contains("áudio com sinal chegando") }.count, 1)
+    }
+
+    func testFailedPCMWriteDoesNotCountAsCapturedSignal() throws {
+        let notADirectory = directory.appendingPathComponent("not-a-directory")
+        XCTAssertTrue(FileManager.default.createFile(atPath: notADirectory.path, contents: Data()))
+        let writer = WAVWriter(stagingDirectory: notADirectory, stagingFileName: "mic.inprogress.wav")
+        let recorder = MicRecorder(writer: writer)
+        recorder.recordRecoveryAttempt()
+        recorder.recordReceivedBuffer(hostTime: 100)
+        recorder.appendConvertedPCM(Data([1, 0]), hostTime: 100)
+
+        XCTAssertNil(recorder.health.firstSignalHostTime)
+        XCTAssertNil(recorder.health.lastSignalHostTime)
+        XCTAssertNil(recorder.health.lastSuccessfulWriteHostTime)
+        XCTAssertNotNil(recorder.health.firstErrorDescription)
+        XCTAssertTrue(recorder.health.recoveryPending)
+    }
+
+    func testPreviousTapCannotWriteOrConfirmNewRecovery() {
+        let recorder = MicRecorder(writer: WAVWriter())
+        let oldGeneration = recorder.beginTapGeneration()
+        XCTAssertTrue(recorder.recordReceivedBuffer(hostTime: 100, generation: oldGeneration))
+        recorder.appendConvertedPCM(Data([1, 0]), hostTime: 100, generation: oldGeneration)
+
+        recorder.recordRecoveryAttempt()
+        let newGeneration = recorder.beginTapGeneration()
+        let beforeLateCallback = recorder.health
+
+        // Simula o resultado de uma conversão antiga que terminou depois do
+        // rearme, além de outro callback já enfileirado no tap antigo.
+        recorder.appendConvertedPCM(Data([9, 0]), hostTime: hostTime(seconds: 10), generation: oldGeneration)
+        XCTAssertFalse(recorder.recordReceivedBuffer(hostTime: 300, generation: oldGeneration))
+        recorder.recordProcessingFailure(TestError.conversion, generation: oldGeneration)
+        XCTAssertEqual(recorder.health, beforeLateCallback)
+        XCTAssertTrue(recorder.health.recoveryPending)
+
+        XCTAssertTrue(recorder.recordReceivedBuffer(hostTime: 140, generation: newGeneration))
+        recorder.appendConvertedPCM(Data([0, 0]), hostTime: 140, generation: newGeneration)
+        XCTAssertTrue(recorder.health.recoveryPending)
+        XCTAssertEqual(recorder.health.lastSignalHostTime, 100)
+
+        XCTAssertTrue(recorder.recordReceivedBuffer(hostTime: 180, generation: newGeneration))
+        recorder.appendConvertedPCM(Data([2, 0]), hostTime: 180, generation: newGeneration)
+        XCTAssertFalse(recorder.health.recoveryPending)
+        XCTAssertEqual(recorder.health.firstSignalHostTime, 100)
+        XCTAssertEqual(recorder.health.lastSignalHostTime, 180)
+        XCTAssertEqual(recorder.health.writtenByteCount, 6)
+        XCTAssertEqual(recorder.health.receivedBufferCount, 3)
+    }
+
     func testSystemHealthTracksUnexpectedStopWithoutCapturePermission() {
         let recorder = SystemAudioRecorder(
             stagingDirectory: directory,
