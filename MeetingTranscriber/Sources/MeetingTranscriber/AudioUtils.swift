@@ -118,18 +118,30 @@ struct AudioCaptureHealth: Equatable, Sendable {
 /// rebaixava sessões íntegras; aqui só conta intervalo de meio segundo ou mais.
 struct AudioLossTally: Equatable, Sendable {
     static let minimumSeconds: TimeInterval = 0.5
+    static let maxIntervals = 50
 
     private(set) var totalSeconds: TimeInterval = 0
     private(set) var largestSeconds: TimeInterval = 0
     private(set) var count = 0
+    /// Posição das interrupções (v1.8), relativa ao início da sessão. Só entram
+    /// as que chegam com posição; os totais acima valem de qualquer forma.
+    private(set) var intervals: [LossInterval] = []
 
     init() {}
 
-    mutating func add(seconds: TimeInterval) {
+    mutating func add(seconds: TimeInterval, atSeconds: TimeInterval? = nil) {
         guard seconds.isFinite, seconds >= Self.minimumSeconds else { return }
         totalSeconds += seconds
         largestSeconds = max(largestSeconds, seconds)
         count += 1
+        guard let atSeconds, atSeconds.isFinite else { return }
+        intervals.append(LossInterval(kind: .gap, atS: max(0, atSeconds), durS: seconds))
+        if intervals.count > Self.maxIntervals {
+            // Mantém as maiores; a ordem cronológica é restaurada na leitura.
+            intervals.sort { $0.durS > $1.durS }
+            intervals.removeLast()
+            intervals.sort { $0.atS < $1.atS }
+        }
     }
 }
 

@@ -101,8 +101,10 @@ final class MeetingIdentityTests: XCTestCase {
         let never = health(received: 0, lastReceived: nil)
 
         XCTAssertFalse(AppState.micIsStalled(health: fresh, secondsSinceCaptureStart: 60))
-        XCTAssertTrue(AppState.micIsStalled(health: never, secondsSinceCaptureStart: 6))
-        XCTAssertFalse(AppState.micIsStalled(health: never, secondsSinceCaptureStart: 3))
+        // v1.8: abertura lenta não alarma antes da janela de 30 s.
+        XCTAssertFalse(AppState.micIsStalled(health: never, secondsSinceCaptureStart: 6))
+        XCTAssertFalse(AppState.micIsStalled(health: never, secondsSinceCaptureStart: 29))
+        XCTAssertTrue(AppState.micIsStalled(health: never, secondsSinceCaptureStart: 31))
     }
 
     // MARK: - Argumentos da CLI

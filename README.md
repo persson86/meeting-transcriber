@@ -19,6 +19,45 @@ Speaker labels are track based: microphone audio is labeled `Você`, system audi
 is labeled `Interlocutor`. Optional local clustering can split the system track
 into heuristic `Remote_A`, `Remote_B`, etc. labels.
 
+## What's New in 1.8
+
+The app and the transcript now say how much to trust them. Pipeline 0.10.0.
+
+- **Integrity rule v2.** Each track is `degraded` when its start delay, a gap,
+  or the end shortfall reaches 2 s, or total loss reaches 10 s (edges under 1 s
+  count as zero). Positions are stored as intervals in manifest schema 2
+  (`record`, `integrity`). A microphone that never had signal is reported as a
+  start loss. Expect more `degraded` than in 1.7: slow starts now count.
+- **Graded result and live proof of life.** The job list, icon and notification
+  distinguish "ok", "small loss" and "needs attention" (new amber state). While
+  recording, the menu shows per-track seconds written and device; the first 10 s
+  read "Iniciando…", then a track without audio shows as pending, and the red
+  microphone alert waits 30 s without a first signal. The system track turns
+  amber when stream callbacks stop, never red for plain silence.
+- **Safer side effects and shutdown.** Errors in side steps no longer change the
+  recording state; quitting during a recording waits (up to 20 s) for the files
+  to be saved. `install.sh` refuses to run while the app is open. A pipeline
+  older than 0.10.0 is blocked with a clear message.
+- **Session record and logs.** Each session keeps its ASR attempts, the app and
+  pipeline versions, and the full Python stderr (`Open log` in the menu).
+- **Transcript honesty (pipeline 0.10.0).** Blocks with speech but empty ASR are
+  marked `[sem texto N s]`; the prompt label no longer leaks into the text;
+  negative timestamps are gone; probable echo of the system track in `Você` is
+  marked; duplicated words at chunk seams are trimmed using word timestamps; a
+  fixed language that disagrees with the first 30 s of speech raises a warning;
+  suspect segments are marked individually, and a short confidence box sits at
+  the top of the `.md`. The app passes measured losses with `--capture-loss`.
+- **Capture, minimal changes.** With the engine stopped, a configuration change
+  re-arms immediately (up to 3 times in 10 s, then the backoff applies); the
+  first tap uses the hardware input format, avoiding the 16 kHz refusal. The
+  diary marks `f8a`, `f8b`.
+- **`report.py`** measures integrity and transcript signals per version from
+  the manifests, read-only, without printing titles or speech.
+
+Not validated before this release: the hardware battery for the capture changes
+and the A/B word-coverage evaluation for the prompt change. The first sessions
+after installing are the validation.
+
 ## What's New in 1.7
 
 Fewer warnings, and the ones left mean that audio was lost. Less load on the

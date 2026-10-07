@@ -289,6 +289,8 @@ def cmd_chunks(chunks: list[dict], at_ms: int | None, track: str | None) -> None
                 )
             if c.get("seam_dropped"):
                 parts.append(f"{c['seam_dropped']} segmento(s) descartado(s) na costura")
+            if c.get("skipped_reason") == "empty_asr":   # 0.10.0+: fala no VAD, ASR vazio
+                parts.append("fala sem texto (ASR vazio)")
         print(" · ".join(parts))
     if not rows:
         print("Nenhum bloco cobre esse ponto.")

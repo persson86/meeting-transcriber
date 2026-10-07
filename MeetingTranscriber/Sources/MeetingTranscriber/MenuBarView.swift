@@ -20,6 +20,13 @@ struct MenuBarView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            // `onAppear` do MenuBarExtra pode disparar só na 1ª abertura; a janela
+            // virar key a cada abertura é o sinal confiável de que a lista foi vista.
+            Color.clear.frame(height: 0)
+                .onAppear { state.acknowledgeJobProblems() }
+                .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
+                    state.acknowledgeJobProblems()
+                }
 
             // ── Status bar ───────────────────────────────────────────────
             HStack(spacing: MenuLayout.controlSpacing) {
@@ -159,6 +166,10 @@ struct MenuBarView: View {
                             .foregroundColor(.secondary)
                     }
 
+                    if state.status.isRecording, let proof = state.captureProof {
+                        CaptureProofView(proof: proof)
+                    }
+
                     if state.status.isRecording, let alert = state.captureAlert {
                         VStack(alignment: .leading, spacing: MenuLayout.controlSpacing) {
                             Label(alert, systemImage: "exclamationmark.triangle.fill")
@@ -265,14 +276,25 @@ struct MenuBarView: View {
                                         .font(.callout.weight(.medium))
                                         .lineLimit(1)
                                         .truncationMode(.tail)
-                                    HStack(spacing: MenuLayout.compactSpacing) {
+                                    HStack(alignment: .top, spacing: MenuLayout.compactSpacing) {
                                         Text(jobStatusLabel(job))
+                                            .fixedSize(horizontal: false, vertical: true)
+                                            .help(jobStatusLabel(job))
                                         Text("•")
                                         Text(timeLabel(job.createdAt))
                                     }
                                     .font(.caption)
                                     .foregroundColor(.secondary)
-                                    .lineLimit(1)
+                                    .lineLimit(job.status.isFinished ? 4 : 1)
+
+                                    if let sideError = job.sideError {
+                                        Text(sideError)
+                                            .font(.caption)
+                                            .foregroundColor(.red)
+                                            .lineLimit(3)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                            .help(sideError)
+                                    }
 
                                     if job.status.isRunning {
                                         HStack(spacing: MenuLayout.controlSpacing) {
@@ -314,13 +336,30 @@ struct MenuBarView: View {
                                                 .contentShape(Rectangle())
                                         }
                                         .buttonStyle(.plain)
-                                        .disabled(job.exportedToSecondBrain)
+                                        .disabled(job.exportedToSecondBrain || state.status.isCapturing)
                                         .help(
                                             job.exportedToSecondBrain
                                                 ? "Enviada ao second-brain"
-                                                : "Enviar ao second-brain"
+                                                : state.status.isCapturing
+                                                    ? "Disponível após a gravação"
+                                                    : (job.sideError ?? "Enviar ao second-brain")
                                         )
                                     }
+                                }
+
+                                if case .failed = job.status, let logURL = state.pipelineLogURL(for: job.id) {
+                                    Button {
+                                        NSWorkspace.shared.open(logURL)
+                                    } label: {
+                                        Image(systemName: "doc.plaintext")
+                                            .frame(
+                                                width: MenuLayout.iconButtonSize,
+                                                height: MenuLayout.iconButtonSize
+                                            )
+                                            .contentShape(Rectangle())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("Abrir o log do pipeline")
                                 }
 
                                 if case .failed = job.status,
@@ -525,7 +564,7 @@ struct MenuBarView: View {
         case .recording: return "Parar e adicionar à fila"
         case .stopping:  return "Salvando áudio…"
         case .importing: return "Importando áudio…"
-        case .error:     return "Tentar novamente"
+        case .error:     return state.hasActiveRecorder ? "Parar gravação" : "Iniciar nova gravação"
         }
     }
 
@@ -563,6 +602,8 @@ struct MenuBarView: View {
 
     private func handleAction() {
         switch state.status {
+        case .error where state.hasActiveRecorder:
+            state.stopRecording()
         case .idle, .error:
             state.resetError()
             state.startRecording()
@@ -585,10 +626,8 @@ struct MenuBarView: View {
             return state.transcriptionsPaused ? "Pausada durante a gravação" : "Em andamento"
         case .cancelling:
             return "Cancelando…"
-        case .succeeded:
-            return job.captureIntegrity.status == .degraded ? "Concluída com captura parcial" : "Concluída"
-        case .failed(let message):
-            return message
+        case .succeeded, .failed:
+            return JobPresentation.result(for: job).listText
         }
     }
 
@@ -597,9 +636,7 @@ struct MenuBarView: View {
         case .queued: return "clock"
         case .running: return "waveform"
         case .cancelling: return "stop.circle"
-        case .succeeded:
-            return job.captureIntegrity.status == .degraded ? "exclamationmark.triangle.fill" : "checkmark.circle.fill"
-        case .failed: return "exclamationmark.triangle.fill"
+        case .succeeded, .failed: return JobPresentation.result(for: job).symbol
         }
     }
 
@@ -608,8 +645,13 @@ struct MenuBarView: View {
         case .queued: return .blue
         case .running: return .orange
         case .cancelling: return .orange
-        case .succeeded: return job.captureIntegrity.status == .degraded ? .orange : .green
-        case .failed: return .orange
+        case .succeeded, .failed:
+            switch JobPresentation.result(for: job).level {
+            case .complete: return .green
+            case .minorLoss: return .yellow
+            case .partial: return .orange
+            case .failed: return .red
+            }
         }
     }
 
@@ -634,5 +676,56 @@ struct MenuBarView: View {
 
     private func timeLabel(_ date: Date) -> String {
         Self.timeFormatter.string(from: date)
+    }
+}
+
+
+/// F5: por trilha, tempo gravado, idade do último sinal e dispositivo efetivo.
+private struct CaptureProofView: View {
+    let proof: CaptureProof
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: MenuLayout.compactSpacing) {
+            HStack {
+                Label(proof.isOpening ? "Iniciando… · \(CaptureProof.clock(proof.elapsed))" : "Gravando · \(CaptureProof.clock(proof.elapsed))",
+                      systemImage: proof.isOpening ? "hourglass" : "record.circle.fill")
+                    .font(.callout.weight(.medium))
+                    .foregroundColor(.red)
+                    .monospacedDigit()
+                Spacer()
+            }
+            row(proof.mic)
+            row(proof.system)
+        }
+        .padding(MenuLayout.controlSpacing)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.08)))
+    }
+
+    private func row(_ track: TrackProof) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: MenuLayout.controlSpacing) {
+            Circle().fill(color(track.level)).frame(width: 8, height: 8)
+            VStack(alignment: .leading, spacing: 0) {
+                HStack {
+                    Text(track.title).font(.callout.weight(.medium))
+                    Spacer()
+                    Text(CaptureProof.clock(track.secondsWritten))
+                        .font(.callout).monospacedDigit().foregroundColor(.secondary)
+                }
+                Text("\(track.device) · \(track.detail)")
+                    .font(.caption)
+                    .foregroundColor(track.level == .green ? .secondary : color(track.level))
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    private func color(_ level: ProofLevel) -> Color {
+        switch level {
+        case .green: return .green
+        case .amber: return .orange
+        case .red: return .red
+        }
     }
 }

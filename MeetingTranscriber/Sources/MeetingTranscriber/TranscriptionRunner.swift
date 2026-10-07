@@ -71,6 +71,8 @@ final class TranscriptionRunner {
     private var proc: Process?
     private var processStarted = false
     private var cancelled = false
+    private var pausedSince: Date?
+    private var pausedAccumulated: TimeInterval = 0
     /// Pausado enquanto há gravação (v1.7): o mlx-whisper disputava CPU, GPU e
     /// memória com a reunião seguinte e deixava o Mac lento.
     private var paused = false
@@ -97,6 +99,11 @@ final class TranscriptionRunner {
         let process: Process? = lock.withLock {
             guard paused != value, !cancelled else { return nil }
             paused = value
+            if value { pausedSince = Date() }
+            else if let since = pausedSince {
+                pausedAccumulated += Date().timeIntervalSince(since)
+                pausedSince = nil
+            }
             return processStarted ? proc : nil
         }
         guard let process else { return }
@@ -104,6 +111,11 @@ final class TranscriptionRunner {
     }
 
     var isPaused: Bool { lock.withLock { paused } }
+
+    /// Tempo total suspenso (SIGSTOP), incluindo uma pausa ainda em curso.
+    var pausedSecondsTotal: TimeInterval {
+        lock.withLock { pausedAccumulated + (pausedSince.map { Date().timeIntervalSince($0) } ?? 0) }
+    }
 
     func run(
         micURL: URL?,
@@ -116,6 +128,7 @@ final class TranscriptionRunner {
         captureIntegrity: CaptureIntegrity = .unknown,
         recordedAt: Date? = nil,
         calendarMeeting: CalendarMeeting? = nil,
+        logURL: URL? = nil,
         onProgress: @escaping (Int) -> Void = { _ in }
     ) async throws -> URL {
         guard FileManager.default.isExecutableFile(atPath: python) else {
@@ -138,6 +151,7 @@ final class TranscriptionRunner {
             )
             args += ["--capture-integrity", captureIntegrity.status.rawValue]
             for issue in captureIntegrity.details { args += ["--capture-issue", issue] }
+            args += Self.captureLossArguments(captureIntegrity)
             for term in AppConfig.contextTerms {
                 args += ["--context-term", term]
             }
@@ -182,6 +196,7 @@ final class TranscriptionRunner {
                 drain.appendOut(outPipe.fileHandleForReading.readDataToEndOfFile())
                 drain.appendErr(errPipe.fileHandleForReading.readDataToEndOfFile())
                 let (stdout, stderr) = drain.strings()
+                if let logURL { Self.writeLog(stderr, to: logURL) }
                 let wasCancelled = self.lock.withLock {
                     self.proc = nil
                     self.processStarted = false
@@ -251,6 +266,29 @@ final class TranscriptionRunner {
                 continuation.resume(throwing: error)
             }
         }
+    }
+
+    /// `--capture-loss <trilha>:<tipo>:<início>:<duração>` por intervalo medido.
+    static func captureLossArguments(_ integrity: CaptureIntegrity) -> [String] {
+        guard let measured = integrity.measured else { return [] }
+        var args: [String] = []
+        for track in measured.tracks.keys.sorted() {
+            for interval in measured.tracks[track]?.intervals ?? [] {
+                args += ["--capture-loss", String(
+                    format: "%@:%@:%.1f:%.1f", track, interval.kind.rawValue, interval.atS, interval.durS
+                )]
+            }
+        }
+        return args
+    }
+
+    /// stderr completo do Python (até 1 MB, o fim é o que importa) ao lado da sessão.
+    static func writeLog(_ stderr: String, to url: URL, limit: Int = 1_048_576) {
+        guard !stderr.isEmpty else { return }
+        let data = Data(stderr.utf8)
+        let tail = data.count > limit ? data.suffix(limit) : data
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? Data(tail).write(to: url, options: .atomic)
     }
 
     /// Argumentos da CLI comuns a todo job. Datas saem com o fuso local

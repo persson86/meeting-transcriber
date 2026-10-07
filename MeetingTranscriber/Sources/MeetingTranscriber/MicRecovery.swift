@@ -33,10 +33,15 @@ struct MicRecoveryPlanner: Equatable {
     /// O último valor é o intervalo das tentativas depois do teto.
     static let backoff: [TimeInterval] = [3, 10, 30, 60]
     static let maxAttemptsPerEpisode = 6
+    /// F8a: com o engine parado, a notificação de configuração rearma sem esperar
+    /// o backoff, no máximo `immediateAttemptCap` vezes por `immediateWindow`.
+    static let immediateAttemptCap = 3
+    static let immediateWindow: TimeInterval = 10
 
     private(set) var attemptsInEpisode = 0
     private(set) var lastAttemptAt: TimeInterval?
     private(set) var exhausted = false
+    private var recentAttempts: [TimeInterval] = []
 
     enum Decision: Equatable {
         case none
@@ -70,8 +75,16 @@ struct MicRecoveryPlanner: Equatable {
     /// hora se for a primeira tentativa do episódio; as seguintes esperam o mesmo
     /// backoff do watchdog. Até a 1.6.1 as notificações tinham um teto próprio de
     /// 8 por minuto e esgotavam o episódio em segundos.
-    func allowsConfigurationAttempt(now: TimeInterval) -> Bool {
-        backoffElapsed(now: now)
+    ///
+    /// F8a: com o engine parado não há o que estabilizar, então o rearme só espera
+    /// o debounce. Passado o teto de `immediateAttemptCap` em `immediateWindow`,
+    /// volta a valer o backoff (protege contra o laço de 41 rearmes de 05/out).
+    func allowsConfigurationAttempt(now: TimeInterval, engineRunning: Bool = true) -> Bool {
+        if !engineRunning {
+            let recent = recentAttempts.filter { now - $0 < Self.immediateWindow }.count
+            if recent < Self.immediateAttemptCap { return true }
+        }
+        return backoffElapsed(now: now)
     }
 
     private func backoffElapsed(now: TimeInterval) -> Bool {
@@ -83,6 +96,7 @@ struct MicRecoveryPlanner: Equatable {
     mutating func noteAttempt(at now: TimeInterval) {
         attemptsInEpisode += 1
         lastAttemptAt = now
+        recentAttempts = recentAttempts.filter { now - $0 < Self.immediateWindow } + [now]
     }
 
     /// Retorna true quando este áudio encerra um episódio de recuperação.
@@ -90,6 +104,7 @@ struct MicRecoveryPlanner: Equatable {
         guard attemptsInEpisode > 0, let lastAttemptAt, time >= lastAttemptAt else { return false }
         attemptsInEpisode = 0
         self.lastAttemptAt = nil
+        recentAttempts = []
         exhausted = false
         return true
     }
@@ -98,6 +113,7 @@ struct MicRecoveryPlanner: Equatable {
     mutating func resetForManualAttempt() {
         attemptsInEpisode = 0
         lastAttemptAt = nil
+        recentAttempts = []
         exhausted = false
     }
 

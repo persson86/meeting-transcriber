@@ -46,6 +46,13 @@ struct CaptureIntegrity: Codable, Equatable {
     /// Diário das transições do microfone (v1.6). Vai ao manifest e ao
     /// metadata.json do arquivo; ausente em manifests antigos.
     var diagnostics: [String]? = nil
+    /// Quantidades medidas por trilha (regra v2, v1.8); ausente em sessões antigas.
+    var measured: IntegrityReport? = nil
+
+    enum CodingKeys: String, CodingKey {
+        case status, details, diagnostics
+        case measured = "integrity"
+    }
 
     static let unknown = CaptureIntegrity(status: .unknown, details: [])
     static let complete = CaptureIntegrity(status: .complete, details: [])
@@ -65,7 +72,8 @@ enum DurableSessionState: String, Codable {
 }
 
 struct DurableSessionManifest: Codable, Equatable {
-    var schemaVersion = 1
+    /// 2 desde a v1.8 (campo `record`); o leitor aceita 1 e 2.
+    var schemaVersion = 2
     let id: UUID
     var title: String
     var language: String
@@ -86,6 +94,8 @@ struct DurableSessionManifest: Codable, Equatable {
     /// Evento escolhido pelo usuário no botão do Calendar, congelado no início
     /// da gravação (v1.4). Ausente em manifests antigos.
     var calendarMeeting: CalendarMeeting? = nil
+    /// Medição por sessão (v1.8); ausente em manifests v1.
+    var record: SessionRecord? = nil
 }
 
 struct SessionStore {
@@ -106,7 +116,8 @@ struct SessionStore {
         language: String,
         outputDirectory: URL,
         createdAt: Date,
-        calendarMeeting: CalendarMeeting? = nil
+        calendarMeeting: CalendarMeeting? = nil,
+        record: SessionRecord? = nil
     ) throws -> URL {
         let directory = sessionDirectory(for: id)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -128,7 +139,8 @@ struct SessionStore {
             exportedToSecondBrain: false,
             hidden: false,
             captureIntegrity: .unknown,
-            calendarMeeting: calendarMeeting
+            calendarMeeting: calendarMeeting,
+            record: record
         )
         try write(manifest)
         return directory
@@ -170,7 +182,8 @@ struct SessionStore {
             exportedToSecondBrain: job.exportedToSecondBrain,
             hidden: hidden ?? previous?.hidden ?? false,
             captureIntegrity: job.captureIntegrity,
-            calendarMeeting: job.calendarMeeting ?? previous?.calendarMeeting
+            calendarMeeting: job.calendarMeeting ?? previous?.calendarMeeting,
+            record: job.record ?? previous?.record
         )
         try write(manifest)
     }
@@ -191,6 +204,7 @@ struct SessionStore {
 
         return entries.compactMap { directory -> TranscriptionJob? in
             guard var manifest = try? readManifest(at: directory), !manifest.hidden else { return nil }
+            let original = manifest
 
             let recovery = recoverInProgressAudio(in: directory, manifest: &manifest)
             var missingAudioIssues: [String] = []
@@ -207,7 +221,8 @@ struct SessionStore {
                     + missingAudioIssues
                 manifest.captureIntegrity.status = .degraded
                 manifest.captureIntegrity.details = Array(Set(details)).sorted()
-                try? write(manifest)
+                // Só grava se algo mudou: reabrir o app não pode mexer em manifests antigos.
+                if manifest != original { try? write(manifest) }
             }
 
             if manifest.state == .recording {
@@ -261,7 +276,8 @@ struct SessionStore {
                 progress: manifest.progress,
                 exportedToSecondBrain: manifest.exportedToSecondBrain,
                 captureIntegrity: manifest.captureIntegrity,
-                calendarMeeting: manifest.calendarMeeting
+                calendarMeeting: manifest.calendarMeeting,
+                record: manifest.record
             )
         }.sorted { $0.createdAt < $1.createdAt }
     }

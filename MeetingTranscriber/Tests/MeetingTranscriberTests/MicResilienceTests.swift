@@ -81,6 +81,30 @@ final class MicResilienceTests: XCTestCase {
         XCTAssertTrue(planner.allowsConfigurationAttempt(now: 14.1))
     }
 
+    func testStoppedEngineRearmsImmediatelyThenFallsBackToBackoff() {
+        // F8a: engine parado → 3 rearmes imediatos em 10 s; o 4º espera o backoff.
+        var planner = MicRecoveryPlanner()
+        for t in [10.0, 10.3, 10.6] {
+            XCTAssertTrue(planner.allowsConfigurationAttempt(now: t, engineRunning: false))
+            planner.noteAttempt(at: t)
+        }
+        XCTAssertFalse(planner.allowsConfigurationAttempt(now: 10.9, engineRunning: false))
+        // O backoff do 3º rearme é 30 s; ainda dentro da janela, nada de rearme.
+        XCTAssertFalse(planner.allowsConfigurationAttempt(now: 19, engineRunning: false))
+        // Com o engine rodando, o backoff nunca é contornado.
+        var running = MicRecoveryPlanner()
+        running.noteAttempt(at: 10)
+        XCTAssertFalse(running.allowsConfigurationAttempt(now: 10.3, engineRunning: true))
+        XCTAssertTrue(running.allowsConfigurationAttempt(now: 10.3, engineRunning: false))
+    }
+
+    func testImmediateWindowExpiresAndAudioResetsIt() {
+        var planner = MicRecoveryPlanner()
+        for t in [10.0, 10.3, 10.6] { planner.noteAttempt(at: t) }
+        XCTAssertTrue(planner.noteAudio(at: 11))
+        XCTAssertTrue(planner.allowsConfigurationAttempt(now: 11.1, engineRunning: false))
+    }
+
     func testManualRestartOpensNewSeriesAfterExhaustion() {
         var planner = MicRecoveryPlanner()
         for t in stride(from: 10.0, to: 1_000, by: 1) where planner.evaluate(now: t, lastAudioAt: 0) == .attempt {

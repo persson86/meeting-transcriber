@@ -8,16 +8,26 @@ import SwiftUI
 enum AppIndicator: Equatable {
     case idle
     case recording
+    /// Sistema parado, ou job com captura parcial/falho ainda não visto: selo âmbar.
+    case attention
     case error
 
-    static func make(status: RecordingStatus, micState: MicCaptureState) -> AppIndicator {
+    static func make(
+        status: RecordingStatus,
+        micState: MicCaptureState,
+        systemNeedsAttention: Bool = false,
+        unseenJobProblem: Bool = false
+    ) -> AppIndicator {
         switch status {
         case .error:
             return .error
         case .recording:
-            return micState.needsAttention ? .error : .recording
+            if micState.needsAttention { return .error }
+            return systemNeedsAttention ? .attention : .recording
         case .idle, .starting, .stopping, .importing:
-            return .idle
+            // Job falho ou com captura parcial: selo até abrir a lista, para o
+            // aviso não depender de notificação (suprimida em tela compartilhada).
+            return unseenJobProblem ? .attention : .idle
         }
     }
 }
@@ -29,7 +39,7 @@ enum AppIndicatorImage {
     /// Logo do app com selo vermelho no canto superior direito. Não é template: o
     /// vermelho precisa sobreviver na barra de menu. O glifo usa `labelColor`,
     /// resolvido na hora do desenho, então acompanha o tema claro/escuro.
-    static func logoWithErrorBadge(size: CGFloat = 18) -> NSImage {
+    static func logoWithErrorBadge(size: CGFloat = 18, color: NSColor = .systemRed) -> NSImage {
         let image = NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
             let logoConfig = NSImage.SymbolConfiguration(pointSize: size * 0.78, weight: .regular)
                 .applying(NSImage.SymbolConfiguration(paletteColors: [.labelColor]))
@@ -46,7 +56,7 @@ enum AppIndicatorImage {
             let badgeSide = size * 0.56
             let badgeRect = NSRect(x: rect.maxX - badgeSide, y: rect.maxY - badgeSide, width: badgeSide, height: badgeSide)
             let badgeConfig = NSImage.SymbolConfiguration(pointSize: badgeSide, weight: .bold)
-                .applying(NSImage.SymbolConfiguration(paletteColors: [.white, .systemRed]))
+                .applying(NSImage.SymbolConfiguration(paletteColors: [.white, color]))
             NSImage(systemSymbolName: errorBadgeSymbol, accessibilityDescription: nil)?
                 .withSymbolConfiguration(badgeConfig)?
                 .draw(in: badgeRect)
@@ -71,10 +81,10 @@ struct AppLogoView: View {
                 .foregroundColor(.primary)
                 .padding(.top, 4)
                 .padding(.trailing, 4)
-            if indicator == .error {
+            if indicator == .error || indicator == .attention {
                 Image(systemName: AppIndicatorImage.errorBadgeSymbol)
                     .symbolRenderingMode(.palette)
-                    .foregroundStyle(.white, .red)
+                    .foregroundStyle(.white, indicator == .error ? Color.red : Color.orange)
                     .font(.system(size: 14, weight: .bold))
                     .accessibilityLabel("Erro")
             } else {

@@ -223,7 +223,10 @@ final class MicRecorder: @unchecked Sendable {
 
         let srcFmt: AVAudioFormat
         do {
-            srcFmt = try installTap(format: currentInputFormat(hardware: false))
+            // F8b: o 1º tap já usa o formato do hardware; o do nó pode guardar uma taxa
+            // anterior (16 kHz) e o tap era recusado de forma determinística.
+            srcFmt = try installTap(format: currentInputFormat(hardware: true))
+            note("f8b: tap com formato de hardware")
         } catch {
             // Com o dispositivo fixado, o nó pode guardar o formato anterior a uma
             // troca de taxa ("Failed to create tap due to format mismatch"). Reset
@@ -388,18 +391,21 @@ final class MicRecorder: @unchecked Sendable {
                     self.note("configuração já aplicada; engine continua rodando")
                     return
                 }
-                // Mesmo controle do watchdog: a primeira tentativa do episódio é
-                // imediata; as seguintes esperam o backoff, para a rota assentar.
-                guard self.planner.allowsConfigurationAttempt(now: Self.uptime()) else {
+                // Mesmo controle do watchdog: com o engine rodando, as tentativas
+                // seguintes esperam o backoff, para a rota assentar. Com o engine
+                // parado (F8a) o rearme é imediato, até 3 vezes em 10 s.
+                guard self.planner.allowsConfigurationAttempt(now: Self.uptime(), engineRunning: self.engine.isRunning) else {
                     self.note("rearme recente; o watchdog decide a próxima tentativa")
                     return
                 }
+                if !self.engine.isRunning { self.note("f8a: rearme imediato") }
                 self.rearm(reason: reason)
             }
         }
     }
 
     private func rearm(reason: String) {
+        AppLog.recovery.info("rearm reason=\(reason, privacy: .public)")
         let running = engine.isRunning
         // Para antes da nova geração; a geração também rejeita uma conversão
         // antiga ainda em andamento quando o stop retorna.
@@ -562,8 +568,13 @@ final class MicRecorder: @unchecked Sendable {
                 // Interrupção = buraco entre dois buffers com sinal: cobre tanto
                 // callbacks que pararam quanto callbacks só com zeros.
                 if let previous = lastSignalHostTime, let hostTime {
-                    dropouts.add(seconds: Self.seconds(from: previous, to: hostTime)
-                        - Double(lastSignalByteCount) / Double(PCMGapFiller.bytesPerSecond))
+                    let lastSignalDuration = Double(lastSignalByteCount) / Double(PCMGapFiller.bytesPerSecond)
+                    // O buraco começa quando termina o último buffer com sinal.
+                    let gapStart = (lastSignalUptime ?? now) - startedAtUptime + lastSignalDuration
+                    dropouts.add(
+                        seconds: Self.seconds(from: previous, to: hostTime) - lastSignalDuration,
+                        atSeconds: gapStart
+                    )
                 }
                 lastSignalByteCount = data.count
                 let first = awaitingAudioAfterAttempt || lastSignalUptime == nil

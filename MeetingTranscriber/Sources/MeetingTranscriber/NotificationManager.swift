@@ -1,9 +1,11 @@
+import AppKit
 import UserNotifications
 import Foundation
 import OSLog
 
-final class NotificationManager {
+final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
     static let shared = NotificationManager()
+    private override init() { super.init() }
     private static let logger = Logger(
         subsystem: Bundle.main.bundleIdentifier ?? "io.github.meetingtranscriber.app",
         category: "notifications"
@@ -11,6 +13,7 @@ final class NotificationManager {
 
     func requestAuthorization() {
         let center = UNUserNotificationCenter.current()
+        center.delegate = self
         center.requestAuthorization(options: [.alert, .sound]) { granted, error in
             if let error {
                 Self.logger.error("Notification authorization failed: \(error.localizedDescription, privacy: .public)")
@@ -24,14 +27,48 @@ final class NotificationManager {
         }
     }
 
-    func notifyDone(fileURL: URL) {
+    func notifyDone(fileURL: URL, title: String = "Transcrição concluída", caveat: String? = nil) {
         let content = UNMutableNotificationContent()
-        content.title = "Transcrição concluída"
-        content.body = fileURL.lastPathComponent
+        content.title = title
+        content.body = caveat.map { "\($0)\n\(fileURL.lastPathComponent)" } ?? fileURL.lastPathComponent
         content.sound = .default
         content.userInfo = ["filePath": fileURL.path]
 
         deliver(content, kind: "transcription-complete")
+    }
+
+    func notifyFailure(title: String, message: String) {
+        let content = UNMutableNotificationContent()
+        content.title = "Transcrição falhou"
+        content.subtitle = title
+        content.body = message
+        content.sound = .default
+
+        deliver(content, kind: "transcription-failed")
+    }
+
+    // MARK: - UNUserNotificationCenterDelegate
+
+    /// Com o app em primeiro plano o sistema não apresenta a notificação por conta
+    /// própria; sem isto o aviso de job falho sumia quando o popover estava aberto.
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .list, .sound])
+    }
+
+    /// Clique abre o `.md` do job concluído.
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        if let path = response.notification.request.content.userInfo["filePath"] as? String {
+            NSWorkspace.shared.open(URL(fileURLWithPath: path))
+        }
+        completionHandler()
     }
 
     func notifyWarning(_ message: String) {

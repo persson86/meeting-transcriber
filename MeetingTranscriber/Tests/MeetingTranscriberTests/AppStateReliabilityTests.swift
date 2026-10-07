@@ -127,20 +127,24 @@ final class AppStateReliabilityTests: XCTestCase {
         ).isEmpty)
 
         let longGap = AppState.healthIssues(mic: captureHealth(dropouts: [0.6, 3.2]), system: nil)
-        XCTAssertEqual(longGap, ["O microfone ficou sem áudio por 4 s no total (2 interrupção(ões): 4 s, maior 3 s)."])
+        XCTAssertEqual(longGap, ["Microfone sem áudio por 4 s no total: 2 interrupção(ões) no meio, maior 3 s."])
 
         // Muitas falhas curtas somadas também contam.
         let many = AppState.healthIssues(mic: captureHealth(dropouts: Array(repeating: 1.5, count: 7)), system: nil)
         XCTAssertEqual(many.count, 1)
         XCTAssertTrue(many[0].contains("11 s no total"))
+        XCTAssertTrue(many[0].contains("7 interrupção(ões) no meio"))
     }
 
     func testMicLossIncludesStartAndEnd() {
         let issues = AppState.healthIssues(
             mic: captureHealth(initialAudioDelaySeconds: 74.8, trailingSilenceSeconds: 12),
-            system: nil
+            system: nil,
+            sessionDuration: 120
         )
-        XCTAssertEqual(issues, ["O microfone ficou sem áudio por 1 min 27 s no total (início: 1 min 15 s; fim: 12 s)."])
+        XCTAssertEqual(issues, [
+            "Microfone sem áudio por 1 min 27 s no total: 1 min 15 s no início (00:00–01:15); 12 s no fim (01:48–02:00)."
+        ])
         // Abertura normal do engine e o stop não contam.
         XCTAssertTrue(AppState.healthIssues(
             mic: captureHealth(initialAudioDelaySeconds: 0.5, trailingSilenceSeconds: 0.8), system: nil
@@ -165,8 +169,118 @@ final class AppStateReliabilityTests: XCTestCase {
     func testSystemDropoutsAreMeasuredFromInsertedGaps() {
         XCTAssertTrue(AppState.healthIssues(mic: nil, system: captureHealth(dropouts: [1.0])).isEmpty)
         XCTAssertEqual(AppState.healthIssues(mic: nil, system: captureHealth(dropouts: [125])), [
-            "O áudio do sistema ficou sem captura por 2 min 05 s no total (maior intervalo: 2 min 05 s).",
+            "Áudio do sistema sem captura por 2 min 05 s no total: 1 interrupção(ões) no meio, maior 2 min 05 s.",
         ])
+    }
+
+
+    // MARK: - Integridade v2 (F1)
+
+    func testStartDelayBelowTwoSecondsKeepsSessionComplete() throws {
+        let mic = captureHealth(initialAudioDelaySeconds: 1.5)
+        XCTAssertTrue(AppState.healthIssues(mic: mic, system: nil, sessionDuration: 575).isEmpty)
+        let report = try XCTUnwrap(AppState.integrityReport(mic: mic, system: nil, sessionDuration: 575))
+        let track = try XCTUnwrap(report.tracks["mic"])
+        XCTAssertEqual(track.startDelayS, 1.5, accuracy: 0.001)
+        XCTAssertEqual(track.lossS, 1.5, accuracy: 0.001)
+        XCTAssertEqual(report.ruleVersion, 2)
+    }
+
+    func testMicStartOfTwoSecondsDegradesWithPosition() throws {
+        let mic = captureHealth(initialAudioDelaySeconds: 2.0)
+        let issues = AppState.healthIssues(mic: mic, system: nil, sessionDuration: 575)
+        XCTAssertEqual(issues, ["Microfone sem áudio por 2 s no total: 2 s no início (00:00–00:02)."])
+        let track = try XCTUnwrap(AppState.integrityReport(mic: mic, system: nil, sessionDuration: 575)?.tracks["mic"])
+        XCTAssertEqual(track.intervals, [LossInterval(kind: .start, atS: 0, durS: 2.0)])
+    }
+
+    func testSeveralSubThresholdLossesBelowTenSecondsStayComplete() {
+        let mic = captureHealth(
+            initialAudioDelaySeconds: 1.9,
+            trailingSilenceSeconds: 1.9,
+            positionedGaps: [(at: 100, seconds: 1.9)]
+        )
+        XCTAssertTrue(AppState.healthIssues(mic: mic, system: nil, sessionDuration: 600).isEmpty)
+    }
+
+    func testSystemStartDelayDegradesLikeTheMicrophone() throws {
+        let system = captureHealth(initialAudioDelaySeconds: 6.2)
+        let issues = AppState.healthIssues(mic: nil, system: system, sessionDuration: 600)
+        XCTAssertEqual(issues.count, 1)
+        XCTAssertTrue(issues[0].hasPrefix("Áudio do sistema"))
+        XCTAssertTrue(issues[0].contains("no início (00:00–00:06)"))
+        let track = try XCTUnwrap(AppState.integrityReport(mic: nil, system: system, sessionDuration: 600)?.tracks["system"])
+        XCTAssertEqual(track.intervals.first?.kind, .start)
+    }
+
+    func testSystemGapInTheMiddleIsReportedWithItsPosition() throws {
+        let system = captureHealth(positionedGaps: [(at: 750, seconds: 3)])
+        let issues = AppState.healthIssues(mic: nil, system: system, sessionDuration: 1800)
+        XCTAssertEqual(issues, ["Áudio do sistema sem captura por 3 s no total: 3 s no meio (12:30–12:33)."])
+        let track = try XCTUnwrap(AppState.integrityReport(mic: nil, system: system, sessionDuration: 1800)?.tracks["system"])
+        XCTAssertEqual(track.intervals.map(\.kind), [.gap])
+    }
+
+    func testSystemTrailingSilenceIsMeasured() {
+        let system = captureHealth(trailingSilenceSeconds: 4)
+        let issues = AppState.healthIssues(mic: nil, system: system, sessionDuration: 600)
+        XCTAssertEqual(issues, ["Áudio do sistema sem captura por 4 s no total: 4 s no fim (09:56–10:00)."])
+    }
+
+    func testIntervalsKeepOnlyTheFiftyLargest() {
+        var tally = AudioLossTally()
+        for index in 0..<60 {
+            tally.add(seconds: 0.5 + Double(index) * 0.01, atSeconds: Double(index) * 10)
+        }
+        XCTAssertEqual(tally.intervals.count, 50)
+        XCTAssertEqual(tally.count, 60)
+        XCTAssertEqual(tally.intervals.map(\.atS), tally.intervals.map(\.atS).sorted())
+        XCTAssertFalse(tally.intervals.contains { $0.atS == 0 })
+    }
+
+    func testProportionalDurationToleranceIsGone() throws {
+        // 15 s de diferença em 400 s passava com a tolerância de 5%.
+        let mic = try writeWAV(name: "mic.wav", seconds: 400)
+        let system = try writeWAV(name: "system.wav", seconds: 385)
+        XCTAssertEqual(AppState.durationIntegrityIssues(
+            micURL: mic, systemURL: system, sessionDuration: 400
+        ).count, 1)
+        let close = try writeWAV(name: "system2.wav", seconds: 399)
+        XCTAssertTrue(AppState.durationIntegrityIssues(
+            micURL: mic, systemURL: close, sessionDuration: 400
+        ).isEmpty)
+    }
+
+    func testLateMicrophoneIsStillFlaggedByTheMeasuredStart() {
+        // A comparação de durações aceita o mic atrasado (offset normaliza); a
+        // perda aparece pela medição do início.
+        let mic = captureHealth(initialAudioDelaySeconds: 30)
+        XCTAssertFalse(AppState.healthIssues(mic: mic, system: nil, sessionDuration: 60).isEmpty)
+    }
+
+    func testIntegrityReportRoundTripsAndOldManifestHasNone() throws {
+        let health = captureHealth(initialAudioDelaySeconds: 6.7)
+        let report = AppState.integrityReport(mic: health, system: nil, sessionDuration: 575.2)
+        let integrity = AppState.captureIntegrity(issues: ["x"], micEvents: [], measured: report)
+        let encoded = try JSONEncoder().encode(integrity)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        XCTAssertNotNil(object["integrity"])
+        XCTAssertEqual(try JSONDecoder().decode(CaptureIntegrity.self, from: encoded), integrity)
+
+        let old = #"{"status":"complete","details":[]}"#.data(using: .utf8)!
+        XCTAssertNil(try JSONDecoder().decode(CaptureIntegrity.self, from: old).measured)
+    }
+
+    func testMicThatNeverHadSignalIsReportedAsStartLossNotEnd() throws {
+        let mic = captureHealth(trailingSilenceSeconds: 600, firstSignalHostTime: nil)
+        let track = try XCTUnwrap(AppState.integrityReport(mic: mic, system: nil, sessionDuration: 600)?.tracks["mic"])
+        XCTAssertEqual(track.intervals, [LossInterval(kind: .start, atS: 0, durS: 600)])
+    }
+
+    func testDurationMismatchMessagesCountAsMeasuredLoss() {
+        XCTAssertTrue(IntegrityRule.isLossMessage("A trilha do sistema terminou antes da outra (1s de microfone, 1s de sistema)."))
+        XCTAssertTrue(IntegrityRule.isLossMessage("As duas trilhas terminaram antes do fim da sessão (1s)."))
+        XCTAssertFalse(IntegrityRule.isLossMessage("Falha de escrita no microfone: disco cheio"))
     }
 
     func testSecondsFormatterRoundsAcrossMinuteBoundary() {
@@ -256,10 +370,12 @@ final class AppStateReliabilityTests: XCTestCase {
         lastBufferHostTime: UInt64 = 100,
         firstSignalHostTime: UInt64? = 1,
         insertedSilenceSeconds: Double = 0,
-        dropouts: [TimeInterval] = []
+        dropouts: [TimeInterval] = [],
+        positionedGaps: [(at: TimeInterval, seconds: TimeInterval)] = []
     ) -> AudioCaptureHealth {
         var tally = AudioLossTally()
         dropouts.forEach { tally.add(seconds: $0) }
+        positionedGaps.forEach { tally.add(seconds: $0.seconds, atSeconds: $0.at) }
         return AudioCaptureHealth(
             receivedBufferCount: 100,
             writtenByteCount: 320_000,

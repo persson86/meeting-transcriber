@@ -197,20 +197,56 @@ class TranscribeMeetingTests(unittest.TestCase):
 
         self.assertEqual([seg.text for seg in kept], ["novo"])
 
-    def test_drop_overlap_duplicates_keeps_segment_straddling_the_seam(self):
-        # Whisper pode emitir um único segmento longo cobrindo o chunk inteiro:
-        # começa na janela coberta mas carrega conteúdo novo — não pode ser perdido.
+    def test_drop_overlap_duplicates_keeps_straddling_segment_without_word_times(self):
+        # Sem tempos por palavra não há como cortar só a parte repetida: o
+        # segmento que atravessa a costura carrega conteúdo novo e fica inteiro.
         segments = [
             tm.Segment(17.5, 33.0, "segmento longo atravessando a costura", "Interlocutor"),
             tm.Segment(17.8, 19.9, "totalmente coberto", "Interlocutor"),
         ]
 
-        kept = tm.drop_overlap_duplicates(segments, covered_until_sec=20.0)
+        kept = tm.drop_overlap_duplicates(segments, covered_until_sec=20.0, config=tm.TranscriptionConfig())
 
         self.assertEqual(
             [seg.text for seg in kept],
             ["segmento longo atravessando a costura"],
         )
+
+    def test_drop_overlap_duplicates_trims_repeated_words_of_straddling_segment(self):
+        # 0.10.0: com tempos por palavra, as palavras que terminam até
+        # covered_until + 0,2 s e já estão em segmentos emitidos saem; o resto fica.
+        previous = [tm.Segment(14.0, 20.0, "a gente fecha o escopo hoje", "Interlocutor")]
+        straddling = tm.Segment(
+            17.0, 23.0, "fecha o escopo hoje e manda amanhã", "Interlocutor",
+            words=[
+                (17.0, 17.5, " fecha"), (17.5, 17.8, " o"), (17.8, 18.6, " escopo"),
+                (18.6, 20.1, " hoje"), (20.3, 20.6, " e"), (20.6, 21.5, " manda"),
+                (21.5, 23.0, " amanhã"),
+            ],
+        )
+        report = {}
+
+        kept = tm.drop_overlap_duplicates(
+            [straddling], covered_until_sec=20.0, covered_segments=previous,
+            config=tm.TranscriptionConfig(), report=report,
+        )
+
+        self.assertEqual([seg.text for seg in kept], ["e manda amanhã"])
+        self.assertAlmostEqual(kept[0].start, 20.3)
+        self.assertEqual(report, {"words_dropped": 4, "segments_trimmed": 1})
+
+    def test_trim_seam_words_keeps_words_the_previous_chunk_missed(self):
+        # O chunk anterior não emitiu nada sobre 17–19 s: essas palavras são
+        # fala recuperada pelo overlap, não repetição.
+        previous = [tm.Segment(10.0, 12.0, "antes", "Você")]
+        straddling = tm.Segment(
+            17.0, 22.0, "fala recuperada e nova", "Você",
+            words=[(17.0, 17.6, " fala"), (17.6, 19.0, " recuperada"), (20.4, 20.8, " e"), (20.8, 22.0, " nova")],
+        )
+
+        kept = tm.trim_seam_words(straddling, 20.0, tm.TranscriptionConfig(), covered_segments=previous)
+
+        self.assertEqual(kept.text, "fala recuperada e nova")
 
     def test_drop_overlap_duplicates_keeps_tiny_segment_after_boundary(self):
         segments = [
@@ -305,7 +341,8 @@ class TranscribeMeetingTests(unittest.TestCase):
         self.assertEqual(model.calls, [])
         self.assertEqual(report, {"audio_ms": 3000, "vad_islands": 0, "vad_speech_ms": 0})
 
-    def test_transcribe_track_reports_low_energy_after_vad_separately_from_empty_asr(self):
+    def test_transcribe_track_skips_only_short_low_energy_residue(self):
+        # Menos de 1,5 s de fala VAD e RMS < 0,01: resíduo, não chama o modelo.
         wav_path = self.write_wav(duration_sec=3.0, amplitude=200)
         logs = []
         model = FakeModel()
@@ -316,21 +353,74 @@ class TranscribeMeetingTests(unittest.TestCase):
 
         self.assertEqual(model.calls, [])
         self.assertEqual(logs[0]["skipped"], "low_energy")
+        self.assertEqual(logs[0]["skipped_reason"], "low_energy")
+        self.assertEqual(logs[0]["covered_ms"], 0)
         self.assertEqual(logs[0]["speech_ms"], 1000)
         self.assertGreater(logs[0]["rms"], 0)
-        self.assertNotIn("covered_ms", logs[0])
 
-    def test_analysis_overlap_handles_negative_track_offset(self):
+    def test_transcribe_track_calls_model_for_quiet_block_with_enough_vad_speech(self):
+        # Bloco de 24 s, VAD ≥ 20 s e RMS 0,009: a 0.9.x pulava; agora quem
+        # decide é o modelo (no_speech_prob).
+        sr = tm.SAMPLE_RATE
+        wav_path = self.write_wav(duration_sec=25.0, amplitude=int(0.009 * 32767))
+        logs = []
+        model = FakeModel()
+        with patch.object(tm, "detect_speech_islands", return_value=[
+            {"start": 0, "end": 12 * sr},
+            {"start": 13 * sr, "end": 24 * sr},
+        ]):
+            segments = tm.transcribe_track(wav_path, "Você", model, chunk_log=logs)
+
+        self.assertEqual(len(model.calls), 1)
+        self.assertGreaterEqual(logs[0]["speech_ms"], 20000)
+        self.assertLess(logs[0]["rms"], 0.01)
+        self.assertNotIn("skipped", logs[0])
+        self.assertEqual([seg.text for seg in segments], ["olá"])
+
+    def test_empty_asr_on_block_with_speech_is_logged_as_untranscribed(self):
+        sr = tm.SAMPLE_RATE
+        wav_path = self.write_wav(duration_sec=10.0, amplitude=1000)
+        logs, untranscribed = [], []
+        model = FakeModel()
+        with patch.object(tm, "detect_speech_islands", return_value=[
+            {"start": 2 * sr, "end": 8 * sr},
+        ]), patch.object(model, "transcribe", return_value=([], SimpleNamespace(language="pt", language_probability=0.9))):
+            tm.transcribe_track(
+                wav_path, "Você", model, offset_sec=1.0, chunk_log=logs, untranscribed_log=untranscribed,
+            )
+
+        self.assertEqual(logs[0]["skipped_reason"], "empty_asr")
+        self.assertEqual(logs[0]["covered_ms"], 0)
+        self.assertNotIn("skipped", logs[0])   # o bloco foi transcrito, só veio vazio
+        self.assertEqual(untranscribed, [{"start_ms": 3000, "end_ms": 9000, "speech_ms": 6000}])
+
+    def test_track_offsets_are_normalized_to_a_single_non_negative_timeline(self):
+        # 0.10.0: com o sistema começando antes do mic, a origem passa a ser o
+        # sistema; os offsets ficam ≥ 0 e nenhum turno sai negativo.
+        mic, system, t0 = tm.normalize_track_offsets(0.0, -594.0)
+        self.assertEqual((mic, system, t0), (594.0, 0.0, -594.0))
+        self.assertEqual(tm.normalize_track_offsets(0.0, 0.202), (0.0, 0.202, 0.0))
+        self.assertEqual(tm.normalize_track_offsets(-1.0, 2.0), (0.0, 3.0, -1.0))
+
+    def test_format_time_is_safe_for_negative_and_uses_floor(self):
+        self.assertNotEqual(tm.format_time(-3.4), "-1:57")
+        self.assertEqual(tm.format_time(-3.4), "-00:03")
+        self.assertEqual(tm.format_time(-0.4), "00:00")
+        self.assertEqual(tm.format_time(59.99), "00:59")
+        self.assertEqual(tm.format_time(3725.2), "62:05")
+        self.assertEqual(tm.format_time(float("nan")), "00:00")
+
+    def test_analysis_overlap_with_normalized_offsets(self):
         turns = [
-            tm.Turn("Interlocutor", "primeiro", -5326, -4346, 1.0, False),
-            tm.Turn("Interlocutor", "segundo", -4000, -3000, 1.0, False),
-            tm.Turn("Você", "sobreposição real", -3500, -2500, 1.0, False),
+            tm.Turn("Interlocutor", "primeiro", 0, 980, 1.0, False),
+            tm.Turn("Interlocutor", "segundo", 1326, 2326, 1.0, False),
+            tm.Turn("Você", "sobreposição real", 1826, 2826, 1.0, False),
         ]
 
         rows = [json.loads(line) for line in tm.build_analysis_jsonl(turns).splitlines()]
 
         self.assertEqual([row["overlap_ms"] for row in rows], [0, 0, 500])
-        self.assertEqual([row["start_ms"] for row in rows], [-5326, -4000, -3500])
+        self.assertTrue(all(row["start_ms"] >= 0 for row in rows))
 
     def test_transcribe_track_no_overlap_keeps_legacy_slicing(self):
         sr = tm.SAMPLE_RATE
@@ -615,24 +705,19 @@ class TranscribeMeetingTests(unittest.TestCase):
 
         self.assertTrue(tm.segment_is_suspect(segment))
 
-    def test_chunk_by_silence_skips_low_energy_chunks(self):
-        wav_path = self.write_wav(amplitude=0)
-        model = FakeModel()
-
-        with patch.object(
-            tm,
-            "detect_speech_islands",
-            return_value=[{"start": 0, "end": tm.SAMPLE_RATE}],
-        ):
-            segments = tm.transcribe_track(
-                wav_path,
-                "Você",
-                model,
-                chunk_by_silence=True,
-            )
-
-        self.assertEqual(segments, [])
-        self.assertEqual(model.calls, [])
+    def test_chunk_by_silence_skips_low_energy_chunks_only_below_vad_threshold(self):
+        sr = tm.SAMPLE_RATE
+        wav_path = self.write_wav(duration_sec=6.0, amplitude=0)
+        cases = [
+            ([{"start": 0, "end": int(1.4 * sr)}], 0),   # 1,4 s de fala VAD: pula
+            ([{"start": 0, "end": int(1.5 * sr)}], 1),   # 1,5 s: o modelo decide
+        ]
+        for islands, expected_calls in cases:
+            with self.subTest(speech_sec=islands[0]["end"] / sr):
+                model = FakeModel()
+                with patch.object(tm, "detect_speech_islands", return_value=islands):
+                    tm.transcribe_track(wav_path, "Você", model, chunk_by_silence=True)
+                self.assertEqual(len(model.calls), expected_calls)
 
     def test_transcribe_track_carries_clean_context_between_chunks(self):
         sr = tm.SAMPLE_RATE
@@ -665,7 +750,9 @@ class TranscribeMeetingTests(unittest.TestCase):
             tm.transcribe_track(wav_path, "Você", model, chunk_by_silence=True)
 
         self.assertNotIn("Contexto anterior", model.calls[0]["initial_prompt"])
-        self.assertIn("Contexto anterior recente: primeira parte", model.calls[1]["initial_prompt"])
+        # 0.10.0: a cauda vai crua, sem o rótulo que vazava para o texto.
+        self.assertNotIn("Contexto anterior", model.calls[1]["initial_prompt"])
+        self.assertTrue(model.calls[1]["initial_prompt"].endswith(" primeira parte"))
 
     def test_mlx_backend_uses_cached_snapshot_and_drops_unsupported_beam_size(self):
         captured = {}

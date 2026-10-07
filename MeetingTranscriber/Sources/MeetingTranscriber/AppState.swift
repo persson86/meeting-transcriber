@@ -23,6 +23,7 @@ enum RecordingStatus {
         if case .error = self { return true }
         return false
     }
+    var isError: Bool { if case .error = self { return true }; return false }
 
     var label: String {
         switch self {
@@ -80,6 +81,11 @@ struct TranscriptionJob: Identifiable, Equatable {
     var captureIntegrity: CaptureIntegrity = .unknown
     /// Evento do Calendar escolhido pelo usuário para esta gravação (v1.4).
     var calendarMeeting: CalendarMeeting? = nil
+    /// Medição da sessão para o manifest v2 (versões, aparelho, tentativas do ASR).
+    var record: SessionRecord? = nil
+    /// Erro de uma ação lateral (envio ao second-brain). Fica no job e nunca no
+    /// estado de captura: um envio que falha não pode esconder a gravação.
+    var sideError: String? = nil
 }
 
 @MainActor
@@ -103,10 +109,26 @@ final class AppState: ObservableObject {
     /// quando o áudio chega de fato.
     @Published var micCaptureState: MicCaptureState = .waitingForAudio
     @Published private(set) var canRestartMicrophone = true
+    /// Prova de vida da gravação (v1.8): atualizada a cada segundo pelo monitor.
+    @Published private(set) var captureProof: CaptureProof?
+    /// Áudio do sistema parado ou com stream morto durante a gravação.
+    @Published private(set) var systemNeedsAttention = false
+    /// Há job falho ou com captura parcial que o usuário ainda não viu na lista.
+    @Published private(set) var unseenJobProblem = false
     private var manualMicRecoveryAt: TimeInterval?
+    /// Instância viva, para o delegate do app decidir o encerramento (v1.8).
+    static weak var current: AppState?
+    /// O usuário pediu para sair durante a captura: o app só sai depois que os
+    /// WAVs e o manifest foram gravados.
+    private var quitRequested = false
+    /// Pergunta ao usuário se deve parar a gravação para sair. Injetável em teste.
+    var confirmQuitWhileCapturing: () -> Bool = AppState.showQuitConfirmation
+    /// Libera o `terminateLater` do `NSApplication`. Injetável em teste.
+    var replyToTermination: (Bool) -> Void = { NSApp.reply(toApplicationShouldTerminate: $0) }
 
-    private var mic: MicRecorder?
-    private var sys: SystemAudioRecorder?
+    /// Internos (não privados) só para os testes de invariante de estado.
+    var mic: MicRecorder?
+    var sys: SystemAudioRecorder?
     private var tempDir: URL?
     private var currentSessionID: UUID?
     private var captureStartedAt: Date?
@@ -126,6 +148,7 @@ final class AppState: ObservableObject {
     private var selectedCalendarTitle: String?
     private var currentCalendarMeeting: CalendarMeeting?
     private var currentTitle: String?
+    private var currentRecord: SessionRecord?
 
     /// Quantas transcrições concluídas ficam retidas (na lista e em memória).
     /// Jobs ativos não contam para esse limite — eles são sempre visíveis.
@@ -143,6 +166,7 @@ final class AppState: ObservableObject {
         let lease = try? sessionStore.acquireExclusiveLease()
         sessionLease = lease
         storageLeaseAvailable = lease != nil
+        Self.current = self
         guard storageLeaseAvailable else {
             status = .error("Outra instância do Meeting Transcriber já está usando as sessões. Feche-a antes de continuar.")
             return
@@ -158,7 +182,6 @@ final class AppState: ObservableObject {
                 return !recoveredOutputs.contains(url.resolvingSymlinksInPath().path)
             }
         transcriptionJobs = recovered + legacy
-        for job in recovered { try? sessionStore.save(job) }
         pruneFinishedJobs()
         Task { scheduleTranscriptionJobs() }
     }
@@ -218,8 +241,13 @@ final class AppState: ObservableObject {
         return status.label
     }
 
+    /// Invariante: `status` em {starting, recording, stopping} ⇔ há captura ativa.
+    /// Um erro com recorder ainda ativo não autoriza iniciar outra gravação.
+    var hasActiveRecorder: Bool { mic != nil || sys != nil }
+
     func startRecording() {
-        guard storageLeaseAvailable, status.canStartRecording, !isCalendarSyncing else { return }
+        guard storageLeaseAvailable, status.canStartRecording, !hasActiveRecorder,
+              !isCalendarSyncing else { return }
         status = .starting
         lastWarning = nil
 
@@ -262,7 +290,8 @@ final class AppState: ObservableObject {
                     language: currentLanguage,
                     outputDirectory: outDir,
                     createdAt: createdAt,
-                    calendarMeeting: calendarMeeting
+                    calendarMeeting: calendarMeeting,
+                    record: SessionRecord.starting(at: createdAt)
                 )
                 pendingDirectory = dir
 
@@ -272,6 +301,7 @@ final class AppState: ObservableObject {
                     preserveOnDeinit: true
                 )
                 pendingMic = micRec
+                let sessionStartUptime = ProcessInfo.processInfo.systemUptime
                 try micRec.start()
 
                 let sysRec = SystemAudioRecorder(
@@ -280,7 +310,7 @@ final class AppState: ObservableObject {
                     preserveOnDeinit: true
                 )
                 pendingSystem = sysRec
-                try await sysRec.start()
+                try await sysRec.start(sessionStartUptime: sessionStartUptime)
 
                 mic = micRec
                 sys = sysRec
@@ -288,8 +318,10 @@ final class AppState: ObservableObject {
                 currentSessionID = sessionID
                 captureStartedAt = createdAt
                 currentTitle = title
+                currentRecord = SessionRecord.starting(at: createdAt)
                 currentCalendarMeeting = calendarMeeting
                 selectedCalendarMeeting = nil
+                AppLog.capture.info("start session=\(sessionID.uuidString, privacy: .public)")
                 selectedCalendarTitle = nil
                 captureHealthWarnings = []
                 captureAlert = nil
@@ -335,7 +367,7 @@ final class AppState: ObservableObject {
     }
 
     func stopRecording() {
-        guard case .recording = status else { return }
+        guard status.isRecording || (status.isError && hasActiveRecorder) else { return }
         status = .stopping
 
         let micCopy = mic
@@ -348,10 +380,15 @@ final class AppState: ObservableObject {
 
         let title = currentTitle ?? (meetingTitle.isEmpty ? Self.defaultTitle(at: startedAt) : meetingTitle)
         let calendarMeeting = currentCalendarMeeting
+        var sessionRecord = currentRecord ?? SessionRecord.starting(at: captureStartedAt ?? Date())
+        sessionRecord.stopReason = quitRequested ? "quit" : "user"
         let outDir = outputDirectory
         let currentLanguage = language
+        AppLog.capture.info("stop session=\(sessionID.uuidString, privacy: .public) reason=\(sessionRecord.stopReason ?? "", privacy: .public)")
         captureAlert = nil
         micCaptureState = .waitingForAudio
+        captureProof = nil
+        systemNeedsAttention = false
 
         Task {
             do {
@@ -371,16 +408,21 @@ final class AppState: ObservableObject {
                 catch { captureIssues.append("Falha ao finalizar o áudio do sistema: \(error.localizedDescription)") }
 
                 let finalMicHealth = micCopy?.health
+                let finalSystemHealth = sysCopy?.health
+                let sessionDuration = Date().timeIntervalSince(startedAt)
                 captureIssues.append(contentsOf: Self.healthIssues(
                     mic: finalMicHealth,
-                    system: sysCopy?.health
+                    system: finalSystemHealth,
+                    sessionDuration: sessionDuration
                 ))
                 captureIssues = Array(Set(captureIssues)).sorted()
 
                 mic = nil; sys = nil; tempDir = nil
                 currentSessionID = nil; captureStartedAt = nil
-                currentTitle = nil; currentCalendarMeeting = nil
+                currentTitle = nil; currentCalendarMeeting = nil; currentRecord = nil
                 captureHealthWarnings = []
+                sessionRecord.recordingStoppedAt = Date()
+                sessionRecord.inputDevice = finalMicHealth?.currentDeviceLabel
 
                 let recordedMicURL = Self.existingAudioFileURL(micURL)
                 let recordedSystemURL = Self.existingAudioFileURL(sysURL)
@@ -434,9 +476,15 @@ final class AppState: ObservableObject {
                     status: .queued,
                     captureIntegrity: Self.captureIntegrity(
                         issues: captureIssues,
-                        micEvents: finalMicHealth?.events ?? []
+                        micEvents: finalMicHealth?.events ?? [],
+                        measured: Self.integrityReport(
+                            mic: finalMicHealth,
+                            system: finalSystemHealth,
+                            sessionDuration: sessionDuration
+                        )
                     ),
-                    calendarMeeting: calendarMeeting
+                    calendarMeeting: calendarMeeting,
+                    record: sessionRecord
                 )
 
                 transcriptionJobs.append(job)
@@ -447,11 +495,12 @@ final class AppState: ObservableObject {
                 meetingTitle = ""
                 status = .idle
                 scheduleTranscriptionJobs()
+                finishPendingQuit()
 
             } catch {
                 mic = nil; sys = nil; tempDir = nil
                 currentSessionID = nil; captureStartedAt = nil
-                currentTitle = nil; currentCalendarMeeting = nil
+                currentTitle = nil; currentCalendarMeeting = nil; currentRecord = nil
                 captureHealthWarnings = []
                 meetingTitle = ""
                 let failedMicURL = dir.map { Self.existingAudioFileURL($0.appendingPathComponent("mic.wav")) } ?? nil
@@ -475,8 +524,77 @@ final class AppState: ObservableObject {
                     persist(failedJob)
                 }
                 status = .error(error.localizedDescription)
+                finishPendingQuit()
             }
         }
+    }
+
+    // MARK: - Encerramento seguro (v1.8)
+
+    /// Chamado por `applicationShouldTerminate`. Com captura ativa pergunta antes
+    /// e só libera a saída depois de gravar WAVs e manifest; sem captura, cancela
+    /// o que o ASR ainda estiver fazendo para o Python não sobreviver ao app.
+    func handleTerminationRequest() -> NSApplication.TerminateReply {
+        if status.isStarting {
+            lastWarning = "Aguarde a gravação terminar de iniciar para sair."
+            return .terminateCancel
+        }
+        guard status.isCapturing || hasActiveRecorder else {
+            cancelTranscriptionsForQuit()
+            return .terminateNow
+        }
+        guard confirmQuitWhileCapturing() else { return .terminateCancel }
+        quitRequested = true
+        if status.isStopping { armQuitTimeout(); return .terminateLater }
+        stopRecording()
+        if status.isStopping { armQuitTimeout(); return .terminateLater }
+        // Nada a parar (estado inconsistente): sai sem deixar o ASR para trás.
+        quitRequested = false
+        cancelTranscriptionsForQuit()
+        return .terminateNow
+    }
+
+    /// Se o stop travar (ex.: `stopCapture` do sistema), o app não pode ficar
+    /// preso em `terminateLater`: depois do prazo sai com o que já foi gravado em
+    /// disco (WAVs em andamento são recuperados na próxima abertura).
+    private func armQuitTimeout(seconds: TimeInterval = 20) {
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            guard let self, self.quitRequested else { return }
+            AppLog.capture.error("stop não terminou em \(seconds, privacy: .public) s; saindo")
+            self.finishPendingQuit()
+        }
+    }
+
+    private func finishPendingQuit() {
+        guard quitRequested else { return }
+        cancelTranscriptionsForQuit()
+        replyToTermination(true)
+    }
+
+    /// Jobs em andamento viram `failed` ("cancelado ao sair") para não haver
+    /// retry automático na próxima abertura; o áudio fica preservado.
+    func cancelTranscriptionsForQuit() {
+        for index in transcriptionJobs.indices where transcriptionJobs[index].status.isRunning {
+            let id = transcriptionJobs[index].id
+            runners[id]?.cancel()
+            runners[id] = nil
+            transcriptionJobs[index].status = .failed("Cancelado ao sair do app. O áudio foi preservado para tentar novamente.")
+            transcriptionJobs[index].completedAt = Date()
+            persist(transcriptionJobs[index])
+        }
+    }
+
+    private static func showQuitConfirmation() -> Bool {
+        // App de barra de menu: sem ativar, o alerta pode abrir atrás de outras janelas.
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Há uma gravação em andamento"
+        alert.informativeText = "Parar a gravação, salvar o áudio e sair?"
+        alert.addButton(withTitle: "Parar e sair")
+        alert.addButton(withTitle: "Cancelar")
+        alert.alertStyle = .warning
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     func importAudioFile(_ sourceURL: URL) {
@@ -519,8 +637,9 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Com recorder ativo, limpar o erro não pode declarar o app ocioso.
     func resetError() {
-        guard storageLeaseAvailable else { return }
+        guard storageLeaseAvailable, !hasActiveRecorder else { return }
         if case .error = status { status = .idle }
     }
 
@@ -540,7 +659,17 @@ final class AppState: ObservableObject {
 
     /// Indicador do ícone da barra de menu e do cabeçalho do popover.
     var appIndicator: AppIndicator {
-        AppIndicator.make(status: status, micState: micCaptureState)
+        AppIndicator.make(
+            status: status,
+            micState: micCaptureState,
+            systemNeedsAttention: systemNeedsAttention,
+            unseenJobProblem: unseenJobProblem
+        )
+    }
+
+    /// O popover foi aberto: o selo por job falho ou parcial cumpriu a função.
+    func acknowledgeJobProblems() {
+        if unseenJobProblem { unseenJobProblem = false }
     }
 
     func syncMeetingTitleFromCalendar() {
@@ -612,7 +741,14 @@ final class AppState: ObservableObject {
             issues.append("O microfone deixou de entregar áudio há mais de cinco segundos.")
         }
         micCaptureState = micHealth.captureState
-        updateCaptureAlert(state: micHealth.captureState)
+        let elapsed = Date().timeIntervalSince(captureStartedAt ?? Date())
+        systemNeedsAttention = Self.systemIsStalled(health: systemHealth, secondsSinceCaptureStart: elapsed)
+        captureProof = CaptureProof.make(mic: micHealth, system: systemHealth, elapsed: elapsed)
+        updateCaptureAlert(state: CaptureProof.alertState(
+            micHealth.captureState,
+            hasFirstSignal: micHealth.firstSignalHostTime != nil,
+            elapsed: elapsed
+        ))
         for issue in issues where captureHealthWarnings.insert(issue).inserted {
             warn("Captura parcial: \(issue) A gravação recuperável continua sendo preservada.")
         }
@@ -653,11 +789,12 @@ final class AppState: ObservableObject {
         guard paused != transcriptionsPaused else { return }
         transcriptionsPaused = paused
         for runner in runners.values { runner.setPaused(paused) }
+        AppLog.queue.info("asr \(paused ? "pausado" : "retomado", privacy: .public) jobs=\(self.runners.count, privacy: .public)")
         if !paused { scheduleTranscriptionJobs() }
     }
 
     private func scheduleTranscriptionJobs() {
-        guard !transcriptionsPaused else { return }
+        guard !transcriptionsPaused, !quitRequested else { return }
         while runningTranscriptionCount < maxConcurrentTranscriptions,
               let index = transcriptionJobs.firstIndex(where: { $0.status.isQueued }) {
             transcriptionJobs[index].status = .running
@@ -670,7 +807,31 @@ final class AppState: ObservableObject {
     private func runTranscriptionJob(_ job: TranscriptionJob) {
         let runner = TranscriptionRunner()
         runners[job.id] = runner
+        let logURL = sessionStore.sessionDirectory(for: job.id).appendingPathComponent("pipeline.log")
         Task { [job, runner] in
+            // O pipeline roda do checkout vivo: a versão é lida a cada job, não
+            // só na abertura do app, e fora da faixa suportada o job não começa.
+            let scriptPath = AppConfig.scriptPath
+            let pipelineVersion = AppVersion.pipelineVersion(atPath: scriptPath)
+            if let blocked = PipelineGuard.blockingMessage(forVersion: pipelineVersion) {
+                AppLog.runner.error("job bloqueado: \(blocked, privacy: .public)")
+                failTranscriptionJob(id: job.id, message: blocked)
+                return
+            }
+            let git = await Task.detached { PipelineGuard.gitState(scriptPath: scriptPath) }.value
+            let attemptStart = Date()
+            mutateRecord(job.id) { record in
+                record.pipelineVersion = pipelineVersion
+                record.pipelineGitSha = git.sha
+                record.pipelineDirty = git.dirty
+                record.asrAttempts.append(ASRAttempt(
+                    startedAt: attemptStart, endedAt: nil, exitCode: nil,
+                    pausedSeconds: 0, overlappedRecording: transcriptionsPaused
+                ))
+            }
+            AppLog.runner.info("job start id=\(job.id.uuidString, privacy: .public) pipeline=\(pipelineVersion ?? "?", privacy: .public) dirty=\(git.dirty.map(String.init) ?? "?", privacy: .public)")
+            var attemptExitCode: Int32?
+            defer { closeAttempt(job.id, runner: runner, startedAt: attemptStart, exitCode: attemptExitCode) }
             do {
                 let outputURL = try await runner.run(
                     micURL: job.micURL,
@@ -683,6 +844,7 @@ final class AppState: ObservableObject {
                     captureIntegrity: job.captureIntegrity,
                     recordedAt: job.createdAt,
                     calendarMeeting: job.calendarMeeting,
+                    logURL: logURL,
                     onProgress: { [weak self] pct in
                         Task { @MainActor in
                             self?.updateProgress(id: job.id, pct: pct)
@@ -709,9 +871,38 @@ final class AppState: ObservableObject {
                 )
                 finishTranscriptionJob(id: job.id, outputURL: outputURL, micURL: audio.mic, systemURL: audio.system)
             } catch {
+                if case TranscriptionError.processFailed(let code, _) = error { attemptExitCode = code }
                 failTranscriptionJob(id: job.id, message: error.localizedDescription)
             }
         }
+    }
+
+    private func mutateRecord(_ id: UUID, _ body: (inout SessionRecord) -> Void) {
+        guard let index = transcriptionJobs.firstIndex(where: { $0.id == id }) else { return }
+        var record = transcriptionJobs[index].record ?? SessionRecord()
+        body(&record)
+        transcriptionJobs[index].record = record
+        persist(transcriptionJobs[index])
+    }
+
+    /// Fecha a última tentativa: fim, tempo suspenso e se a gravação atravessou o ASR.
+    private func closeAttempt(_ id: UUID, runner: TranscriptionRunner, startedAt: Date, exitCode: Int32?) {
+        let paused = runner.pausedSecondsTotal
+        guard let index = transcriptionJobs.firstIndex(where: { $0.id == id }) else { return }
+        let succeeded: Bool
+        if case .succeeded = transcriptionJobs[index].status { succeeded = true } else { succeeded = false }
+        mutateRecord(id) { record in
+            guard let last = record.asrAttempts.lastIndex(where: { $0.startedAt == startedAt }) else { return }
+            record.asrAttempts[last].endedAt = Date()
+            record.asrAttempts[last].pausedSeconds = (paused * 10).rounded() / 10
+            record.asrAttempts[last].overlappedRecording = paused > 0
+            record.asrAttempts[last].exitCode = succeeded ? 0 : exitCode
+        }
+    }
+
+    func pipelineLogURL(for id: UUID) -> URL? {
+        let url = sessionStore.sessionDirectory(for: id).appendingPathComponent("pipeline.log")
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
     }
 
     private func updateProgress(id: UUID, pct: Int) {
@@ -734,7 +925,13 @@ final class AppState: ObservableObject {
         transcriptionJobs[index].completedAt = Date()
         persist(transcriptionJobs[index])
         lastOutputURL = outputURL
-        NotificationManager.shared.notifyDone(fileURL: outputURL)
+        let result = JobPresentation.result(for: transcriptionJobs[index])
+        if result.needsAttention { unseenJobProblem = true }
+        NotificationManager.shared.notifyDone(
+            fileURL: outputURL,
+            title: result.notificationTitle,
+            caveat: result.notificationCaveat
+        )
         pruneFinishedJobs()
         scheduleTranscriptionJobs()
     }
@@ -742,9 +939,16 @@ final class AppState: ObservableObject {
     private func failTranscriptionJob(id: UUID, message: String) {
         runners[id] = nil
         guard let index = transcriptionJobs.firstIndex(where: { $0.id == id }) else { return }
+        let wasCancelledByUser: Bool
+        if case .cancelling = transcriptionJobs[index].status { wasCancelledByUser = true } else { wasCancelledByUser = false }
         transcriptionJobs[index].status = .failed(message)
         transcriptionJobs[index].completedAt = Date()
         persist(transcriptionJobs[index])
+        if !wasCancelledByUser, !quitRequested {
+            // Falha de transcrição nunca é silenciosa (antes de v1.8 não havia aviso).
+            unseenJobProblem = true
+            NotificationManager.shared.notifyFailure(title: transcriptionJobs[index].title, message: message)
+        }
         pruneFinishedJobs()
         scheduleTranscriptionJobs()
     }
@@ -796,8 +1000,11 @@ final class AppState: ObservableObject {
         transcriptionJobs.remove(at: index)
     }
 
+    /// Ação lateral: qualquer falha vai para o job e para o aviso, nunca para
+    /// `status` (que pertence ao ciclo de captura).
     func sendToSecondBrain(_ job: TranscriptionJob) {
-        guard case .succeeded(let outputURL) = job.status,
+        guard !status.isCapturing,
+              case .succeeded(let outputURL) = job.status,
               let root = AppConfig.secondBrainPath,
               let index = transcriptionJobs.firstIndex(where: { $0.id == job.id }),
               !transcriptionJobs[index].exportedToSecondBrain else { return }
@@ -811,7 +1018,7 @@ final class AppState: ObservableObject {
             do {
                 try fm.createDirectory(at: queueDir, withIntermediateDirectories: true)
             } catch {
-                status = .error("Não foi possível criar queue/transcricoes/: \(error.localizedDescription)")
+                reportSideError(jobID: job.id, "Não foi possível criar queue/transcricoes/: \(error.localizedDescription)")
                 return
             }
         }
@@ -827,17 +1034,25 @@ final class AppState: ObservableObject {
                 copied.append(destination)
             }
             guard !copied.isEmpty else {
-                status = .error("Nenhum arquivo de transcrição encontrado para enviar")
+                reportSideError(jobID: job.id, "Nenhum arquivo de transcrição encontrado para enviar")
                 return
             }
             transcriptionJobs[index].exportedToSecondBrain = true
+            transcriptionJobs[index].sideError = nil
             persist(transcriptionJobs[index])
         } catch {
             // Pacote incompleto não fica na fila: o retry usa outro timestamp e
             // o feed trataria as cópias parciais como outra reunião.
             for url in copied { try? fm.removeItem(at: url) }
-            status = .error("Falha ao enviar para o second-brain: \(error.localizedDescription)")
+            reportSideError(jobID: job.id, "Falha ao enviar para o second-brain: \(error.localizedDescription)")
         }
+    }
+
+    private func reportSideError(jobID: UUID, _ message: String) {
+        if let index = transcriptionJobs.firstIndex(where: { $0.id == jobID }) {
+            transcriptionJobs[index].sideError = message
+        }
+        lastWarning = message
     }
 
     /// Arquivos que vão juntos para o Second Brain, com o mesmo basename: o
@@ -900,7 +1115,7 @@ final class AppState: ObservableObject {
             files["system"] = "system.wav"
         }
 
-        let metadata: [String: Any] = [
+        var metadata: [String: Any] = [
             "title": title,
             "language": language,
             "sysOffsetMs": sysOffsetMs,
@@ -912,6 +1127,11 @@ final class AppState: ObservableObject {
             "captureIssues": captureIntegrity.details,
             "captureDiagnostics": captureIntegrity.diagnostics ?? []
         ]
+        if let measured = captureIntegrity.measured,
+           let encoded = try? JSONEncoder().encode(measured),
+           let object = try? JSONSerialization.jsonObject(with: encoded) {
+            metadata["integrity"] = object
+        }
         let data = try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted, .sortedKeys])
         try data.write(to: archiveURL.appendingPathComponent("metadata.json"))
         return archiveURL
@@ -1002,6 +1222,9 @@ final class AppState: ObservableObject {
         return Double(file.length) / file.fileFormat.sampleRate
     }
 
+    /// Cobre a latência de abertura e de parada; uma reunião longa não ganha margem.
+    static let durationToleranceSeconds: TimeInterval = 5
+
     static func durationIntegrityIssues(
         micURL: URL?,
         systemURL: URL?,
@@ -1016,11 +1239,12 @@ final class AppState: ObservableObject {
         let offset = sysOffsetMs / 1_000
         let micEnd = max(0, -offset) + micDuration
         let systemEnd = max(0, offset) + systemDuration
-        let reference = max(micEnd, systemEnd, sessionDuration)
-        let tolerance = max(5.0, reference * 0.05)
+        // Tolerância fixa: o fim de cada trilha também é medido por trilha
+        // (`IntegrityRule`), então não há margem proporcional à duração.
+        let tolerance = durationToleranceSeconds
         if sessionDuration - max(micEnd, systemEnd) > tolerance {
             return [
-                "As duas trilhas terminaram antes do fim da sessão " +
+                IntegrityRule.durationMessagePrefixBoth + " " +
                 "(\(Int(micDuration))s de microfone, \(Int(systemDuration))s de sistema, " +
                 "\(Int(sessionDuration))s de sessão)."
             ]
@@ -1028,23 +1252,25 @@ final class AppState: ObservableObject {
         guard abs(micEnd - systemEnd) > tolerance else { return [] }
         let shorter = micEnd < systemEnd ? "microfone" : "sistema"
         return [
-            "A trilha do \(shorter) terminou antes da outra " +
+            IntegrityRule.durationMessagePrefixOne + "\(shorter) terminou antes da outra " +
             "(\(Int(micDuration))s de microfone, \(Int(systemDuration))s de sistema)."
         ]
     }
 
     /// Uma interrupção no meio da trilha a partir disso vira problema de integridade.
-    static let materialDropoutSeconds: TimeInterval = 2
+    static let materialDropoutSeconds = IntegrityRule.materialEventSeconds
     /// Perda somada (início + interrupções + fim) a partir disso também vira.
-    static let materialLossSeconds: TimeInterval = 10
+    static let materialLossSeconds = IntegrityRule.materialLossSeconds
 
     /// v1.7: `degraded` só com falha de escrita/conversão ou perda medida em
     /// segundos. Contagem de rearmes, erro de uma tentativa que depois funcionou e
     /// micro-correções do relógio ficam no diário (`diagnostics`): na 1.6.1 elas
     /// rebaixaram 7 de 7 sessões, três delas com o microfone íntegro.
+    /// v1.8: as duas trilhas medem início, buracos e fim com a mesma regra.
     static func healthIssues(
         mic: AudioCaptureHealth?,
-        system: AudioCaptureHealth?
+        system: AudioCaptureHealth?,
+        sessionDuration: TimeInterval = 0
     ) -> [String] {
         var issues: [String] = []
         if let error = mic?.firstErrorDescription {
@@ -1068,47 +1294,44 @@ final class AppState: ObservableObject {
         if let system, system.cappedGapCount > 0 {
             issues.append("Um intervalo do áudio do sistema excedeu o limite de preenchimento; a sincronização das trilhas pode estar comprometida.")
         }
-        if let mic, let loss = micLossIssue(mic) {
+        if let mic, let loss = micLossIssue(mic, sessionDuration: sessionDuration) {
             issues.append(loss)
         }
-        if let system,
-           system.dropouts.largestSeconds >= materialDropoutSeconds
-            || system.dropouts.totalSeconds >= materialLossSeconds {
-            issues.append(
-                "O áudio do sistema ficou sem captura por \(seconds(system.dropouts.totalSeconds)) no total " +
-                "(maior intervalo: \(seconds(system.dropouts.largestSeconds)))."
-            )
+        if let system, let loss = lossIssue(label: IntegrityRule.systemLabel, health: system, sessionDuration: sessionDuration) {
+            issues.append(loss)
         }
         return Array(Set(issues)).sorted()
     }
 
-    static func micLossIssue(_ mic: AudioCaptureHealth) -> String? {
+    /// Quantidades medidas por trilha, para o manifest e para a interface.
+    static func integrityReport(
+        mic: AudioCaptureHealth?,
+        system: AudioCaptureHealth?,
+        sessionDuration: TimeInterval
+    ) -> IntegrityReport? {
+        var tracks: [String: TrackIntegrity] = [:]
+        if let mic, mic.writtenByteCount > 0 { tracks["mic"] = IntegrityRule.measure(mic, sessionDuration: sessionDuration) }
+        if let system, system.writtenByteCount > 0 { tracks["system"] = IntegrityRule.measure(system, sessionDuration: sessionDuration) }
+        guard !tracks.isEmpty else { return nil }
+        return IntegrityReport(ruleVersion: IntegrityRule.version, tracks: tracks, sessionDurationS: max(0, sessionDuration))
+    }
+
+    static func micLossIssue(_ mic: AudioCaptureHealth, sessionDuration: TimeInterval = 0) -> String? {
         guard mic.writtenByteCount > 0 else { return nil }
         guard mic.firstSignalHostTime != nil || mic.initialAudioDelaySeconds != nil else {
             return "O microfone não entregou áudio em nenhum momento da gravação."
         }
-        // Até ~0,5 s é o tempo normal de abertura do engine; 1 s no fim é o stop.
-        let start = (mic.initialAudioDelaySeconds ?? 0) >= 1 ? (mic.initialAudioDelaySeconds ?? 0) : 0
-        let end = (mic.trailingSilenceSeconds ?? 0) >= 1 ? (mic.trailingSilenceSeconds ?? 0) : 0
-        let total = start + mic.dropouts.totalSeconds + end
-        guard mic.dropouts.largestSeconds >= materialDropoutSeconds || total >= materialLossSeconds else {
-            return nil
-        }
-        var parts: [String] = []
-        if start > 0 { parts.append("início: \(seconds(start))") }
-        if mic.dropouts.count > 0 {
-            parts.append("\(mic.dropouts.count) interrupção(ões): \(seconds(mic.dropouts.totalSeconds)), maior \(seconds(mic.dropouts.largestSeconds))")
-        }
-        if end > 0 { parts.append("fim: \(seconds(end))") }
-        return "O microfone ficou sem áudio por \(seconds(total)) no total (\(parts.joined(separator: "; ")))."
+        return lossIssue(label: IntegrityRule.micLabel, health: mic, sessionDuration: sessionDuration)
     }
 
-    static func seconds(_ value: TimeInterval) -> String {
-        let rounded = Int(value.rounded())
-        return rounded >= 60
-            ? String(format: "%d min %02d s", rounded / 60, rounded % 60)
-            : "\(rounded) s"
+    private static func lossIssue(label: String, health: AudioCaptureHealth, sessionDuration: TimeInterval) -> String? {
+        guard health.writtenByteCount > 0 else { return nil }
+        let track = IntegrityRule.measure(health, sessionDuration: sessionDuration)
+        guard IntegrityRule.isMaterial(track, largestGap: health.dropouts.largestSeconds) else { return nil }
+        return IntegrityRule.message(label: label, track: track, health: health)
     }
+
+    static func seconds(_ value: TimeInterval) -> String { IntegrityRule.seconds(value) }
 
     static func hostTimeAgeSeconds(_ hostTime: UInt64?) -> TimeInterval {
         guard let hostTime else { return .infinity }
@@ -1164,9 +1387,28 @@ final class AppState: ObservableObject {
     ) -> Bool {
         guard secondsSinceCaptureStart > threshold else { return false }
         if health.captureState.needsAttention { return true }
-        if health.receivedBufferCount == 0 { return true }
+        // Abertura lenta (fone BT, ~6 s de mediana) não é falha: sem nenhum
+        // callback, o aviso só vem depois da janela de abertura (v1.8).
+        if health.receivedBufferCount == 0 {
+            return secondsSinceCaptureStart >= CaptureProof.openingGraceSeconds
+        }
         let lastReceived = health.lastSignalHostTime ?? health.lastReceivedBufferHostTime ?? health.lastBufferHostTime
         return hostTimeAgeSeconds(lastReceived) > threshold
+    }
+
+    /// Callbacks do sistema pararam por mais de `threshold` s, ou o stream morreu.
+    /// Silêncio com callbacks não conta: reunião presencial não gera áudio do sistema.
+    static func systemIsStalled(
+        health: AudioCaptureHealth,
+        secondsSinceCaptureStart: TimeInterval,
+        threshold: TimeInterval = 5
+    ) -> Bool {
+        if health.streamStopErrorDescription != nil { return true }
+        guard secondsSinceCaptureStart > threshold else { return false }
+        if health.receivedBufferCount == 0 { return true }
+        // Sem relógio de sincronização não há idade confiável: não alarma.
+        guard let last = health.lastReceivedBufferHostTime else { return false }
+        return hostTimeAgeSeconds(last) > threshold
     }
 
     private func updateCaptureAlert(state: MicCaptureState) {
@@ -1191,9 +1433,14 @@ final class AppState: ObservableObject {
         }
     }
 
-    static func captureIntegrity(issues: [String], micEvents: [String]) -> CaptureIntegrity {
+    static func captureIntegrity(
+        issues: [String],
+        micEvents: [String],
+        measured: IntegrityReport? = nil
+    ) -> CaptureIntegrity {
         var integrity: CaptureIntegrity = issues.isEmpty ? .complete : .degraded(issues)
         integrity.diagnostics = micEvents.isEmpty ? nil : micEvents
+        integrity.measured = measured
         return integrity
     }
 

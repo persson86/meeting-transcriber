@@ -13,6 +13,14 @@ final class URLSchemeDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
+    /// Sair durante a gravação pede confirmação e só termina depois de salvar o
+    /// áudio; o ASR em andamento é cancelado para não sobreviver ao app.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        MainActor.assumeIsolated {
+            AppState.current?.handleTerminationRequest() ?? .terminateNow
+        }
+    }
+
     @objc private func handleGetURL(_ event: NSAppleEventDescriptor, withReplyEvent: NSAppleEventDescriptor) {
         guard let urlString = event.paramDescriptor(forKeyword: AEKeyword(keyDirectObject))?.stringValue,
               let url = URL(string: urlString) else { return }

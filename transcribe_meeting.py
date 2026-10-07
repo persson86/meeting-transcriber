@@ -27,6 +27,8 @@ import numpy as np
 import noisereduce as nr
 from scipy.io import wavfile
 
+import transcript_signals as signals
+
 SAMPLE_RATE = 16000
 
 VAD_PARAMETERS = dict(
@@ -47,7 +49,7 @@ CHUNK_OVERLAP_SEC = 3.0
 CHUNK_DEDUP_TOLERANCE_SEC = 0.5
 TEXT_DENSITY_SUSPECT_CHARS_PER_SEC = 80.0
 
-PIPELINE_VERSION = "0.9.1"
+PIPELINE_VERSION = "0.10.0"
 DEFAULT_HOTWORD_LIMIT = 60
 PROMPT_TAIL_MAX_CHARS = 240
 RUNAWAY_UNICODE_MIN_REPEATS = 8
@@ -76,6 +78,35 @@ LANGUAGE_DETECTION_MIN_SEC = 2.0
 CHUNK_COVERAGE_MIN_RATIO = 0.5
 CHUNK_COVERAGE_MIN_SPEECH_SEC = 6.0
 CHUNK_COVERAGE_RETRY_GAIN = 1.2
+
+# Veto por energia (RMS < 0,01) só para resíduos curtos: com ≥ 1,5 s de fala
+# VAD no bloco, o modelo é chamado e o no_speech_prob decide.
+LOW_ENERGY_VETO_MAX_SPEECH_SEC = 1.5
+# Bloco com pelo menos isto de fala VAD e nenhum texto do ASR vira
+# "[sem texto N s]" no .md, na posição do bloco.
+UNTRANSCRIBED_MIN_SPEECH_SEC = 3.0
+
+# Rótulo que a 0.9.x punha antes da cauda do prompt e que vazava para o texto.
+LEGACY_PROMPT_LABEL = "Contexto anterior recente:"
+LEGACY_PROMPT_LABEL_RE = re.compile(r"contexto\s+anterior\s+recente\s*:?", re.IGNORECASE)
+# Prefixo de segmento igual a um trecho do prompt só conta a partir disto.
+PROMPT_ECHO_MIN_WORDS = 6
+
+# Costura: palavras que terminam até aqui depois do fim já coberto são repetição.
+SEAM_WORD_TOLERANCE_SEC = 0.2
+
+# Marca "⚠ suspeito" por segmento (critério da 0.10.0).
+SUSPECT_LOGPROB = -0.8
+SUSPECT_COMPRESSION_RATIO = 2.4
+SUSPECT_NO_SPEECH = 0.6
+
+# Idioma fixo: amostra de fala do início da trilha e confiança mínima (fração
+# dos segundos votados) para registrar divergência sem trocar o idioma.
+LANGUAGE_CHECK_SAMPLE_SEC = 30.0
+LANGUAGE_CHECK_MIN_SHARE = 0.8
+
+# Caixa de confiança: baixa confiança abaixo disto não basta para mostrar a caixa.
+CONFIDENCE_BOX_LOW_CONFIDENCE_SHARE = 0.05
 
 DEFAULT_TITLE_RE = re.compile(r"^Reuni[aã]o(?: \d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})?)?$")
 CALENDAR_TITLE_SUFFIX_RE = re.compile(r"\s+—\s+\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
@@ -139,6 +170,12 @@ class Segment:
     no_speech_prob: float | None = None
     raw_text: str | None = None
     text_is_suspect: bool = False
+    # 0.10.0: palavras com tempo absoluto [(início, fim, texto bruto)], para
+    # cortar a costura por palavra; sinais do decoder para a marca por segmento.
+    words: list | None = None
+    temperature: float | None = None
+    compression_ratio: float | None = None
+    prompt_echo_removed: bool = False
 
 
 @dataclass
@@ -152,6 +189,14 @@ class Turn:
     raw_text: str | None = None
     safe_text: str | None = None
     track: str | None = None
+    # 0.10.0 (opcionais): pedaços de texto por segmento com a marca nova de
+    # suspeita [(texto exibido, texto seguro, suspeito)], eco provável do
+    # sistema e sinais do decoder. Turnos sem `parts` seguem o .md antigo.
+    parts: list | None = None
+    echo_of_system: bool = False
+    prompt_echo_removed: bool = False
+    temperature: float | None = None
+    compression_ratio: float | None = None
 
 
 @dataclass
@@ -838,6 +883,8 @@ def drop_overlap_duplicates(
     covered_until_sec: float,
     tolerance_sec: float = CHUNK_DEDUP_TOLERANCE_SEC,
     covered_segments: list[Segment] | None = None,
+    config: TranscriptionConfig | None = None,
+    report: dict | None = None,
 ) -> list[Segment]:
     """Dedup na costura: descarta segmentos TOTALMENTE dentro da janela já
     transcrita pelo chunk anterior (o overlap reapresenta esses segundos).
@@ -848,10 +895,16 @@ def drop_overlap_duplicates(
     costura, preferível à perda de conteúdo. Quando os segmentos anteriores
     estão disponíveis, o fim do chunk não prova cobertura: só descarta trechos
     inteiramente representados por segmentos já emitidos.
+
+    0.10.0: com `config` e tempos por palavra, o segmento que atravessa a
+    costura perde as palavras que terminam até `covered_until + 0,2 s` e que
+    caem em fala já emitida (a repetição do overlap); o resto é mantido e o
+    texto é recomposto a partir das palavras que sobraram. Sem tempos por
+    palavra, o segmento atravessando a costura é mantido inteiro, como antes.
     """
-    return [
-        seg for seg in segments
-        if not (
+    kept = []
+    for seg in segments:
+        if (
             seg.start < covered_until_sec
             and seg.end <= covered_until_sec + tolerance_sec
             and (
@@ -859,8 +912,65 @@ def drop_overlap_duplicates(
                 or covered_seconds(covered_segments, seg.start, seg.end)
                 >= seg.end - seg.start - 1e-6
             )
-        )
-    ]
+        ):
+            continue
+        if config is not None and seg.start < covered_until_sec:
+            trimmed = trim_seam_words(seg, covered_until_sec, config, covered_segments, report)
+            if trimmed is None:
+                continue
+            seg = trimmed
+        kept.append(seg)
+    return kept
+
+
+def _time_is_covered(segments: list[Segment] | None, start: float, end: float, slack: float) -> bool:
+    if segments is None:
+        return True
+    middle = (start + end) / 2.0
+    return any(seg.start - slack <= middle <= seg.end + slack for seg in segments)
+
+
+def trim_seam_words(
+    segment: Segment,
+    covered_until_sec: float,
+    config: TranscriptionConfig,
+    covered_segments: list[Segment] | None = None,
+    report: dict | None = None,
+    tolerance_sec: float = SEAM_WORD_TOLERANCE_SEC,
+) -> Segment | None:
+    """Corta do início do segmento as palavras repetidas pelo overlap.
+
+    Só sai a palavra que termina até `covered_until + tolerance` **e** cujo
+    meio cai num segmento já emitido (o chunk anterior de fato a transcreveu).
+    Devolve o segmento (talvez igual), ou None se nada sobrou.
+    """
+    if not segment.words:
+        return segment
+    limit = covered_until_sec + tolerance_sec
+    cut = 0
+    for word_start, word_end, _ in segment.words:
+        if word_end <= limit and _time_is_covered(covered_segments, word_start, word_end, tolerance_sec):
+            cut += 1
+            continue
+        break
+    if cut == 0:
+        return segment
+    remaining = segment.words[cut:]
+    if report is not None:
+        report["words_dropped"] = report.get("words_dropped", 0) + cut
+        report["segments_trimmed"] = report.get("segments_trimmed", 0) + 1
+    raw_text = re.sub(r"\s+", " ", "".join(word for _, _, word in remaining)).strip()
+    text, text_is_suspect = clean_segment_text(raw_text, config) if raw_text else ("", False)
+    if not remaining or _is_empty_text(text):
+        return None
+    return dataclasses.replace(
+        segment,
+        start=remaining[0][0],
+        text=text,
+        raw_text=raw_text,
+        text_is_suspect=text_is_suspect,
+        words=remaining,
+    )
 
 
 def _speaker_label(index: int) -> str:
@@ -1059,11 +1169,78 @@ def build_contextual_initial_prompt(
     config: TranscriptionConfig,
     prompt_tail: str | None = None,
 ) -> str | None:
+    """Prompt base seguido da cauda crua do texto anterior, sem rótulo.
+
+    Até a 0.9.x a cauda vinha depois de "Contexto anterior recente:", e o
+    Whisper às vezes devolvia o rótulo como fala. O conteúdo é o mesmo; só o
+    rótulo saiu.
+    """
     prompt = build_initial_prompt(config)
     if prompt_tail:
-        context = f"Contexto anterior recente: {prompt_tail}"
-        prompt = f"{prompt} {context}".strip() if prompt else context
+        prompt = f"{prompt} {prompt_tail}".strip() if prompt else prompt_tail
     return prompt
+
+
+def _word_spans(text: str) -> list[tuple[str, int, int]]:
+    return [
+        (match.group(0).casefold(), match.start(), match.end())
+        for match in re.finditer(r"\w+", text, flags=re.UNICODE)
+    ]
+
+
+def _longest_prompt_prefix(words: list[str], prompt_words: list[str]) -> int:
+    """Quantas palavras iniciais de `words` repetem um trecho contíguo do prompt."""
+    if not words or not prompt_words:
+        return 0
+    best = 0
+    for start, word in enumerate(prompt_words):
+        if word != words[0]:
+            continue
+        length = 0
+        while (
+            length < len(words)
+            and start + length < len(prompt_words)
+            and prompt_words[start + length] == words[length]
+        ):
+            length += 1
+        best = max(best, length)
+    return best
+
+
+def strip_prompt_echo(
+    text: str,
+    prompt: str | None,
+    check_prefix: bool = True,
+) -> tuple[str, int, bool]:
+    """Remove o rótulo legado e um prefixo que repete o prompt.
+
+    Devolve (texto, palavras do prefixo removidas, algo foi removido). O rótulo
+    "Contexto anterior recente:" sai em qualquer posição; o trecho logo depois
+    dele também é comparado com o prompt. Um prefixo sem rótulo só sai com
+    PROMPT_ECHO_MIN_WORDS palavras seguidas idênticas a um trecho do prompt:
+    preferimos deixar uma repetição a apagar fala real.
+    """
+    removed = False
+    prompt_words = [word for word, _, _ in _word_spans(prompt or "")]
+    pieces = LEGACY_PROMPT_LABEL_RE.split(text)
+    if len(pieces) > 1:
+        removed = True
+    prefix_words_removed = 0
+    cleaned_pieces = []
+    for index, piece in enumerate(pieces):
+        after_label = index > 0
+        if prompt_words and (check_prefix or after_label):
+            spans = _word_spans(piece)
+            matched = _longest_prompt_prefix([word for word, _, _ in spans], prompt_words)
+            if matched >= PROMPT_ECHO_MIN_WORDS or (after_label and matched > 0):
+                piece = piece[spans[matched - 1][2]:]
+                piece = re.sub(r"^[\s.,;:!?…\-–—]+", "", piece)
+                if index == 0:
+                    prefix_words_removed = matched
+                removed = True
+        cleaned_pieces.append(piece.strip())
+    cleaned = " ".join(piece for piece in cleaned_pieces if piece)
+    return re.sub(r"\s+", " ", cleaned).strip(), prefix_words_removed, removed
 
 
 def fit_prompt_tail(prompt_tail: str | None, token_budget: int) -> str | None:
@@ -1072,7 +1249,9 @@ def fit_prompt_tail(prompt_tail: str | None, token_budget: int) -> str | None:
         return None
     words = prompt_tail.split()
     while words:
-        candidate = f"Contexto anterior recente: {' '.join(words)}"
+        # O orçamento ainda desconta o rótulo que saiu do prompt: a cauda fica
+        # idêntica à da 0.9.1 e o A/B de cobertura isola só a remoção do rótulo.
+        candidate = f"{LEGACY_PROMPT_LABEL} {' '.join(words)}"
         if count_prompt_tokens(candidate) <= token_budget:
             return " ".join(words)
         words = words[max(1, len(words) // 8):]
@@ -1109,6 +1288,14 @@ def transcription_kwargs(
     if vad_filter:
         kwargs["vad_parameters"] = VAD_PARAMETERS
     return kwargs
+
+
+def effective_prompt(kwargs: dict) -> str | None:
+    """O texto que o decoder vê: prompt + hotwords (o MlxBackend junta os dois)."""
+    prompt = " ".join(
+        part for part in (kwargs.get("initial_prompt"), kwargs.get("hotwords")) if part
+    ).strip()
+    return prompt or None
 
 
 # ---------------------------------------------------------------------------
@@ -1180,6 +1367,10 @@ class MlxBackend:
                 words=seg.get("words", []),
                 avg_logprob=seg.get("avg_logprob"),
                 no_speech_prob=seg.get("no_speech_prob"),
+                # Temperatura do fallback e razão de compressão: já vêm do
+                # mlx-whisper; a 0.10.0 passa a guardá-las para a marca de suspeita.
+                temperature=seg.get("temperature"),
+                compression_ratio=seg.get("compression_ratio"),
             )
             for seg in result.get("segments", [])
         ]
@@ -1277,27 +1468,140 @@ def detect_track_language(
     return best, {language: round(seconds, 1) for language, seconds in votes.items()}
 
 
+def language_sample_chunks(chunks: list[dict], max_sec: float = LANGUAGE_CHECK_SAMPLE_SEC) -> list[dict]:
+    """Os primeiros blocos de fala da trilha, recortados para somar até max_sec."""
+    sample = []
+    remaining = int(max_sec * SAMPLE_RATE)
+    for chunk_info in chunks:
+        if remaining <= 0:
+            break
+        length = chunk_info["end"] - chunk_info["start"]
+        take = min(length, remaining)
+        sample.append({"start": chunk_info["start"], "end": chunk_info["start"] + take})
+        remaining -= take
+    return sample
+
+
+def check_fixed_language(
+    model,
+    audio: np.ndarray,
+    chunks: list[dict],
+    expected: str,
+    min_share: float = LANGUAGE_CHECK_MIN_SHARE,
+) -> dict:
+    """Com idioma fixo, confere os primeiros 30 s de fala; nunca troca o idioma.
+
+    A confiança é a fração dos segundos votados no idioma vencedor (o
+    mlx-whisper não expõe probabilidade). Divergência só com o vencedor
+    diferente do esperado e ≥ min_share dos votos.
+    """
+    expected_lang = get_lang_config(expected).get("whisper_lang") or expected
+    detected, votes = detect_track_language(model, audio, language_sample_chunks(chunks))
+    result = {"expected": expected_lang, "detected": detected, "votes": votes, "mismatch": False}
+    total = sum(votes.values())
+    if detected and total > 0:
+        share = votes.get(detected, 0.0) / total
+        result["share"] = round(share, 2)
+        result["mismatch"] = bool(detected != expected_lang and share >= min_share)
+    return result
+
+
+def clean_segment_text(raw_text: str, config: TranscriptionConfig) -> tuple[str, bool]:
+    """Correções determinísticas sobre o texto bruto de um segmento."""
+    text = apply_text_replacements(raw_text, config.replacements)
+    text, text_is_suspect = sanitize_intraword_runaways(text)
+    text = collapse_runaway_repetitions(text)
+    text = normalize_laughter(text)
+    text = normalize_known_names(text, config.known_names)
+    return text, text_is_suspect
+
+
+def _is_empty_text(text: str) -> bool:
+    return not text or text in (".", ",", "...", "…")
+
+
+def _optional_float(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _segment_words(seg, base_offset_sec: float) -> list | None:
+    """Palavras do decoder com tempo absoluto; None se faltar algum tempo."""
+    raw_words = getattr(seg, "words", None)
+    if not raw_words:
+        return None
+    words = []
+    for word in raw_words:
+        if isinstance(word, dict):
+            text, start, end = word.get("word"), word.get("start"), word.get("end")
+        else:
+            text = getattr(word, "word", None)
+            start, end = getattr(word, "start", None), getattr(word, "end", None)
+        start, end = _optional_float(start), _optional_float(end)
+        if text is None or start is None or end is None:
+            return None
+        words.append((start + base_offset_sec, end + base_offset_sec, str(text)))
+    return words or None
+
+
+def _drop_leading_word_tokens(words: list, token_count: int) -> list:
+    """Remove palavras do início até somar `token_count` tokens \\w+."""
+    remaining = list(words)
+    dropped = 0
+    while remaining and dropped < token_count:
+        dropped += max(1, len(_word_spans(remaining[0][2])))
+        remaining.pop(0)
+    return remaining
+
+
 def collect_segments(
     raw_segments,
     speaker: str,
     base_offset_sec: float,
     config: TranscriptionConfig,
+    prompt: str | None = None,
+    check_prompt_prefix: bool = True,
+    report: dict | None = None,
 ) -> list[Segment]:
+    """Normaliza os segmentos do decoder para a linha do tempo da sessão.
+
+    Com `prompt`, remove o rótulo legado em qualquer segmento e, no primeiro
+    segmento do bloco (se `check_prompt_prefix`), um prefixo que repete o
+    prompt. Segmentos assim ficam marcados (`prompt_echo_removed`).
+    """
     segments = []
-    for seg in raw_segments:
+    for index, seg in enumerate(raw_segments):
         raw_text = seg.text.strip()
         # Normalize whitespace including verse-like \n that Whisper emits on rhythmic pauses
         raw_text = re.sub(r"\s+", " ", raw_text)
-        text = raw_text
-        text = apply_text_replacements(text, config.replacements)
-        text, text_is_suspect = sanitize_intraword_runaways(text)
-        text = collapse_runaway_repetitions(text)
-        text = normalize_laughter(text)
-        text = normalize_known_names(text, config.known_names)
-        if not text or text in (".", ",", "...", "…"):
+        words = _segment_words(seg, base_offset_sec)
+        start = seg.start + base_offset_sec
+        prompt_echo_removed = False
+        if prompt is not None or LEGACY_PROMPT_LABEL_RE.search(raw_text):
+            stripped, prefix_tokens, prompt_echo_removed = strip_prompt_echo(
+                raw_text, prompt, check_prefix=check_prompt_prefix and index == 0,
+            )
+            if prompt_echo_removed:
+                if report is not None:
+                    report["prompt_echo_removed"] = report.get("prompt_echo_removed", 0) + 1
+                raw_text = stripped
+                if words and prefix_tokens:
+                    words = _drop_leading_word_tokens(words, prefix_tokens) or None
+                    if words:
+                        start = max(start, words[0][0])
+                elif words:
+                    # Rótulo no meio: as palavras não casam mais com o texto.
+                    words = None
+        text, text_is_suspect = clean_segment_text(raw_text, config)
+        if _is_empty_text(text):
             continue
         segments.append(Segment(
-            start=seg.start + base_offset_sec,
+            start=start,
             end=seg.end + base_offset_sec,
             text=text,
             speaker=speaker,
@@ -1305,6 +1609,10 @@ def collect_segments(
             no_speech_prob=getattr(seg, "no_speech_prob", None),
             raw_text=raw_text,
             text_is_suspect=text_is_suspect,
+            words=words,
+            temperature=_optional_float(getattr(seg, "temperature", None)),
+            compression_ratio=_optional_float(getattr(seg, "compression_ratio", None)),
+            prompt_echo_removed=prompt_echo_removed,
         ))
     return segments
 
@@ -1328,6 +1636,8 @@ def transcribe_track(
     language_report: dict | None = None,
     quality_report: dict | None = None,
     chunk_log: list | None = None,
+    untranscribed_log: list | None = None,
+    language_check: dict | None = None,
 ) -> list[Segment]:
     config = config or TranscriptionConfig()
 
@@ -1348,15 +1658,16 @@ def transcribe_track(
         audio_input = audio_path     # passa path direto — evita roundtrip desnecessário
 
     if not chunk_by_silence:
-        raw_segments, info = model.transcribe(
-            audio_input,
-            **transcription_kwargs(config, vad_filter=True),
-        )
+        full_kwargs = transcription_kwargs(config, vad_filter=True)
+        raw_segments, info = model.transcribe(audio_input, **full_kwargs)
 
         if config.language == "auto":
             print(f"    Detected: {info.language} ({info.language_probability:.0%})", flush=True)
 
-        segments = collect_segments(raw_segments, speaker, offset_sec, config)
+        segments = collect_segments(
+            raw_segments, speaker, offset_sec, config,
+            prompt=effective_prompt(full_kwargs), report=quality_report,
+        )
         emit_progress(90 * (progress_base_sec + info.duration) / total_sec)
         print(f"    {len(segments)} segments, {round(info.duration, 1)}s audio", flush=True)
         return segments
@@ -1387,6 +1698,15 @@ def transcribe_track(
             # "sim"/"uhum" por "sí"/"thank you" e desligava o vocabulário.
             config = config_for_language(config, locked_language)
             print(f"    Idioma travado na trilha: {locked_language} (votos: {votes})", flush=True)
+    elif language_check is not None:
+        # Idioma fixo: só confere numa amostra do início e registra divergência.
+        language_check.update(check_fixed_language(model, audio, chunks, config.language))
+        if language_check.get("mismatch"):
+            print(
+                f"    [lang] trilha parece {language_check['detected']} "
+                f"(fixo {config.language}; votos: {language_check['votes']}); idioma mantido",
+                flush=True,
+            )
     track_hotwords = build_hotwords(config)
     # O guarda de cobertura só vale quando há vocabulário do usuário no prompt
     # (glossário, título ou participantes): é o prompt longo que pode pular fala.
@@ -1420,9 +1740,14 @@ def transcribe_track(
         if chunk_log is not None:
             chunk_log.append(chunk_entry)
 
-        if not chunk_has_speech(chunk):
-            # VAD já apontou fala; baixa energia não prova silêncio.
+        speech_sec = chunk_entry["speech_ms"] / 1000.0
+        if speech_sec < LOW_ENERGY_VETO_MAX_SPEECH_SEC and not chunk_has_speech(chunk):
+            # Resíduo curto e sem energia: não vale chamar o modelo. Com fala
+            # VAD suficiente, baixa energia não prova silêncio (voz baixa ou
+            # distante): quem decide é o no_speech_prob do modelo.
             chunk_entry["skipped"] = "low_energy"
+            chunk_entry["skipped_reason"] = "low_energy"
+            chunk_entry["covered_ms"] = 0
             print(
                 f"    chunk {i}/{len(chunks)}: "
                 f"{format_time(start_sample / SAMPLE_RATE)}–{format_time(end_sample / SAMPLE_RATE)} "
@@ -1432,21 +1757,26 @@ def transcribe_track(
             continue
 
         prompt_tail = build_prompt_tail(segments)
-        raw_segments, info = model.transcribe(
-            chunk,
-            **transcription_kwargs(
-                config,
-                vad_filter=False,
-                prompt_tail=prompt_tail,
-                hotwords=track_hotwords,
-            ),
+        chunk_kwargs = transcription_kwargs(
+            config,
+            vad_filter=False,
+            prompt_tail=prompt_tail,
+            hotwords=track_hotwords,
         )
+        raw_segments, info = model.transcribe(chunk, **chunk_kwargs)
         if config.language == "auto":
             detected_languages.append((info.language, info.language_probability))
-        chunk_segments = collect_segments(raw_segments, speaker, chunk_offset_sec, config)
+        # No bloco com overlap o início repete áudio já transcrito; esse
+        # prefixo é tratado pela costura (por palavra), não como eco do prompt.
+        seam_pending = use_overlap and covered_until_sec is not None
+        chunk_segments = collect_segments(
+            raw_segments, speaker, chunk_offset_sec, config,
+            prompt=effective_prompt(chunk_kwargs),
+            check_prompt_prefix=not seam_pending,
+            report=quality_report,
+        )
         chunk_entry["hotwords"] = bool(track_hotwords)
         chunk_entry["prompt_tail_chars"] = len(prompt_tail or "")
-        speech_sec = chunk_entry["speech_ms"] / 1000.0
         covered_sec = covered_seconds(
             chunk_segments,
             chunk_offset_sec,
@@ -1458,16 +1788,18 @@ def transcribe_track(
                 speech_sec >= CHUNK_COVERAGE_MIN_SPEECH_SEC
                 and covered_sec < CHUNK_COVERAGE_MIN_RATIO * speech_sec
             ):
-                retry_raw, _ = model.transcribe(
-                    chunk,
-                    **transcription_kwargs(
-                        config,
-                        vad_filter=False,
-                        prompt_tail=prompt_tail,
-                        include_hotwords=False,
-                    ),
+                retry_kwargs = transcription_kwargs(
+                    config,
+                    vad_filter=False,
+                    prompt_tail=prompt_tail,
+                    include_hotwords=False,
                 )
-                retry_segments = collect_segments(retry_raw, speaker, chunk_offset_sec, config)
+                retry_raw, _ = model.transcribe(chunk, **retry_kwargs)
+                retry_segments = collect_segments(
+                    retry_raw, speaker, chunk_offset_sec, config,
+                    prompt=effective_prompt(retry_kwargs),
+                    check_prompt_prefix=not seam_pending,
+                )
                 retry_covered = covered_seconds(
                     retry_segments,
                     chunk_offset_sec,
@@ -1504,13 +1836,35 @@ def transcribe_track(
             speech_sec >= CHUNK_COVERAGE_MIN_SPEECH_SEC
             and chunk_entry["covered_ms"] < CHUNK_COVERAGE_MIN_RATIO * speech_sec * 1000
         )
-        if use_overlap and covered_until_sec is not None:
+        if not chunk_segments:
+            own_speech_sec = speech_seconds_in_range(islands, start_sample, end_sample)
+            if own_speech_sec >= UNTRANSCRIBED_MIN_SPEECH_SEC:
+                # O modelo não devolveu texto para fala que o VAD viu: o .md
+                # marca o trecho em vez de deixá-lo sumir sem rastro.
+                chunk_entry["skipped_reason"] = "empty_asr"
+                if untranscribed_log is not None:
+                    untranscribed_log.append({
+                        "start_ms": chunk_entry["start_ms"],
+                        "end_ms": chunk_entry["end_ms"],
+                        "speech_ms": int(round(own_speech_sec * 1000)),
+                    })
+        if seam_pending:
             before = len(chunk_segments)
+            seam_report: dict = {}
             chunk_segments = drop_overlap_duplicates(
                 chunk_segments, offset_sec + covered_until_sec,
                 covered_segments=segments,
+                config=config,
+                report=seam_report,
             )
             dropped = before - len(chunk_segments)
+            if quality_report is not None and seam_report.get("words_dropped"):
+                quality_report["seam_words_dropped"] = (
+                    quality_report.get("seam_words_dropped", 0) + seam_report["words_dropped"]
+                )
+                quality_report["seam_segments_trimmed"] = (
+                    quality_report.get("seam_segments_trimmed", 0) + seam_report["segments_trimmed"]
+                )
         else:
             dropped = 0
         chunk_entry["segments"] = len(chunk_segments)
@@ -1557,7 +1911,10 @@ def confidence_from_logprob(avg_logprob: float | None) -> float:
 
 
 def segment_is_suspect(segment: Segment) -> bool:
+    """Suspeita do turno no .jsonl/.analysis.jsonl (critério de sempre + eco do prompt)."""
     if segment.text_is_suspect:
+        return True
+    if segment.prompt_echo_removed:
         return True
     if segment.avg_logprob is not None and segment.avg_logprob < -0.8:
         return True
@@ -1566,6 +1923,26 @@ def segment_is_suspect(segment: Segment) -> bool:
     duration = segment.end - segment.start
     quality_text = segment.raw_text if segment.raw_text is not None else segment.text
     if duration > 0 and len(quality_text) / duration > TEXT_DENSITY_SUSPECT_CHARS_PER_SEC:
+        return True
+    return False
+
+
+def segment_marked_suspect(segment: Segment) -> bool:
+    """Marca "⚠ suspeito" do .md (0.10.0): por segmento, só com sinal do decoder.
+
+    avg_logprob < -0,8, fallback de temperatura (> 0), razão de compressão
+    > 2,4, no_speech ≥ 0,6, ou prefixo de prompt removido. Texto saneado já
+    aparece como [inaudível] e não precisa de outra marca.
+    """
+    if segment.prompt_echo_removed:
+        return True
+    if segment.avg_logprob is not None and segment.avg_logprob < SUSPECT_LOGPROB:
+        return True
+    if segment.temperature is not None and segment.temperature > 0:
+        return True
+    if segment.compression_ratio is not None and segment.compression_ratio > SUSPECT_COMPRESSION_RATIO:
+        return True
+    if segment.no_speech_prob is not None and segment.no_speech_prob >= SUSPECT_NO_SPEECH:
         return True
     return False
 
@@ -1661,6 +2038,9 @@ def split_long_segment(segment: Segment, max_duration_s: float) -> list[Segment]
             no_speech_prob=segment.no_speech_prob,
             raw_text=raw_parts[index] if index < len(raw_parts) else None,
             text_is_suspect=segment.text_is_suspect or text_part == "[inaudível]",
+            temperature=segment.temperature,
+            compression_ratio=segment.compression_ratio,
+            prompt_echo_removed=segment.prompt_echo_removed,
         ))
     return split_segments
 
@@ -1677,6 +2057,8 @@ def turn_from_segments(segments: list[Segment]) -> Turn:
         for seg, is_suspect in zip(segments, segment_suspicions)
     ])
     is_suspect = any(segment_suspicions) or (confidence != -1.0 and confidence < 0.6)
+    temperatures = [seg.temperature for seg in segments if seg.temperature is not None]
+    ratios = [seg.compression_ratio for seg in segments if seg.compression_ratio is not None]
     return Turn(
         speaker=segments[0].speaker or "Áudio",
         text=text,
@@ -1687,6 +2069,13 @@ def turn_from_segments(segments: list[Segment]) -> Turn:
         raw_text=raw_text if raw_text != text else None,
         safe_text=safe_text if safe_text != text else None,
         track=infer_track_from_speaker(segments[0].speaker or "Áudio"),
+        parts=[
+            (seg.text, safe_text_for_segment(seg, seg_suspect), segment_marked_suspect(seg))
+            for seg, seg_suspect in zip(segments, segment_suspicions)
+        ],
+        prompt_echo_removed=any(seg.prompt_echo_removed for seg in segments),
+        temperature=max(temperatures) if temperatures else None,
+        compression_ratio=max(ratios) if ratios else None,
     )
 
 
@@ -1784,6 +2173,21 @@ def build_meeting_meta(
     return meta
 
 
+def mark_echo_turns(turns: list[Turn]) -> float | None:
+    """Marca turnos do mic que repetem a trilha do sistema; não apaga texto.
+
+    Devolve a fração das palavras do mic em turnos marcados (None sem mic).
+    """
+    rows = [
+        (turn.track or infer_track_from_speaker(turn.speaker), turn.start_ms, turn.end_ms, turn.text)
+        for turn in turns
+    ]
+    flags = signals.echo_flags(rows)
+    for turn, flagged in zip(turns, flags):
+        turn.echo_of_system = bool(flagged)
+    return signals.echo_word_share(rows, flags)
+
+
 def apply_speaker_map(turns: list[Turn], speaker_map: dict[str, str]) -> None:
     for turn in turns:
         turn.speaker = speaker_map.get(turn.speaker, turn.speaker)
@@ -1815,6 +2219,8 @@ def quality_flags_for_turn(turn: Turn, text: str, raw_text: str, safe_text: str)
         flags.append("remote_clustered")
     if turn.track == "system" and turn.speaker != "Interlocutor" and not turn.speaker.startswith("Remote_"):
         flags.append("remote_named")
+    if turn.prompt_echo_removed:
+        flags.append("prompt_echo_removed")
     return flags
 
 
@@ -1857,6 +2263,13 @@ def build_analysis_jsonl(
             "is_suspect": turn.is_suspect,
             "quality_flags": quality_flags_for_turn(turn, text, raw_text, safe_text),
         }
+        # Campos opcionais da 0.10.0: só aparecem quando há o dado.
+        if turn.echo_of_system:
+            record["echo_of_system"] = True
+        if turn.temperature is not None:
+            record["temperature"] = turn.temperature
+        if turn.compression_ratio is not None:
+            record["compression_ratio"] = round(turn.compression_ratio, 3)
         lines.append(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
     for track, entries in (chunks or {}).items():
         for entry in entries:
@@ -1935,7 +2348,7 @@ def build_llm_package(meta: dict, jsonl_text: str) -> str:
         f"# Transcrição de reunião: {meta['title']}",
         "",
         f"- **Data:** {meta['date']}",
-        f"- **Duração:** {format_time(meta['duration_ms'] / 1000.0)}",
+        f"- **Duração:** {format_time((meta.get('audio_duration_ms') or meta['duration_ms']) / 1000.0)}",
         f"- **Participantes (labels):** {speakers}",
         f"- **Idioma:** {meta['language']}",
         "",
@@ -1959,6 +2372,44 @@ def build_llm_package(meta: dict, jsonl_text: str) -> str:
     return "\n".join(lines)
 
 
+SUSPECT_MARK = " ⚠ suspeito"
+ECHO_LABEL_PREFIX = "(eco provável) "
+
+
+def turn_markdown_text(turn: Turn, sanitize_suspect: bool = True) -> str:
+    """Texto do turno no .md, com "⚠ suspeito" por segmento quando há `parts`.
+
+    Turno sem `parts` (construído por fora do pipeline) mantém o formato
+    antigo: marca única no fim quando `is_suspect`.
+    """
+    if not turn.parts:
+        text = turn_output_text(turn, sanitize_suspect=sanitize_suspect)
+        return f"{text}{SUSPECT_MARK}" if turn.is_suspect else text
+    if not sanitize_suspect and turn.raw_text:
+        # --no-sanitize (depuração): texto bruto do turno, marca única no fim.
+        marked_any = any(marked for _, _, marked in turn.parts)
+        return f"{turn.raw_text}{SUSPECT_MARK}" if marked_any else turn.raw_text
+    use_safe = sanitize_suspect and turn.is_suspect
+    pieces: list[str] = []
+    pending_mark = False
+    for shown, safe, marked in turn.parts:
+        piece = (safe if use_safe else shown).strip()
+        if not piece:
+            continue
+        if pending_mark and not marked:
+            pieces[-1] = pieces[-1] + SUSPECT_MARK
+            pending_mark = False
+        pieces.append(piece)
+        pending_mark = pending_mark or marked
+    if pending_mark and pieces:
+        pieces[-1] = pieces[-1] + SUSPECT_MARK
+    return compact_inaudible_markers(" ".join(pieces))
+
+
+def untranscribed_marker(speech_ms: int) -> str:
+    return f"[sem texto {max(1, int(speech_ms // 1000))} s]"
+
+
 def build_markdown(
     title: str,
     turns: list[Turn],
@@ -1970,9 +2421,22 @@ def build_markdown(
     recorded_at: str | None = None,
     language_detected: dict | None = None,
     calendar_event: dict | None = None,
+    audio_duration_ms: int | None = None,
+    untranscribed: list[dict] | None = None,
+    confidence_box: list[str] | None = None,
 ) -> str:
+    """Markdown legível; os campos da 0.10.0 são opcionais.
+
+    Sem `audio_duration_ms`, a "Duração" continua sendo o fim do último turno;
+    `untranscribed` ([{track, start_ms, speech_ms}]) vira "[sem texto N s]" na
+    posição do bloco; `confidence_box` (linhas prontas) entra logo abaixo do
+    cabeçalho.
+    """
     now = datetime.now().astimezone()
-    duration = max((turn.end_ms for turn in turns), default=0) / 1000.0
+    if audio_duration_ms:
+        duration = audio_duration_ms / 1000.0
+    else:
+        duration = max((turn.end_ms for turn in turns), default=0) / 1000.0
     lang_label = {"pt": "PT-BR", "en": "EN", "auto": "auto-detect"}.get(language, language)
     if language == "auto" and language_detected:
         detected = ", ".join(
@@ -2001,6 +2465,8 @@ def build_markdown(
         if attendees:
             # Convite não prova presença nem autoria de fala.
             lines.append(f"**Convidados (convite, não confirma presença):** {', '.join(attendees)}")
+    if confidence_box:
+        lines.extend(["", *confidence_box])
     lines.extend(["", "---", ""])
     if capture_integrity == "degraded":
         lines.extend([
@@ -2008,16 +2474,225 @@ def build_markdown(
             *[f"> - {issue}" for issue in (capture_issues or [])],
             "",
         ])
-    for turn in turns:
-        ts = format_time(turn.start_ms / 1000.0)
-        suspect = " ⚠ suspeito" if turn.is_suspect else ""
-        text = turn_output_text(turn, sanitize_suspect=sanitize_suspect)
-        lines.append(
-            f"**{turn.speaker}:** [{ts}] {text}{suspect}"
-            if dual_track else f"[{ts}] {text}{suspect}"
-        )
+
+    entries: list[tuple[int, int, object]] = [(turn.start_ms, 0, turn) for turn in turns]
+    entries.extend((int(marker["start_ms"]), 1, marker) for marker in (untranscribed or []))
+    entries.sort(key=lambda item: (item[0], item[1]))
+    for start_ms, _, item in entries:
+        ts = format_time(start_ms / 1000.0)
+        if isinstance(item, Turn):
+            label = f"{ECHO_LABEL_PREFIX}{item.speaker}" if item.echo_of_system else item.speaker
+            text = turn_markdown_text(item, sanitize_suspect=sanitize_suspect)
+        else:
+            label = "Você" if item.get("track") == "mic" else "Interlocutor"
+            text = untranscribed_marker(item.get("speech_ms", 0))
+        lines.append(f"**{label}:** [{ts}] {text}" if dual_track else f"[{ts}] {text}")
         lines.append("")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Caixa de confiança (0.10.0)
+# ---------------------------------------------------------------------------
+
+CAPTURE_LOSS_TRACKS = ("mic", "system")
+CAPTURE_LOSS_KINDS = ("start", "gap", "end")
+_TRACK_LABEL = {"mic": "mic", "system": "sistema"}
+_KIND_LABEL = {"start": "no início", "gap": "no meio", "end": "no fim"}
+CONFIDENCE_BOX_MAX_ITEMS = 6
+
+
+def parse_capture_loss(value: str) -> dict:
+    """`<track>:<kind>:<atS>:<durS>` → {track, kind, at_s, dur_s} (erro claro, exit 2)."""
+    parts = value.split(":")
+    if len(parts) != 4:
+        raise argparse.ArgumentTypeError(
+            f"--capture-loss inválido: {value!r}; use <track>:<kind>:<atS>:<durS>, "
+            "ex.: mic:start:0.0:6.7"
+        )
+    track, kind, at_raw, dur_raw = (part.strip() for part in parts)
+    if track not in CAPTURE_LOSS_TRACKS:
+        raise argparse.ArgumentTypeError(
+            f"--capture-loss inválido: trilha {track!r}; use {' ou '.join(CAPTURE_LOSS_TRACKS)}"
+        )
+    if kind not in CAPTURE_LOSS_KINDS:
+        raise argparse.ArgumentTypeError(
+            f"--capture-loss inválido: tipo {kind!r}; use {', '.join(CAPTURE_LOSS_KINDS)}"
+        )
+    try:
+        at_s, dur_s = float(at_raw), float(dur_raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--capture-loss inválido: {value!r}; atS e durS devem ser números em segundos"
+        ) from None
+    # durS = 0 é aceito: o app formata com uma casa (%.1f), e uma perda < 0,05 s
+    # chega como "0.0"; recusar derrubaria a transcrição inteira por arredondamento.
+    if not (math.isfinite(at_s) and math.isfinite(dur_s)) or at_s < 0 or dur_s < 0:
+        raise argparse.ArgumentTypeError(
+            f"--capture-loss inválido: {value!r}; atS ≥ 0 e durS ≥ 0"
+        )
+    return {"track": track, "kind": kind, "at_s": at_s, "dur_s": dur_s}
+
+
+def format_duration_label(seconds: float) -> str:
+    """6,7 → "6 s"; 95 → "1 min 35 s"; < 1 s → "<1 s" (piso, como o mm:ss)."""
+    if seconds < 1:
+        return "<1 s"
+    total = int(math.floor(seconds))
+    if total < 60:
+        return f"{total} s"
+    minutes, rest = divmod(total, 60)
+    return f"{minutes} min {rest} s" if rest else f"{minutes} min"
+
+
+def _limited(items: list[str], limit: int = CONFIDENCE_BOX_MAX_ITEMS) -> list[str]:
+    if len(items) <= limit:
+        return items
+    return [*items[:limit], f"+{len(items) - limit}"]
+
+
+def describe_capture_loss(interval: dict) -> str:
+    start = interval["at_s"]
+    end = start + interval["dur_s"]
+    return (
+        f"{_TRACK_LABEL[interval['track']]} {format_duration_label(interval['dur_s'])} "
+        f"{_KIND_LABEL[interval['kind']]} ({format_time(start)}–{format_time(end)})"
+    )
+
+
+def text_share_marked(turns: list[Turn]) -> float:
+    """Fração das palavras com a marca de suspeita do .md."""
+    total = 0
+    marked = 0
+    for turn in turns:
+        if turn.parts:
+            for shown, _, flagged in turn.parts:
+                count = len(signals.tokens(shown))
+                total += count
+                if flagged:
+                    marked += count
+        else:
+            count = len(signals.tokens(turn.text))
+            total += count
+            if turn.is_suspect:
+                marked += count
+    return marked / total if total else 0.0
+
+
+def _percent(share: float) -> str:
+    value = share * 100
+    if 0 < value < 1:
+        return "<1%"
+    return f"{int(round(value))}%"
+
+
+def build_confidence_box(
+    turns: list[Turn],
+    dual_track: bool,
+    tracks: str,
+    capture_integrity: str = "unknown",
+    loss_intervals: list[dict] | None = None,
+    untranscribed: list[dict] | None = None,
+    language: str = "pt",
+    language_checks: dict | None = None,
+    language_detected: dict | None = None,
+    echo_share: float | None = None,
+    quality_reports: dict | None = None,
+) -> list[str]:
+    """As 3 linhas do topo do .md, ou [] quando não há nada a dizer.
+
+    A caixa some só quando a captura não é `degraded` e todos os sinais estão
+    vazios: sem lacunas, sem fala sem texto, sem divergência de idioma, eco 0%,
+    baixa confiança abaixo de 5% e nada reprocessado ou removido.
+    """
+    loss_intervals = loss_intervals or []
+    untranscribed = untranscribed or []
+    language_checks = language_checks or {}
+    quality_reports = quality_reports or {}
+    low_share = text_share_marked(turns)
+    retries_used = sum(report.get("coverage_retries_used", 0) for report in quality_reports.values())
+    removed = sum(
+        report.get("prompt_echo_removed", 0) + report.get("seam_segments_trimmed", 0)
+        for report in quality_reports.values()
+    )
+    mismatches = {
+        track: check for track, check in sorted(language_checks.items()) if check.get("mismatch")
+    }
+    has_signal = any((
+        capture_integrity == "degraded",
+        loss_intervals,
+        untranscribed,
+        mismatches,
+        bool(echo_share),
+        low_share >= CONFIDENCE_BOX_LOW_CONFIDENCE_SHARE,
+        retries_used,
+        removed,
+    ))
+    if not has_signal:
+        return []
+
+    if dual_track:
+        remote_labels = sorted({
+            turn.speaker for turn in turns
+            if (turn.track or infer_track_from_speaker(turn.speaker)) == "system"
+            and turn.speaker != "Interlocutor"
+        })
+        if remote_labels:
+            remotes = f"Remotos = áudio do sistema (separação automática por voz, {len(remote_labels)} rótulos)"
+        else:
+            remotes = "Remotos (não separados) = áudio do sistema"
+        speakers = f"Você = microfone; {remotes}"
+        if echo_share is not None:
+            speakers += f' · eco provável: {_percent(echo_share)} das palavras de "Você"'
+    else:
+        source = "microfone" if tracks == "mic" else "áudio do sistema"
+        speakers = f"trilha única ({source}), sem separação de falantes"
+
+    if loss_intervals:
+        ordered = sorted(loss_intervals, key=lambda item: (item["at_s"], item["track"]))
+        capture = ", ".join(_limited([describe_capture_loss(item) for item in ordered]))
+    elif capture_integrity == "complete":
+        capture = "captura sem lacunas medidas"
+    elif capture_integrity == "degraded":
+        capture = "captura parcial (ver aviso abaixo)"
+    else:
+        capture = "captura não medida"
+    if untranscribed:
+        ordered_markers = sorted(untranscribed, key=lambda item: item["start_ms"])
+        total_sec = sum(item.get("speech_ms", 0) for item in ordered_markers) / 1000.0
+        positions = ", ".join(_limited([format_time(item["start_ms"] / 1000.0) for item in ordered_markers]))
+        count = len(ordered_markers)
+        silent = (
+            f"fala sem texto: {format_duration_label(total_sec)} em {count} "
+            f"{'trecho' if count == 1 else 'trechos'} ({positions})"
+        )
+    else:
+        silent = "fala sem texto: nenhuma"
+    if language == "auto":
+        detected = ", ".join(
+            f"{_TRACK_LABEL.get(track, track)} {value or '?'}"
+            for track, value in sorted((language_detected or {}).items())
+        )
+        idiom = f"idioma: detecção automática ({detected})" if detected else "idioma: detecção automática"
+    elif mismatches:
+        idiom = "idioma: " + ", ".join(
+            f"{_TRACK_LABEL.get(track, track)} parece {check.get('detected')} (fixo {check.get('expected')})"
+            for track, check in mismatches.items()
+        )
+    elif language_checks:
+        idiom = "idioma: sem divergência"
+    else:
+        idiom = "idioma: não verificado"
+
+    return [
+        f"> Confiança: falantes: {speakers}",
+        f"> Lacunas: {capture}; {silent} · {idiom}",
+        (
+            f"> Qualidade: {_percent(low_share)} do texto com baixa confiança"
+            f" · trechos reprocessados sem vocabulário: {retries_used}"
+            f" · prompt/duplicação removidos: {removed}"
+        ),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -2080,8 +2755,33 @@ def output_stem(
 
 
 def format_time(seconds: float) -> str:
-    s = int(seconds)
+    """mm:ss com piso nos segundos; negativo vira "-mm:ss" (nunca "-1:57").
+
+    A linha do tempo normalizada (0.10.0) não produz negativos; o sinal fica
+    visível se algum chegar aqui, em vez de virar um horário plausível.
+    """
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        return "00:00"
+    if not math.isfinite(value):
+        return "00:00"
+    if value < 0:
+        magnitude = math.floor(-value)
+        return f"-{magnitude // 60:02d}:{magnitude % 60:02d}" if magnitude else "00:00"
+    s = math.floor(value)
     return f"{s // 60:02d}:{s % 60:02d}"
+
+
+def normalize_track_offsets(mic_offset_sec: float, sys_offset_sec: float) -> tuple[float, float, float]:
+    """Linha do tempo única: origem na trilha que começou primeiro.
+
+    t0 = min(0, offset do sistema, offset do mic); os dois offsets passam a
+    ser medidos a partir de t0, então nenhum tempo de turno fica negativo.
+    Devolve (offset do mic, offset do sistema, t0), em segundos.
+    """
+    t0 = min(0.0, sys_offset_sec, mic_offset_sec)
+    return mic_offset_sec - t0, sys_offset_sec - t0, t0
 
 
 def validate_audio_inputs(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -2167,6 +2867,14 @@ def main() -> None:
     parser.add_argument(
         "--capture-issue", action="append", default=[],
         help="Limitação observada da captura (pode repetir)",
+    )
+    parser.add_argument(
+        "--capture-loss", action="append", type=parse_capture_loss, default=[],
+        metavar="TRACK:KIND:AT_S:DUR_S",
+        help=(
+            "Perda medida pelo app (pode repetir): track mic|system, kind start|gap|end, "
+            "início e duração em segundos desde o clique em Gravar. Ex.: mic:start:0.0:6.7"
+        ),
     )
     parser.add_argument(
         "--backend", default="mlx", choices=["mlx", "faster-whisper"],
@@ -2377,17 +3085,27 @@ def main() -> None:
 
     segments: list[Segment] = []
     dual_track = bool(args.mic and args.system)
-    sys_offset_sec = args.sys_offset / 1000.0
+    # Linha do tempo única (0.10.0): a origem é a trilha que começou primeiro,
+    # então nenhum turno fica com tempo negativo quando o sistema começou antes.
+    mic_offset_sec, sys_offset_sec, _timeline_t0 = normalize_track_offsets(
+        args.mic_offset / 1000.0 if args.mic else 0.0,   # --mic-offset: compat retroativa
+        args.sys_offset / 1000.0 if args.system else 0.0,
+    )
     language_reports: dict[str, dict] = {}
     quality_reports: dict[str, dict] = {}
     chunk_logs: dict[str, list[dict]] = {}
+    untranscribed_logs: dict[str, list[dict]] = {}
+    language_checks: dict[str, dict] = {}
+    check_language = args.language != "auto"
 
     if args.mic:
-        mic_offset_sec = args.mic_offset / 1000.0   # compat retroativa
         speaker = "Você" if dual_track else ""
         language_reports["mic"] = {}
         quality_reports["mic"] = {}
         chunk_logs["mic"] = []
+        untranscribed_logs["mic"] = []
+        if check_language:
+            language_checks["mic"] = {}
         segments.extend(transcribe_track(
             args.mic, speaker, model,
             config=config,
@@ -2401,6 +3119,8 @@ def main() -> None:
             language_report=language_reports["mic"],
             quality_report=quality_reports["mic"],
             chunk_log=chunk_logs["mic"],
+            untranscribed_log=untranscribed_logs["mic"],
+            language_check=language_checks.get("mic"),
         ))
         _mem("mic-track-done", args.profile_memory)
 
@@ -2409,6 +3129,9 @@ def main() -> None:
         language_reports["system"] = {}
         quality_reports["system"] = {}
         chunk_logs["system"] = []
+        untranscribed_logs["system"] = []
+        if check_language:
+            language_checks["system"] = {}
         segments.extend(transcribe_track(
             args.system, speaker, model,
             config=config,
@@ -2422,6 +3145,8 @@ def main() -> None:
             language_report=language_reports["system"],
             quality_report=quality_reports["system"],
             chunk_log=chunk_logs["system"],
+            untranscribed_log=untranscribed_logs["system"],
+            language_check=language_checks.get("system"),
         ))
         _mem("system-track-done", args.profile_memory)
 
@@ -2448,8 +3173,9 @@ def main() -> None:
         if args.participant:
             calendar_event["attendees_expected"] = list(args.participant)
 
+    # Duração sobre as trilhas já na linha do tempo normalizada.
     audio_duration_ms = int(round(max(
-        mic_duration_sec,
+        (mic_duration_sec + mic_offset_sec) if args.mic else 0.0,
         (system_duration_sec + sys_offset_sec) if args.system else 0.0,
     ) * 1000))
 
@@ -2471,6 +3197,7 @@ def main() -> None:
                 print(f"  Trimmed {trimmed} system segment(s) after mic end ({format_time(mic_end)})", flush=True)
 
     turns = consolidate_turns(segments, max_turn_duration_s=args.max_turn_duration)
+    echo_share = mark_echo_turns(turns) if dual_track else None
     emit_progress(95)
 
     if args.speaker_map:
@@ -2497,16 +3224,29 @@ def main() -> None:
         calendar_event=calendar_event,
         audio_duration_ms=audio_duration_ms,
         track_offsets_ms={
-            track: offset
+            track: round(offset * 1000.0, 3)
             for track, offset, path in (
-                ("mic", args.mic_offset, args.mic),
-                ("system", args.sys_offset, args.system),
+                ("mic", mic_offset_sec, args.mic),
+                ("system", sys_offset_sec, args.system),
             )
             if path
         },
     )
     if vocabulary_status:
         meta["vocabulary"] = vocabulary_status
+    if args.capture_loss:
+        meta["loss_intervals"] = list(args.capture_loss)
+    for track, check in language_checks.items():
+        if check:
+            quality_reports.setdefault(track, {})["language_check"] = check
+    ran_checks = {track: check for track, check in language_checks.items() if check}
+    if ran_checks:
+        meta["lang_mismatch"] = any(check.get("mismatch") for check in ran_checks.values())
+    untranscribed = [
+        {"track": track, **marker}
+        for track, markers in untranscribed_logs.items()
+        for marker in markers
+    ]
     diagnostics = {track: report for track, report in quality_reports.items() if report}
     if diagnostics:
         meta["transcription_diagnostics"] = diagnostics
@@ -2553,6 +3293,21 @@ def main() -> None:
                 recorded_at=args.recorded_at,
                 language_detected=language_detected,
                 calendar_event=calendar_event,
+                audio_duration_ms=audio_duration_ms,
+                untranscribed=untranscribed,
+                confidence_box=build_confidence_box(
+                    turns,
+                    dual_track=dual_track,
+                    tracks=meta["tracks"],
+                    capture_integrity=args.capture_integrity,
+                    loss_intervals=args.capture_loss,
+                    untranscribed=untranscribed,
+                    language=args.language,
+                    language_checks=ran_checks,
+                    language_detected=language_detected,
+                    echo_share=echo_share,
+                    quality_reports=quality_reports,
+                ),
             ),
         )
         output_paths.append(md_path)

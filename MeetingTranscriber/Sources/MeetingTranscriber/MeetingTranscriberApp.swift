@@ -29,6 +29,8 @@ struct MeetingTranscriberApp: App {
             switch appState.appIndicator {
             case .error:
                 Image(nsImage: AppIndicatorImage.logoWithErrorBadge())
+            case .attention:
+                Image(nsImage: AppIndicatorImage.logoWithErrorBadge(color: .systemOrange))
             case .recording:
                 Image(systemName: "record.circle.fill")
                     .symbolRenderingMode(.hierarchical)

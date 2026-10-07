@@ -18,6 +18,9 @@ final class SystemAudioRecorder: @unchecked Sendable {
         delegate.recordStreamStopError(error)
     }
 
+    /// Fecha a medição do fim: tempo desde o último callback até o stop.
+    func markStopped() { delegate.markStopped() }
+
     init(
         stagingDirectory: URL? = nil,
         stagingFileName: String = "system.inprogress.wav",
@@ -36,7 +39,10 @@ final class SystemAudioRecorder: @unchecked Sendable {
         self.delegate = SysDelegate(writer: writer)
     }
 
-    func start() async throws {
+    /// `sessionStartUptime`: instante do clique em Gravar, para o atraso do 1º
+    /// callback ser medido contra o mesmo zero do microfone.
+    func start(sessionStartUptime: TimeInterval? = nil) async throws {
+        delegate.markStarted(at: sessionStartUptime)
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
         guard let display = content.displays.first else {
             throw NSError(domain: "SystemAudioRecorder", code: 1,
@@ -67,6 +73,7 @@ final class SystemAudioRecorder: @unchecked Sendable {
         // OS tears it down after dropped frames). That's a signal, not a reason to
         // discard whatever the writer already buffered — best-effort stop, then
         // always try to save.
+        delegate.markStopped()
         do {
             try await stream?.stopCapture()
         } catch {
@@ -99,6 +106,10 @@ private final class SysDelegate: NSObject, SCStreamOutput, SCStreamDelegate, @un
     private var insertedSilenceByteCount: UInt32 = 0
     private var dropouts = AudioLossTally()
     private var cappedGapCount: UInt64 = 0
+    private var startedAtUptime: TimeInterval?
+    private var lastReceivedUptime: TimeInterval?
+    private var initialAudioDelaySeconds: TimeInterval?
+    private var trailingSilenceSeconds: TimeInterval?
 
     var firstBufferHostTime: UInt64? { lock.withLock { firstBufferHostTimeStorage } }
     var firstBufferPresentationTime: CMTime? { lock.withLock { firstBufferPresentationTimeStorage } }
@@ -119,7 +130,9 @@ private final class SysDelegate: NSObject, SCStreamOutput, SCStreamDelegate, @un
                 processingErrorDescription: processingErrorDescription,
                 insertedSilenceByteCount: insertedSilenceByteCount,
                 cappedGapCount: cappedGapCount,
-                dropouts: dropouts
+                initialAudioDelaySeconds: initialAudioDelaySeconds,
+                dropouts: dropouts,
+                trailingSilenceSeconds: trailingSilenceSeconds
             )
         }
     }
@@ -209,8 +222,26 @@ private final class SysDelegate: NSObject, SCStreamOutput, SCStreamDelegate, @un
         }
     }
 
+    func markStarted(at uptime: TimeInterval?) {
+        lock.withLock { startedAtUptime = uptime ?? ProcessInfo.processInfo.systemUptime }
+    }
+
+    /// No sistema o silêncio legítimo continua chegando como callbacks com zeros;
+    /// o fim "perdido" é o tempo sem nenhum callback antes do stop.
+    func markStopped() {
+        lock.withLock {
+            guard trailingSilenceSeconds == nil, let last = lastReceivedUptime else { return }
+            trailingSilenceSeconds = max(0, ProcessInfo.processInfo.systemUptime - last)
+        }
+    }
+
     private func recordReceivedBuffer(presentationTime: CMTime) {
         lock.withLock {
+            let now = ProcessInfo.processInfo.systemUptime
+            if initialAudioDelaySeconds == nil, let started = startedAtUptime {
+                initialAudioDelaySeconds = max(0, now - started)
+            }
+            lastReceivedUptime = now
             if firstBufferPresentationTimeStorage == nil {
                 firstBufferPresentationTimeStorage = presentationTime
             }
@@ -235,7 +266,12 @@ private final class SysDelegate: NSObject, SCStreamOutput, SCStreamDelegate, @un
             guard writer.appendSilence(byteCount: gap.byteCount) else { return }
             lock.withLock {
                 insertedSilenceByteCount &+= UInt32(gap.byteCount)
-                dropouts.add(seconds: Double(gap.byteCount) / Double(PCMGapFiller.bytesPerSecond))
+                let gapSeconds = Double(gap.byteCount) / Double(PCMGapFiller.bytesPerSecond)
+                let now = ProcessInfo.processInfo.systemUptime
+                dropouts.add(
+                    seconds: gapSeconds,
+                    atSeconds: startedAtUptime.map { max(0, now - $0 - gapSeconds) }
+                )
                 if gap.wasCapped {
                     cappedGapCount &+= 1
                     if processingErrorDescription == nil {
