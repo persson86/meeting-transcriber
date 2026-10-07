@@ -16,6 +16,13 @@ import ObjCExceptionCatcher
 ///   notificação, e só áudio novo conta como recuperação (`MicRecoveryPlanner`);
 /// - as transições vão para um diário curto que acaba no manifest.
 ///
+/// v1.7, depois de 7/7 sessões `degraded` na 1.6.1: um único controle de
+/// recuperação (`MicRecoveryPlanner`). Notificações de configuração não têm mais
+/// orçamento próprio de rearmes; elas pedem ao planner, que aplica o mesmo
+/// backoff do watchdog. O microfone não troca mais sozinho para outro dispositivo
+/// por falta de sinal: o fallback para Bluetooth gerava dezenas de rearmes e
+/// eco. As interrupções são medidas em segundos (`AudioLossTally`).
+///
 /// O rearme reaproveita o mesmo engine: um engine novo criado durante o voice
 /// processing de outro processo grava zeros (reprovado em hardware no v1.5-wip).
 final class MicRecorder: @unchecked Sendable {
@@ -42,12 +49,6 @@ final class MicRecorder: @unchecked Sendable {
     private var configuredInputFormat: AVAudioFormat?
     private var lastManualRecoveryAtUptime: TimeInterval?
     static let manualRecoveryCooldown: TimeInterval = 3
-    /// Rearmes por notificação na janela recente: o teto e o backoff do planner
-    /// valem para o watchdog; notificações têm limite próprio, contra laço de
-    /// rearme que gera nova notificação.
-    private var configRearmTimes: [TimeInterval] = []
-    static let configRearmWindow: TimeInterval = 60
-    static let maxConfigRearmsPerWindow = 8
 
     // Protegidos por healthLock (o tap escreve de outra thread).
     private var firstBufferHostTime: UInt64?
@@ -59,6 +60,9 @@ final class MicRecorder: @unchecked Sendable {
     private var lastSignalUptime: TimeInterval?
     private var firstSignalHostTime: UInt64?
     private var lastSignalHostTime: UInt64?
+    private var lastSignalByteCount = 0
+    private var dropouts = AudioLossTally()
+    private var trailingSilenceSeconds: TimeInterval?
     private var initialAudioDelaySeconds: TimeInterval?
     private var lastSuccessfulWriteHostTime: UInt64?
     private var lastSuccessfulWriteByteCount: Int = 0
@@ -108,6 +112,8 @@ final class MicRecorder: @unchecked Sendable {
                 lastSignalHostTime: lastSignalHostTime,
                 recoveryPending: awaitingAudioAfterAttempt,
                 initialAudioDelaySeconds: initialAudioDelaySeconds,
+                dropouts: dropouts,
+                trailingSilenceSeconds: trailingSilenceSeconds,
                 events: eventLog.lines
             )
         }
@@ -181,6 +187,10 @@ final class MicRecorder: @unchecked Sendable {
             // Fecha a conta de um rearme cujo áudio voltou depois do último tick.
             _ = beginTapGeneration()
             reconcileRecoveredAudio()
+            let stoppedAt = Self.uptime()
+            healthLock.withLock {
+                trailingSilenceSeconds = max(0, stoppedAt - (lastSignalUptime ?? startedAtUptime))
+            }
             active = false
             watchdog?.cancel()
             watchdog = nil
@@ -378,13 +388,12 @@ final class MicRecorder: @unchecked Sendable {
                     self.note("configuração já aplicada; engine continua rodando")
                     return
                 }
-                let now = Self.uptime()
-                self.configRearmTimes = self.configRearmTimes.filter { now - $0 < Self.configRearmWindow }
-                guard self.configRearmTimes.count < Self.maxConfigRearmsPerWindow else {
-                    self.note("notificações em excesso; rearme fica com o watchdog")
+                // Mesmo controle do watchdog: a primeira tentativa do episódio é
+                // imediata; as seguintes esperam o backoff, para a rota assentar.
+                guard self.planner.allowsConfigurationAttempt(now: Self.uptime()) else {
+                    self.note("rearme recente; o watchdog decide a próxima tentativa")
                     return
                 }
-                self.configRearmTimes.append(now)
                 self.rearm(reason: reason)
             }
         }
@@ -403,19 +412,6 @@ final class MicRecorder: @unchecked Sendable {
         note("rearme (\(reason)), tentativa \(planner.attemptsInEpisode); engine rodando=\(running)")
         do {
             pinnedDevice = resolveDevice(previous: pinnedDevice)
-            let lastSignal = healthLock.withLock { lastSignalUptime }
-            let signalIsStalled = MicRecoveryPlanner.isStalled(now: now, lastAudioAt: lastSignal ?? startedAtUptime)
-                && MicRecoveryPlanner.hasSettled(now: now, configuredAt: lastConfiguredAtUptime)
-            if let fallback = MicInputPolicy.fallbackForSilentDevice(
-                policy: policy,
-                pinned: pinnedDevice,
-                systemDefault: MicInputDevices.systemDefault(),
-                attemptsInEpisode: planner.attemptsInEpisode,
-                signalIsStalled: signalIsStalled
-            ) {
-                note("\(pinnedDevice?.label ?? "microfone") sem sinal; usando \(fallback.label)")
-                pinnedDevice = fallback
-            }
             try configureAndStart()
         } catch {
             recordRearmFailure(error)
@@ -447,8 +443,9 @@ final class MicRecorder: @unchecked Sendable {
                 reason = lastSignal == nil ? "sem áudio desde o início" : "microfone parado"
             }
             rearm(reason: reason)
-        } else if planner.exhausted, !wasExhausted {
-            note("recuperação automática esgotada após \(planner.attemptsInEpisode) tentativas")
+        }
+        if planner.exhausted, !wasExhausted {
+            note("sem áudio após \(planner.attemptsInEpisode) tentativas; seguem tentativas a cada \(Int(MicRecoveryPlanner.backoff.last ?? 60)) s")
         }
         refreshCaptureState(now: now)
     }
@@ -474,6 +471,13 @@ final class MicRecorder: @unchecked Sendable {
     }
 
     static func uptime() -> TimeInterval { ProcessInfo.processInfo.systemUptime }
+
+    static func seconds(from start: UInt64, to end: UInt64) -> TimeInterval {
+        CMTimeGetSeconds(CMTimeSubtract(
+            CMClockMakeHostTimeFromSystemUnits(end),
+            CMClockMakeHostTimeFromSystemUnits(start)
+        ))
+    }
 
     // MARK: - Callback do tap
 
@@ -555,6 +559,13 @@ final class MicRecorder: @unchecked Sendable {
             guard writer.append(data) else { return }
             if pcmHasSignal(data) {
                 let now = Self.uptime()
+                // Interrupção = buraco entre dois buffers com sinal: cobre tanto
+                // callbacks que pararam quanto callbacks só com zeros.
+                if let previous = lastSignalHostTime, let hostTime {
+                    dropouts.add(seconds: Self.seconds(from: previous, to: hostTime)
+                        - Double(lastSignalByteCount) / Double(PCMGapFiller.bytesPerSecond))
+                }
+                lastSignalByteCount = data.count
                 let first = awaitingAudioAfterAttempt || lastSignalUptime == nil
                 if lastSignalUptime == nil {
                     firstSignalHostTime = hostTime

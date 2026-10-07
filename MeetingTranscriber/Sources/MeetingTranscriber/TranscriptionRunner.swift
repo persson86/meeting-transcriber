@@ -71,6 +71,9 @@ final class TranscriptionRunner {
     private var proc: Process?
     private var processStarted = false
     private var cancelled = false
+    /// Pausado enquanto há gravação (v1.7): o mlx-whisper disputava CPU, GPU e
+    /// memória com a reunião seguinte e deixava o Mac lento.
+    private var paused = false
 
     init(python: String = AppConfig.pythonPath, script: String = AppConfig.scriptPath) {
         self.python = python
@@ -78,12 +81,29 @@ final class TranscriptionRunner {
     }
 
     func cancel() {
-        let processToTerminate: Process? = lock.withLock {
+        let (processToTerminate, wasPaused): (Process?, Bool) = lock.withLock {
             cancelled = true
-            return processStarted ? proc : nil
+            defer { paused = false }
+            return (processStarted ? proc : nil, paused)
         }
+        // Processo suspenso não trata SIGTERM até voltar a rodar.
+        if wasPaused { processToTerminate?.resume() }
         processToTerminate?.terminate()
     }
+
+    /// Suspende (SIGSTOP) ou retoma o Python sem perder o progresso. Pode ser
+    /// chamado antes de o processo existir: ele já nasce suspenso.
+    func setPaused(_ value: Bool) {
+        let process: Process? = lock.withLock {
+            guard paused != value, !cancelled else { return nil }
+            paused = value
+            return processStarted ? proc : nil
+        }
+        guard let process else { return }
+        _ = value ? process.suspend() : process.resume()
+    }
+
+    var isPaused: Bool { lock.withLock { paused } }
 
     func run(
         micURL: URL?,
@@ -132,6 +152,9 @@ final class TranscriptionRunner {
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: python)
             proc.arguments = args
+            // Prioridade de background: núcleos de eficiência e I/O com baixa
+            // prioridade, para a transcrição não competir com o uso do Mac.
+            proc.qualityOfService = .background
 
             let outPipe = Pipe()
             let errPipe = Pipe()
@@ -207,12 +230,14 @@ final class TranscriptionRunner {
 
             do {
                 try proc.run()
-                let shouldTerminate = lock.withLock {
+                let (shouldTerminate, shouldSuspend) = lock.withLock {
                     processStarted = true
-                    return cancelled
+                    return (cancelled, paused)
                 }
                 if shouldTerminate {
                     proc.terminate()
+                } else if shouldSuspend {
+                    proc.suspend()
                 }
                 if AppConfig.debugMemoryLogging {
                     NSLog("[mem] python pid=%d maxConcurrent=%d model=%@",

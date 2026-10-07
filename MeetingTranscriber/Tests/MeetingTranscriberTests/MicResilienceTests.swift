@@ -47,23 +47,38 @@ final class MicResilienceTests: XCTestCase {
         XCTAssertEqual(planner.evaluate(now: 23, lastAudioAt: 0), .attempt)
     }
 
-    func testAttemptsAreCappedAndReportFailure() {
+    func testAfterCapPlannerReportsFailureButKeepsTryingEveryMinute() {
+        // v1.7: antes, o planner desistia e o mic ficava mudo até o clique manual
+        // (7C472A93, 594 s). Agora o estado fica vermelho e as tentativas seguem.
         var planner = MicRecoveryPlanner()
+        var attemptTimes: [TimeInterval] = []
         var now: TimeInterval = 10
-        var attempts = 0
-        while now < 10_000 {
+        while now < 1_000 {
             if planner.evaluate(now: now, lastAudioAt: 0) == .attempt {
                 planner.noteAttempt(at: now)
-                attempts += 1
+                attemptTimes.append(now)
             }
             now += 1
         }
-        XCTAssertEqual(attempts, MicRecoveryPlanner.maxAttemptsPerEpisode)
+        XCTAssertGreaterThan(attemptTimes.count, MicRecoveryPlanner.maxAttemptsPerEpisode)
         XCTAssertTrue(planner.exhausted)
-        XCTAssertEqual(
-            planner.state(now: now, lastAudioAt: 0, captureStartedAt: 0),
-            .failed(attempts: MicRecoveryPlanner.maxAttemptsPerEpisode)
-        )
+        let late = attemptTimes.suffix(3)
+        XCTAssertEqual(zip(late, late.dropFirst()).map { $1 - $0 }, [60, 60])
+        if case .failed = planner.state(now: now, lastAudioAt: 0, captureStartedAt: 0) {} else {
+            XCTFail("estado deveria ser .failed após o teto")
+        }
+    }
+
+    func testConfigurationNotificationsRespectWatchdogBackoff() {
+        // Um só controle: notificação de troca de dispositivo não rearma por fora
+        // do backoff do planner.
+        var planner = MicRecoveryPlanner()
+        XCTAssertTrue(planner.allowsConfigurationAttempt(now: 10))
+        planner.noteAttempt(at: 10)
+        XCTAssertFalse(planner.allowsConfigurationAttempt(now: 12))
+        XCTAssertTrue(planner.allowsConfigurationAttempt(now: 13))
+        XCTAssertTrue(planner.noteAudio(at: 14))
+        XCTAssertTrue(planner.allowsConfigurationAttempt(now: 14.1))
     }
 
     func testManualRestartOpensNewSeriesAfterExhaustion() {
@@ -131,24 +146,6 @@ final class MicResilienceTests: XCTestCase {
         XCTAssertEqual(MicInputPolicy.systemDefault.select(from: [builtIn, headset], systemDefault: headset), headset)
     }
 
-    func testSilentBuiltInFallsBackToDefaultFromSecondAttempt() {
-        XCTAssertNil(MicInputPolicy.fallbackForSilentDevice(policy: .builtIn, pinned: builtIn, systemDefault: webcam, attemptsInEpisode: 1, signalIsStalled: true))
-        XCTAssertEqual(MicInputPolicy.fallbackForSilentDevice(policy: .builtIn, pinned: builtIn, systemDefault: webcam, attemptsInEpisode: 2, signalIsStalled: true), webcam)
-        // Padrão é o próprio embutido, ou já saiu do embutido, ou política antiga: nada a trocar.
-        XCTAssertNil(MicInputPolicy.fallbackForSilentDevice(policy: .builtIn, pinned: builtIn, systemDefault: builtIn, attemptsInEpisode: 3, signalIsStalled: true))
-        XCTAssertNil(MicInputPolicy.fallbackForSilentDevice(policy: .builtIn, pinned: webcam, systemDefault: headset, attemptsInEpisode: 3, signalIsStalled: true))
-        XCTAssertNil(MicInputPolicy.fallbackForSilentDevice(policy: .systemDefault, pinned: builtIn, systemDefault: webcam, attemptsInEpisode: 3, signalIsStalled: true))
-    }
-
-    func testConfigurationAttemptsBeforeRealStallDoNotAbandonBuiltInMic() {
-        // 10:54 e 12:06 trocaram para Bluetooth com 1,3 e 3,1 s de captura,
-        // apenas porque duas notificações já tinham disparado rearmes.
-        XCTAssertNil(MicInputPolicy.fallbackForSilentDevice(
-            policy: .builtIn, pinned: builtIn, systemDefault: headset,
-            attemptsInEpisode: 2, signalIsStalled: false
-        ))
-    }
-
     func testDigitalSilenceIsNotSignal() {
         XCTAssertFalse(pcmHasSignal(Data(count: 4_096)))
         var noise = Data(count: 4_096)
@@ -188,6 +185,19 @@ final class MicResilienceTests: XCTestCase {
         XCTAssertEqual(arrivals.count, 1)
     }
 
+    func testRecorderMeasuresHoleBetweenSignalBuffers() {
+        let recorder = MicRecorder(writer: WAVWriter())
+        var signal = Data(count: 3_200)   // 0,1 s
+        signal[100] = 7
+        recorder.appendConvertedPCM(signal, hostTime: hostTime(seconds: 10))
+        recorder.appendConvertedPCM(signal, hostTime: hostTime(seconds: 10.1))   // contínuo
+        recorder.appendConvertedPCM(Data(count: 3_200), hostTime: hostTime(seconds: 10.2))   // zeros
+        recorder.appendConvertedPCM(signal, hostTime: hostTime(seconds: 13.2))
+        let dropouts = recorder.health.dropouts
+        XCTAssertEqual(dropouts.count, 1)
+        XCTAssertEqual(dropouts.largestSeconds, 3.0, accuracy: 0.01)
+    }
+
     // MARK: Linha do tempo
 
     func testLongStallKeepsTimelineInsteadOfCappingAtThirtySeconds() {
@@ -217,15 +227,10 @@ final class MicResilienceTests: XCTestCase {
     // MARK: Integridade e UI
 
     @MainActor
-    func testRoutineRearmWithoutLossStaysOutOfIntegrityIssues() {
-        let issues = AppState.healthIssues(mic: micHealth(attempts: 2, successes: 1, silence: 0), system: nil)
-        XCTAssertFalse(issues.contains { $0.contains("tentativa") })
-    }
-
-    @MainActor
-    func testRecoveryThatNeverBroughtAudioBackIsAnIssue() {
-        let issues = AppState.healthIssues(mic: micHealth(attempts: 6, successes: 0, silence: 0), system: nil)
-        XCTAssertTrue(issues.contains { $0.contains("6 tentativa(s) de recuperação") })
+    func testRearmCountsStayOutOfIntegrityIssues() {
+        // v1.7: com ou sem áudio de volta, rearme não é perda; a perda medida é.
+        XCTAssertTrue(AppState.healthIssues(mic: micHealth(attempts: 2, successes: 1, silence: 0), system: nil).isEmpty)
+        XCTAssertTrue(AppState.healthIssues(mic: micHealth(attempts: 6, successes: 0, silence: 64_000), system: nil).isEmpty)
     }
 
     @MainActor
@@ -302,7 +307,8 @@ final class MicResilienceTests: XCTestCase {
             recoveryErrorDescription: nil,
             streamStopErrorDescription: nil,
             insertedSilenceByteCount: silence,
-            recoverySuccessCount: successes
+            recoverySuccessCount: successes,
+            firstSignalHostTime: 1
         )
     }
 

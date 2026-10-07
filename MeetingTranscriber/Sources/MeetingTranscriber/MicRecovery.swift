@@ -21,10 +21,16 @@ enum MicCaptureState: Equatable, Sendable {
 /// áudio depois da última tentativa. Rearme "sem erro" não conta como sucesso:
 /// só áudio novo encerra o episódio (sessão de 01/out/2026, em que o rearme
 /// retornou sem erro e o tap nunca mais recebeu buffers).
+///
+/// v1.7: o teto não desiste mais. Depois de `maxAttemptsPerEpisode` o estado vira
+/// `.failed` (alerta vermelho e botão), mas as tentativas seguem no último
+/// intervalo do backoff. Na sessão de 05/out em que o teto esgotou aos 89 s, o
+/// microfone ficou mudo até o clique manual aos 591 s, que funcionou de primeira.
 struct MicRecoveryPlanner: Equatable {
     /// Sem sinal escrito por mais que isso, a trilha é considerada parada.
     static let stallThreshold: TimeInterval = 5
     /// Espera mínima entre uma tentativa e a próxima, para o HAL assentar a rota.
+    /// O último valor é o intervalo das tentativas depois do teto.
     static let backoff: [TimeInterval] = [3, 10, 30, 60]
     static let maxAttemptsPerEpisode = 6
 
@@ -54,15 +60,24 @@ struct MicRecoveryPlanner: Equatable {
 
     /// `lastAudioAt`: último sinal escrito; antes do primeiro, o início da captura.
     mutating func evaluate(now: TimeInterval, lastAudioAt: TimeInterval) -> Decision {
-        guard Self.isStalled(now: now, lastAudioAt: lastAudioAt), !exhausted else { return .none }
-        guard attemptsInEpisode > 0, let lastAttemptAt else { return .attempt }
-        let wait = Self.backoff[min(attemptsInEpisode - 1, Self.backoff.count - 1)]
-        guard now - lastAttemptAt >= wait else { return .none }
-        guard attemptsInEpisode < Self.maxAttemptsPerEpisode else {
-            exhausted = true
-            return .none
-        }
+        guard Self.isStalled(now: now, lastAudioAt: lastAudioAt) else { return .none }
+        guard backoffElapsed(now: now) else { return .none }
+        if attemptsInEpisode >= Self.maxAttemptsPerEpisode { exhausted = true }
         return .attempt
+    }
+
+    /// Notificação de configuração com engine parado ou formato novo: rearma na
+    /// hora se for a primeira tentativa do episódio; as seguintes esperam o mesmo
+    /// backoff do watchdog. Até a 1.6.1 as notificações tinham um teto próprio de
+    /// 8 por minuto e esgotavam o episódio em segundos.
+    func allowsConfigurationAttempt(now: TimeInterval) -> Bool {
+        backoffElapsed(now: now)
+    }
+
+    private func backoffElapsed(now: TimeInterval) -> Bool {
+        guard attemptsInEpisode > 0, let lastAttemptAt else { return true }
+        let wait = Self.backoff[min(attemptsInEpisode - 1, Self.backoff.count - 1)]
+        return now - lastAttemptAt >= wait
     }
 
     mutating func noteAttempt(at now: TimeInterval) {

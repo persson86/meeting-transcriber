@@ -161,6 +161,61 @@ final class TranscriptionRunnerTests: XCTestCase {
         }
         XCTAssertTrue(FileManager.default.fileExists(atPath: terminated.path))
     }
+
+    func testPausedBeforeStartWaitsForResume() async throws {
+        // v1.7: com gravação em curso o processo nasce suspenso e só anda no resume.
+        let script = directory.appendingPathComponent("pausable.sh")
+        let output = directory.appendingPathComponent("result.md")
+        let jsonl = directory.appendingPathComponent("result.jsonl")
+        let body = """
+        #!/bin/sh
+        sleep 0.2
+        printf '# result\\n' > '\(output.path)'
+        printf '%s\\n' '{"type":"meta"}' > '\(jsonl.path)'
+        printf 'Output: \(output.path)\\n'
+        """
+        try body.write(to: script, atomically: true, encoding: .utf8)
+
+        let runner = TranscriptionRunner(python: "/bin/sh", script: script.path)
+        runner.setPaused(true)
+        let task = Task {
+            try await runner.run(micURL: nil, systemURL: nil, title: "Teste", outputDir: directory)
+        }
+        try await Task.sleep(nanoseconds: 1_000_000_000)
+        XCTAssertTrue(runner.isPaused)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+
+        runner.setPaused(false)
+        let result = try await task.value
+        XCTAssertEqual(result, output)
+    }
+
+    func testCancelWhilePausedStillTerminates() async throws {
+        let script = directory.appendingPathComponent("paused-cancel.sh")
+        let body = """
+        #!/bin/sh
+        while true; do sleep 1; done
+        """
+        try body.write(to: script, atomically: true, encoding: .utf8)
+
+        let runner = TranscriptionRunner(python: "/bin/sh", script: script.path)
+        runner.setPaused(true)
+        let task = Task {
+            try await runner.run(micURL: nil, systemURL: nil, title: "Teste", outputDir: directory)
+        }
+        try await Task.sleep(nanoseconds: 300_000_000)
+        runner.cancel()
+
+        do {
+            _ = try await task.value
+            XCTFail("expected cancellation")
+        } catch let error as TranscriptionError {
+            guard case .cancelled = error else {
+                return XCTFail("unexpected transcription error: \(error)")
+            }
+        }
+        XCTAssertFalse(runner.isPaused)
+    }
 }
 
 private final class ProgressRecorder: @unchecked Sendable {

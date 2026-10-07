@@ -51,6 +51,12 @@ struct AudioCaptureHealth: Equatable, Sendable {
     /// Último rearme ainda sem sinal confirmado, mesmo após recuperações anteriores.
     let recoveryPending: Bool
     let initialAudioDelaySeconds: TimeInterval?
+    /// Interrupções medidas no meio da trilha (v1.7). No microfone, intervalo entre
+    /// buffers com sinal; no sistema, que fica em zeros legítimos quando ninguém
+    /// fala, só o silêncio inserido por falta de callbacks.
+    let dropouts: AudioLossTally
+    /// Do último sinal até o stop. Só o microfone mede.
+    let trailingSilenceSeconds: TimeInterval?
     /// Diário das transições, para o manifest.
     let events: [String]
 
@@ -77,6 +83,8 @@ struct AudioCaptureHealth: Equatable, Sendable {
         lastSignalHostTime: UInt64? = nil,
         recoveryPending: Bool = false,
         initialAudioDelaySeconds: TimeInterval? = nil,
+        dropouts: AudioLossTally = AudioLossTally(),
+        trailingSilenceSeconds: TimeInterval? = nil,
         events: [String] = []
     ) {
         self.receivedBufferCount = receivedBufferCount
@@ -99,7 +107,29 @@ struct AudioCaptureHealth: Equatable, Sendable {
         self.lastSignalHostTime = lastSignalHostTime
         self.recoveryPending = recoveryPending
         self.initialAudioDelaySeconds = initialAudioDelaySeconds
+        self.dropouts = dropouts
+        self.trailingSilenceSeconds = trailingSilenceSeconds
         self.events = events
+    }
+}
+
+/// Soma das interrupções relevantes de uma trilha. Até a 1.6.1 a integridade
+/// somava todo o silêncio inserido, inclusive micro-correções de jitter, e
+/// rebaixava sessões íntegras; aqui só conta intervalo de meio segundo ou mais.
+struct AudioLossTally: Equatable, Sendable {
+    static let minimumSeconds: TimeInterval = 0.5
+
+    private(set) var totalSeconds: TimeInterval = 0
+    private(set) var largestSeconds: TimeInterval = 0
+    private(set) var count = 0
+
+    init() {}
+
+    mutating func add(seconds: TimeInterval) {
+        guard seconds.isFinite, seconds >= Self.minimumSeconds else { return }
+        totalSeconds += seconds
+        largestSeconds = max(largestSeconds, seconds)
+        count += 1
     }
 }
 

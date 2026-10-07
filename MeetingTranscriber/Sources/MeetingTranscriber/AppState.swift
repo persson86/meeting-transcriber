@@ -16,6 +16,8 @@ enum RecordingStatus {
     var isStopping: Bool { if case .stopping = self { return true }; return false }
     var isImporting: Bool { if case .importing = self { return true }; return false }
     var isBusy: Bool { isStarting || isRecording || isStopping || isImporting }
+    /// Enquanto captura, a transcrição fica pausada (v1.7).
+    var isCapturing: Bool { isStarting || isRecording || isStopping }
     var canStartRecording: Bool {
         if case .idle = self { return true }
         if case .error = self { return true }
@@ -65,8 +67,8 @@ struct TranscriptionJob: Identifiable, Equatable {
     let id: UUID
     let title: String
     let language: String
-    let micURL: URL?
-    let systemURL: URL?
+    var micURL: URL?
+    var systemURL: URL?
     let outputDir: URL
     let sysOffsetMs: Double
     let createdAt: Date
@@ -82,7 +84,11 @@ struct TranscriptionJob: Identifiable, Equatable {
 
 @MainActor
 final class AppState: ObservableObject {
-    @Published var status: RecordingStatus = .idle
+    @Published var status: RecordingStatus = .idle {
+        didSet { applyTranscriptionPause() }
+    }
+    /// Transcrições em andamento suspensas durante a gravação.
+    @Published private(set) var transcriptionsPaused = false
     @Published var meetingTitle: String = ""
     @Published var lastWarning: String?
     @Published var lastOutputURL: URL?
@@ -369,7 +375,6 @@ final class AppState: ObservableObject {
                     mic: finalMicHealth,
                     system: sysCopy?.health
                 ))
-                captureIssues.append(contentsOf: captureHealthWarnings)
                 captureIssues = Array(Set(captureIssues)).sorted()
 
                 mic = nil; sys = nil; tempDir = nil
@@ -587,12 +592,11 @@ final class AppState: ObservableObject {
         }
         let micHealth = mic.health
         let systemHealth = sys.health
+        // Avisos ao vivo só para o que pede ação agora. A integridade final vem da
+        // perda medida no stop (`healthIssues`), não destes avisos.
         var issues: [String] = []
         if let error = micHealth.firstErrorDescription {
             issues.append("Falha ao gravar o microfone: \(error)")
-        }
-        if let error = micHealth.recoveryErrorDescription {
-            issues.append("O microfone não retomou após a troca de dispositivo: \(error)")
         }
         if let error = systemHealth.firstErrorDescription {
             issues.append("Falha ao gravar o áudio do sistema: \(error)")
@@ -606,9 +610,6 @@ final class AppState: ObservableObject {
         )
         if micStalled {
             issues.append("O microfone deixou de entregar áudio há mais de cinco segundos.")
-        }
-        if case .failed(let attempts) = micHealth.captureState {
-            issues.append("O microfone não voltou após \(attempts) tentativas automáticas de recuperação.")
         }
         micCaptureState = micHealth.captureState
         updateCaptureAlert(state: micHealth.captureState)
@@ -644,7 +645,19 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// O mlx-whisper rodava logo após cada reunião e, em 23 de 55 sessões, durante
+    /// a seguinte: disputava o Mac com a captura. Agora o que está rodando é
+    /// suspenso enquanto há gravação, e nada novo começa até ela terminar.
+    private func applyTranscriptionPause() {
+        let paused = status.isCapturing
+        guard paused != transcriptionsPaused else { return }
+        transcriptionsPaused = paused
+        for runner in runners.values { runner.setPaused(paused) }
+        if !paused { scheduleTranscriptionJobs() }
+    }
+
     private func scheduleTranscriptionJobs() {
+        guard !transcriptionsPaused else { return }
         while runningTranscriptionCount < maxConcurrentTranscriptions,
               let index = transcriptionJobs.firstIndex(where: { $0.status.isQueued }) {
             transcriptionJobs[index].status = .running
@@ -677,7 +690,7 @@ final class AppState: ObservableObject {
                     }
                 )
 
-                try Self.archiveSessionFiles(
+                let archiveURL = try Self.archiveSessionFiles(
                     outputURL: outputURL,
                     micURL: job.micURL,
                     systemURL: job.systemURL,
@@ -688,7 +701,13 @@ final class AppState: ObservableObject {
                     captureIntegrity: job.captureIntegrity
                 )
 
-                finishTranscriptionJob(id: job.id, outputURL: outputURL)
+                let audio = Self.releaseSessionAudio(
+                    micURL: job.micURL,
+                    systemURL: job.systemURL,
+                    archiveURL: archiveURL,
+                    sessionRoot: sessionStore.rootDirectory
+                )
+                finishTranscriptionJob(id: job.id, outputURL: outputURL, micURL: audio.mic, systemURL: audio.system)
             } catch {
                 failTranscriptionJob(id: job.id, message: error.localizedDescription)
             }
@@ -705,9 +724,11 @@ final class AppState: ObservableObject {
         }
     }
 
-    private func finishTranscriptionJob(id: UUID, outputURL: URL) {
+    private func finishTranscriptionJob(id: UUID, outputURL: URL, micURL: URL?, systemURL: URL?) {
         runners[id] = nil
         guard let index = transcriptionJobs.firstIndex(where: { $0.id == id }) else { return }
+        transcriptionJobs[index].micURL = micURL
+        transcriptionJobs[index].systemURL = systemURL
         transcriptionJobs[index].progress = 100
         transcriptionJobs[index].status = .succeeded(outputURL)
         transcriptionJobs[index].completedAt = Date()
@@ -854,6 +875,7 @@ final class AppState: ObservableObject {
         return (sysNs - micNs) / 1_000_000.0  // ns → ms
     }
 
+    @discardableResult
     static func archiveSessionFiles(
         outputURL: URL,
         micURL: URL?,
@@ -863,7 +885,7 @@ final class AppState: ObservableObject {
         sysOffsetMs: Double,
         createdAt: Date = Date(),
         captureIntegrity: CaptureIntegrity = .unknown
-    ) throws {
+    ) throws -> URL {
         let fm = FileManager.default
         let archiveURL = try uniqueArchiveDirectory(for: outputURL)
         try fm.createDirectory(at: archiveURL, withIntermediateDirectories: true)
@@ -892,6 +914,36 @@ final class AppState: ObservableObject {
         ]
         let data = try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted, .sortedKeys])
         try data.write(to: archiveURL.appendingPathComponent("metadata.json"))
+        return archiveURL
+    }
+
+    /// Depois do arquivamento, o WAV da sessão é uma cópia idêntica do que foi
+    /// para a pasta da transcrição: eram 12 GB duplicados em out/2026. Remove a
+    /// cópia da sessão só quando ela está dentro de `sessionRoot` e o arquivo
+    /// arquivado tem o mesmo tamanho; o job passa a apontar para o arquivado.
+    static func releaseSessionAudio(
+        micURL: URL?,
+        systemURL: URL?,
+        archiveURL: URL,
+        sessionRoot: URL,
+        fileManager fm: FileManager = .default
+    ) -> (mic: URL?, system: URL?) {
+        func release(_ source: URL?, archivedName: String) -> URL? {
+            guard let source else { return nil }
+            let archived = archiveURL.appendingPathComponent(archivedName)
+            let root = sessionRoot.standardizedFileURL.path + "/"
+            guard source.standardizedFileURL.path.hasPrefix(root),
+                  let sourceSize = (try? fm.attributesOfItem(atPath: source.path))?[.size] as? NSNumber,
+                  let archivedSize = (try? fm.attributesOfItem(atPath: archived.path))?[.size] as? NSNumber,
+                  sourceSize == archivedSize else { return source }
+            do {
+                try fm.removeItem(at: source)
+                return archived
+            } catch {
+                return source
+            }
+        }
+        return (release(micURL, archivedName: "mic.wav"), release(systemURL, archivedName: "system.wav"))
     }
 
     private static func existingAudioFileURL(_ url: URL) -> URL? {
@@ -981,6 +1033,15 @@ final class AppState: ObservableObject {
         ]
     }
 
+    /// Uma interrupção no meio da trilha a partir disso vira problema de integridade.
+    static let materialDropoutSeconds: TimeInterval = 2
+    /// Perda somada (início + interrupções + fim) a partir disso também vira.
+    static let materialLossSeconds: TimeInterval = 10
+
+    /// v1.7: `degraded` só com falha de escrita/conversão ou perda medida em
+    /// segundos. Contagem de rearmes, erro de uma tentativa que depois funcionou e
+    /// micro-correções do relógio ficam no diário (`diagnostics`): na 1.6.1 elas
+    /// rebaixaram 7 de 7 sessões, três delas com o microfone íntegro.
     static func healthIssues(
         mic: AudioCaptureHealth?,
         system: AudioCaptureHealth?
@@ -988,9 +1049,6 @@ final class AppState: ObservableObject {
         var issues: [String] = []
         if let error = mic?.firstErrorDescription {
             issues.append("Falha de escrita no microfone: \(error)")
-        }
-        if let error = mic?.recoveryErrorDescription {
-            issues.append("Falha ao retomar o microfone: \(error)")
         }
         if let error = mic?.processingErrorDescription {
             issues.append("Falha ao converter o áudio do microfone: \(error)")
@@ -1004,34 +1062,52 @@ final class AppState: ObservableObject {
         if let error = system?.processingErrorDescription {
             issues.append("Falha ao converter o áudio do sistema: \(error)")
         }
-        if let mic, mic.recoveryPending {
-            issues.append("A gravação terminou com uma recuperação do microfone pendente, sem confirmação de áudio após a última tentativa.")
-        }
-        if let delay = mic?.initialAudioDelaySeconds, delay > MicRecoveryPlanner.stallThreshold {
-            issues.append("O microfone só entregou sinal após \(Int(delay.rounded())) segundos do início da captura.")
-        }
         if let mic, mic.cappedGapCount > 0 {
             issues.append("Um intervalo do microfone excedeu o limite de preenchimento; a sincronização das trilhas pode estar comprometida.")
         }
         if let system, system.cappedGapCount > 0 {
             issues.append("Um intervalo do áudio do sistema excedeu o limite de preenchimento; a sincronização das trilhas pode estar comprometida.")
         }
-        // Rearme de rotina (troca de dispositivo sem perda) fica só no diário; vira
-        // problema de integridade quando houve áudio perdido ou nada voltou.
-        if let mic, mic.recoveryAttemptCount > 0,
-           mic.insertedSilenceByteCount > 32_000 || mic.recoverySuccessCount == 0 {
+        if let mic, let loss = micLossIssue(mic) {
+            issues.append(loss)
+        }
+        if let system,
+           system.dropouts.largestSeconds >= materialDropoutSeconds
+            || system.dropouts.totalSeconds >= materialLossSeconds {
             issues.append(
-                "O microfone passou por \(mic.recoveryAttemptCount) tentativa(s) de recuperação; " +
-                "\(mic.recoverySuccessCount) terminou(aram) com áudio de volta."
+                "O áudio do sistema ficou sem captura por \(seconds(system.dropouts.totalSeconds)) no total " +
+                "(maior intervalo: \(seconds(system.dropouts.largestSeconds)))."
             )
         }
-        if let mic, mic.insertedSilenceByteCount > 32_000 {
-            issues.append("O microfone teve um intervalo de captura superior a um segundo; silêncio foi inserido para preservar a linha do tempo.")
-        }
-        if let system, system.insertedSilenceByteCount > 32_000 {
-            issues.append("O áudio do sistema teve um intervalo de captura superior a um segundo; silêncio foi inserido para preservar a linha do tempo.")
-        }
         return Array(Set(issues)).sorted()
+    }
+
+    static func micLossIssue(_ mic: AudioCaptureHealth) -> String? {
+        guard mic.writtenByteCount > 0 else { return nil }
+        guard mic.firstSignalHostTime != nil || mic.initialAudioDelaySeconds != nil else {
+            return "O microfone não entregou áudio em nenhum momento da gravação."
+        }
+        // Até ~0,5 s é o tempo normal de abertura do engine; 1 s no fim é o stop.
+        let start = (mic.initialAudioDelaySeconds ?? 0) >= 1 ? (mic.initialAudioDelaySeconds ?? 0) : 0
+        let end = (mic.trailingSilenceSeconds ?? 0) >= 1 ? (mic.trailingSilenceSeconds ?? 0) : 0
+        let total = start + mic.dropouts.totalSeconds + end
+        guard mic.dropouts.largestSeconds >= materialDropoutSeconds || total >= materialLossSeconds else {
+            return nil
+        }
+        var parts: [String] = []
+        if start > 0 { parts.append("início: \(seconds(start))") }
+        if mic.dropouts.count > 0 {
+            parts.append("\(mic.dropouts.count) interrupção(ões): \(seconds(mic.dropouts.totalSeconds)), maior \(seconds(mic.dropouts.largestSeconds))")
+        }
+        if end > 0 { parts.append("fim: \(seconds(end))") }
+        return "O microfone ficou sem áudio por \(seconds(total)) no total (\(parts.joined(separator: "; ")))."
+    }
+
+    static func seconds(_ value: TimeInterval) -> String {
+        let rounded = Int(value.rounded())
+        return rounded >= 60
+            ? String(format: "%d min %02d s", rounded / 60, rounded % 60)
+            : "\(rounded) s"
     }
 
     static func hostTimeAgeSeconds(_ hostTime: UInt64?) -> TimeInterval {

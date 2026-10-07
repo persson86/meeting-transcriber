@@ -580,9 +580,9 @@ struct MenuBarView: View {
     private func jobStatusLabel(_ job: TranscriptionJob) -> String {
         switch job.status {
         case .queued:
-            return "Na fila"
+            return state.transcriptionsPaused ? "Na fila — começa quando a gravação terminar" : "Na fila"
         case .running:
-            return "Em andamento"
+            return state.transcriptionsPaused ? "Pausada durante a gravação" : "Em andamento"
         case .cancelling:
             return "Cancelando…"
         case .succeeded:

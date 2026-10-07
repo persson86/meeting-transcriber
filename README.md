@@ -19,6 +19,43 @@ Speaker labels are track based: microphone audio is labeled `Você`, system audi
 is labeled `Interlocutor`. Optional local clustering can split the system track
 into heuristic `Remote_A`, `Remote_B`, etc. labels.
 
+## What's New in 1.7
+
+Fewer warnings, and the ones left mean that audio was lost. Less load on the
+Mac while you are in a meeting.
+
+- **Integrity reports measured loss, not activity.** A capture is marked
+  degraded only by a write/conversion failure, a stopped stream, a gap beyond
+  the fill limit, a truncated track, or audio actually missing: any single
+  interruption of 2 s or more, or 10 s or more in total, counting the start
+  delay, gaps between signal buffers, and silence before stop. The warning
+  states how much was lost and where ("O microfone ficou sem áudio por 1 min
+  15 s no total (início: …)"). A microphone that never delivered signal is
+  reported as such. Re-arm counts, pending recoveries, and the old cumulative
+  "silence inserted" counter (which flagged intact sessions) move to the
+  diagnostic log only. Live warnings shown during recording no longer leak
+  into the final result.
+- **One recovery controller.** Device-change notifications now go through the
+  watchdog's backoff instead of re-arming on their own (the separate 8-per-minute
+  budget is gone). After 6 attempts the alert stays red, but the watchdog keeps
+  retrying every 60 s instead of giving up until a manual restart. The automatic
+  switch from a silent built-in microphone to the system default input was
+  removed: in practice it moved capture to a Bluetooth headset in HFP mode and
+  caused re-arm storms. With the lid closed, use
+  `defaults write io.github.meetingtranscriber.app micInputPolicy default`.
+- **Transcription stays out of the way.** The Python process runs with
+  background QoS. While a recording is starting, running, or stopping, queued
+  jobs wait and a running job is suspended (SIGSTOP) and resumed afterwards
+  without losing progress; the menu shows "Pausada durante a gravação".
+- **No duplicate audio.** After a job finishes, the session WAVs are deleted once
+  the archived copies next to the transcript are verified (same size), and the
+  manifest points to the archive. Imported files outside the session folder are
+  never touched.
+
+Echo tip: without headphones the built-in microphone picks up the speakers and
+remote speech can be attributed to `Você`. Use a headset as output only (Teams:
+microphone = MacBook, speaker = headset) to avoid both echo and Bluetooth HFP.
+
 ## What's New in 1.6.1
 
 - Startup/configuration notifications no longer restart an engine that is
@@ -52,10 +89,9 @@ Microphone capture survives device changes, and when it does not, you see it.
   from the Mac's built-in microphone and ignores later changes to the system
   default input, so a Bluetooth headset that connects mid-meeting no longer
   takes over (and silently stalls) the capture. Without a built-in microphone
-  it falls back to the system default, and if the built-in microphone only
-  delivers digital silence (for example, lid closed with an external display),
-  the second recovery attempt switches to the system default input.
-  To follow the system default as in 1.5:
+  it falls back to the system default. (The 1.6 switch to the system default
+  when the built-in microphone only delivers digital silence was removed in
+  1.7.) To follow the system default as in 1.5:
   `defaults write io.github.meetingtranscriber.app micInputPolicy default`
   (`builtin` restores the new default).
 - **Recovery is checked by audio, not by "no error".** The configuration
@@ -398,11 +434,14 @@ open "meetingtranscriber://recommend?title=Steering%20Client%20X&reason=external
 
 Each stopped recording becomes a local transcription job containing the WAV
 paths, language, title, track offset, and output directory. Queued jobs do not
-block new recordings.
+block new recordings: while a recording is in progress they wait, and a running
+job is suspended until the recording stops. Transcription runs with background
+QoS.
 
 The manifest also records capture integrity. Writer failures, stream termination,
-microphone rearm failures, missing tracks, and material duration differences mark
-the capture as degraded. The app still transcribes recoverable audio, but the
+missing tracks, material duration differences, and measured audio loss (one gap
+of 2 s or more, or 10 s or more in total) mark the capture as degraded; re-arms
+without loss stay in the diagnostic log. The app still transcribes recoverable audio, but the
 Markdown and JSONL outputs carry an explicit partial-capture warning instead of
 silently presenting the result as complete.
 

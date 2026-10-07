@@ -97,6 +97,7 @@ private final class SysDelegate: NSObject, SCStreamOutput, SCStreamDelegate, @un
     private var streamStopErrorDescription: String?
     private var processingErrorDescription: String?
     private var insertedSilenceByteCount: UInt32 = 0
+    private var dropouts = AudioLossTally()
     private var cappedGapCount: UInt64 = 0
 
     var firstBufferHostTime: UInt64? { lock.withLock { firstBufferHostTimeStorage } }
@@ -117,7 +118,8 @@ private final class SysDelegate: NSObject, SCStreamOutput, SCStreamDelegate, @un
                 lastSuccessfulWriteHostTime: lastSuccessfulWriteHostTime,
                 processingErrorDescription: processingErrorDescription,
                 insertedSilenceByteCount: insertedSilenceByteCount,
-                cappedGapCount: cappedGapCount
+                cappedGapCount: cappedGapCount,
+                dropouts: dropouts
             )
         }
     }
@@ -233,6 +235,7 @@ private final class SysDelegate: NSObject, SCStreamOutput, SCStreamDelegate, @un
             guard writer.appendSilence(byteCount: gap.byteCount) else { return }
             lock.withLock {
                 insertedSilenceByteCount &+= UInt32(gap.byteCount)
+                dropouts.add(seconds: Double(gap.byteCount) / Double(PCMGapFiller.bytesPerSecond))
                 if gap.wasCapped {
                     cappedGapCount &+= 1
                     if processingErrorDescription == nil {
