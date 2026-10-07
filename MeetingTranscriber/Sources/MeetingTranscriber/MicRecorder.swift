@@ -221,36 +221,49 @@ final class MicRecorder: @unchecked Sendable {
         let device = policy == .systemDefault ? MicInputDevices.systemDefault() : pinnedDevice
         healthLock.withLock { currentDeviceLabel = device?.label }
 
-        let srcFmt: AVAudioFormat
-        do {
-            // F8b: o 1º tap já usa o formato do hardware; o do nó pode guardar uma taxa
-            // anterior (16 kHz) e o tap era recusado de forma determinística.
-            srcFmt = try installTap(format: currentInputFormat(hardware: true))
-            note("f8b: tap com formato de hardware")
-        } catch {
-            // Com o dispositivo fixado, o nó pode guardar o formato anterior a uma
-            // troca de taxa ("Failed to create tap due to format mismatch"). Reset
-            // do engine e formato lido do hardware; se falhar de novo, propaga.
-            note("tap recusado (\(error.localizedDescription)); renovando o formato")
-            try MTObjCExceptionCatcher.perform { self.engine.reset() }
-            if policy != .systemDefault, let pinnedDevice {
-                try setInputDevice(pinnedDevice)
+        // F8b: o 1º tap usa o formato do hardware, que evita a recusa 16→48 kHz.
+        // Se o tap ou o start recusarem esse formato (visto em 07/out com fone BT
+        // como entrada padrão depois de uma sessão HFP: erro -10868), reset do
+        // engine e os caminhos da 1.7, nesta ordem: formato do nó, depois o do
+        // hardware de novo. Só propaga quando os três falham.
+        var srcFmt: AVAudioFormat?
+        var lastError: Error?
+        for (attempt, hardware) in [true, false, true].enumerated() {
+            if attempt > 0 {
+                try MTObjCExceptionCatcher.perform { self.engine.reset() }
+                if policy != .systemDefault, let pinnedDevice {
+                    try setInputDevice(pinnedDevice)
+                }
             }
-            srcFmt = try installTap(format: currentInputFormat(hardware: true))
+            do {
+                srcFmt = try installTapAndStart(format: currentInputFormat(hardware: hardware))
+                if attempt == 0 { note("f8b: tap com formato de hardware") }
+                break
+            } catch {
+                lastError = error
+                note("tap recusado (\(error.localizedDescription)); renovando o formato")
+            }
         }
-
-        var startError: Error?
-        try MTObjCExceptionCatcher.perform {
-            self.engine.prepare()
-            do { try self.engine.start() } catch { startError = error }
-        }
-        if let startError { throw startError }
+        guard let srcFmt else { throw lastError ?? NSError(domain: "MicRecorder", code: 6) }
         // Mesmo acessor da comparação em `scheduleConfigurationRearm`: o formato
         // de saída do nó pode diferir do de entrada em canais.
         configuredInputFormat = (try? currentInputFormat(hardware: true)) ?? srcFmt
         lastConfiguredAtUptime = Self.uptime()
         if let pinnedDevice { listen(to: pinnedDevice) }
         note("configurado: \(device?.label ?? "dispositivo padrão") \(Int(srcFmt.sampleRate)) Hz/\(srcFmt.channelCount) ch")
+    }
+
+    /// Instala o tap e inicia o engine; qualquer recusa (tap ou start) sobe como
+    /// erro para o chamador tentar outro formato.
+    private func installTapAndStart(format: AVAudioFormat) throws -> AVAudioFormat {
+        let srcFmt = try installTap(format: format)
+        var startError: Error?
+        try MTObjCExceptionCatcher.perform {
+            self.engine.prepare()
+            do { try self.engine.start() } catch { startError = error }
+        }
+        if let startError { throw startError }
+        return srcFmt
     }
 
     /// `hardware: false` usa o formato de saída do nó (caminho da 1.5, provado em

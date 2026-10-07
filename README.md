@@ -19,6 +19,18 @@ Speaker labels are track based: microphone audio is labeled `Você`, system audi
 is labeled `Interlocutor`. Optional local clustering can split the system track
 into heuristic `Remote_A`, `Remote_B`, etc. labels.
 
+## What's New in 1.8.1
+
+Hotfix found by the hardware battery of 7 Oct: with a Bluetooth headset as the
+system default input (after it had been used in HFP mode), 1.8.0 failed to
+start the microphone at all (CoreAudio -10868) because the first tap used the
+hardware format with no fallback. The first tap now tries the hardware format,
+then the node format, then the hardware format again after an engine reset,
+and only fails when all three do. Also measured in that battery, in 1.7.0 and
+1.8.x alike: with the headset as default input, the pinned built-in microphone
+delivers audio only while another process (e.g. Teams) holds it open; with the
+built-in microphone as the system default input, audio arrives in about 1 s.
+
 ## What's New in 1.8
 
 The app and the transcript now say how much to trust them. Pipeline 0.10.0.
