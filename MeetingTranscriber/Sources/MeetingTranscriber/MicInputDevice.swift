@@ -54,6 +54,18 @@ enum MicInputDevices {
         return ids.compactMap { id in inputChannelCount(id) > 0 ? device(id) : nil }
     }
 
+    /// Troca a entrada padrão do sistema (kAudioHardwarePropertyDefaultInputDevice).
+    static func setSystemDefault(_ id: AudioDeviceID) -> OSStatus {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var value = id
+        return AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil,
+                                          UInt32(MemoryLayout<AudioDeviceID>.size), &value)
+    }
+
     static func systemDefault() -> MicInputDevice? {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDefaultInputDevice,

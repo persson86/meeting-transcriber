@@ -171,6 +171,9 @@ final class AppState: ObservableObject {
             status = .error("Outra instância do Meeting Transcriber já está usando as sessões. Feche-a antes de continuar.")
             return
         }
+        if let message = MicRecorder.restoreDefaultInputAfterCrashIfNeeded() {
+            AppLog.capture.info("\(message, privacy: .public)")
+        }
         let recovered = sessionStore.loadJobs()
         let recoveredOutputs = Set(recovered.compactMap { job -> String? in
             guard case .succeeded(let url) = job.status else { return nil }

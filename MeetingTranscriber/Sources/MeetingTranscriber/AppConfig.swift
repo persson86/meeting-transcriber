@@ -133,6 +133,23 @@ enum AppConfig {
     /// Microfone da gravação: "builtin" (padrão, fixa o microfone do Mac no início)
     /// ou "default" (segue o dispositivo padrão do macOS, comportamento até a 1.5).
     /// `defaults write io.github.meetingtranscriber.app micInputPolicy default`
+    /// C1 (07/out/2026): com a política builtin e um fone Bluetooth como entrada
+    /// padrão, a entrada padrão do sistema passa a ser o embutido durante a
+    /// gravação e volta no fim. `defaults write io.github.meetingtranscriber.app micDefaultInputOverride -bool false`
+    static var micDefaultInputOverride: Bool {
+        (UserDefaults.standard.object(forKey: "micDefaultInputOverride") as? Bool) ?? true
+    }
+
+    /// 1.9.0 (07/out/2026): o mic é capturado por IOProc direto (`raw`). Na
+    /// bateria, com outro processo segurando o embutido com voice processing
+    /// (≈ Teams) e o fone como saída, o AVAudioEngine entregava zeros até o fim;
+    /// o IOProc seguiu gravando. Volta ao engine com
+    /// `defaults write io.github.meetingtranscriber.app micCaptureBackend engine`.
+    static var micCaptureBackend: MicRecorder.CaptureBackend {
+        UserDefaults.standard.string(forKey: "micCaptureBackend")
+            .flatMap(MicRecorder.CaptureBackend.init(rawValue:)) ?? .raw
+    }
+
     static var micInputPolicy: MicInputPolicy {
         UserDefaults.standard.string(forKey: "micInputPolicy").flatMap(MicInputPolicy.init(rawValue:)) ?? .builtIn
     }

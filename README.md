@@ -19,6 +19,40 @@ Speaker labels are track based: microphone audio is labeled `Você`, system audi
 is labeled `Interlocutor`. Optional local clustering can split the system track
 into heuristic `Remote_A`, `Remote_B`, etc. labels.
 
+## What's New in 1.9.0
+
+Two capture changes, both measured in the hardware battery of 7 Oct with a
+Bluetooth headset (QCY) connected and a second process holding the built-in
+microphone with voice processing, the way Teams does.
+
+1. **The built-in microphone becomes the system default input while recording.**
+   Root cause of the 1 Oct incident and of the "slow start, lost ending"
+   pattern, reproduced in three versions: with the headset as the system
+   default input, the pinned built-in microphone never delivers audio on its
+   own — the engine's input node stays bound to the default device (same
+   symptom as jwulff/steno #104 and humanitas-labs/parrot #14). The previous
+   device is restored when the recording stops, or at the next launch/recording
+   if the app died mid-recording; if you change the input yourself during a
+   recording, the app re-asserts the built-in microphone once and then leaves
+   your choice alone. The headset keeps playing audio. Measured: 5/5 starts
+   with the headset as default at 0.22–0.23 s (1.8.1: no audio at all). Opt out
+   with `defaults write io.github.meetingtranscriber.app micDefaultInputOverride -bool false`.
+
+2. **The microphone is captured through a direct CoreAudio IOProc instead of
+   AVAudioEngine.** With the built-in microphone as default and another process
+   opening it with voice processing (output on the headset), the engine
+   delivered zeros from the moment the other process opened the microphone to
+   the end of the recording, in every re-arm; the IOProc kept recording through
+   the whole call (46/46 s, two 0.5 s gaps at the format changes, all three
+   test phrases transcribed). The level during the call is noticeably lower
+   (the other process's voice processing takes the microphone's gain), but
+   intelligible. Go back to the engine with
+   `defaults write io.github.meetingtranscriber.app micCaptureBackend engine`.
+
+Not changed: system audio capture, the pipeline (0.10.0), the integrity rules.
+Known unknown: a real Teams call has not been measured yet; the "call" in the
+battery is an AVAudioEngine with voice processing on the default device.
+
 ## What's New in 1.8.1
 
 Hotfix found by the hardware battery of 7 Oct: with a Bluetooth headset as the

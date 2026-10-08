@@ -15,6 +15,14 @@ enum HardwareSelfTest {
             let seconds = Double(args[index + 1]) ?? 20
             let engine = AVAudioEngine()
             do {
+                // E0 (07/out): --call-device builtin fixa o processo de "call" no embutido;
+                // sem a flag ele usa a entrada padrão (o fone, quando BT é padrão).
+                if let di = args.firstIndex(of: "--call-device"), di + 1 < args.count, args[di + 1] == "builtin",
+                   let builtIn = MicInputDevices.all().first(where: { $0.isBuiltIn }), let unit = engine.inputNode.audioUnit {
+                    var id = builtIn.id
+                    AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &id,
+                                         UInt32(MemoryLayout<AudioDeviceID>.size))
+                }
                 try engine.inputNode.setVoiceProcessingEnabled(true)
                 engine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: nil) { _, _ in }
                 try engine.start()
@@ -42,6 +50,9 @@ enum HardwareSelfTest {
         if let probeIndex = args.firstIndex(of: "--probe-session-at"), probeIndex + 1 < args.count {
             probeSessionAt = Double(args[probeIndex + 1])
         }
+        if let probeIndex = args.firstIndex(of: "--probe-builtin-at"), probeIndex + 1 < args.count {
+            probeBuiltInAt = Double(args[probeIndex + 1])
+        }
 
         let done = DispatchSemaphore(value: 0)
         Task.detached {
@@ -55,6 +66,7 @@ enum HardwareSelfTest {
     private static var callWindow: (Double, Double)?
     private static var probeAt: Double?
     private static var probeSessionAt: Double?
+    private static var probeBuiltInAt: Double?
 
     private final class SessionProbe: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         let lock = NSLock()
@@ -86,6 +98,72 @@ enum HardwareSelfTest {
         session.stopRunning()
         probe.lock.withLock {
             note("PROBE-SESSION device=\(device.localizedName) buffers=\(probe.buffers) nonZeroBytes=\(probe.nonZeroBytes)/\(probe.totalBytes)")
+        }
+    }
+
+    /// Sonda (07/out): o dispositivo embutido entrega IO por caminhos que não passam
+    /// pelo AVAudioEngine — IOProc direto no HAL e AVCaptureSession com o
+    /// dispositivo explícito — enquanto a entrada padrão é o fone BT?
+    private static func nominalSampleRate(_ id: AudioDeviceID) -> Double {
+        var address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyNominalSampleRate,
+                                                 mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var value = 0.0; var size = UInt32(MemoryLayout<Double>.size)
+        AudioObjectGetPropertyData(id, &address, 0, nil, &size, &value); return value
+    }
+
+    private static func setSystemDefaultInput(_ id: AudioDeviceID) -> OSStatus {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var value = id
+        return AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil,
+                                          UInt32(MemoryLayout<AudioDeviceID>.size), &value)
+    }
+
+    private static func probeBuiltInRaw(note: (String) -> Void) {
+        guard let dev = MicInputDevices.all().first(where: { $0.isBuiltIn }) else { note("PROBE-RAW: sem embutido"); return }
+        let lock = NSLock()
+        var callbacks = 0, nonZero = 0, total = 0
+        var procID: AudioDeviceIOProcID?
+        let status = AudioDeviceCreateIOProcIDWithBlock(&procID, dev.id, nil) { _, inData, _, _, _ in
+            var nz = 0, t = 0
+            let abl = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inData))
+            for buf in abl {
+                let n = Int(buf.mDataByteSize) / MemoryLayout<Float>.size
+                if let p = buf.mData?.assumingMemoryBound(to: Float.self) {
+                    for i in 0..<n where p[i] != 0 { nz += 1 }
+                    t += n
+                }
+            }
+            lock.withLock { callbacks += 1; nonZero += nz; total += t }
+        }
+        guard status == noErr, let procID else { note("PROBE-RAW: create falhou \(status)"); return }
+        let started = AudioDeviceStart(dev.id, procID)
+        note("PROBE-RAW: start status=\(started) device=\(dev.label) id=\(dev.id)")
+        Thread.sleep(forTimeInterval: 4)
+        AudioDeviceStop(dev.id, procID)
+        AudioDeviceDestroyIOProcID(dev.id, procID)
+        lock.withLock { note("PROBE-RAW IOProc embutido: callbacks=\(callbacks) nonZeroSamples=\(nonZero)/\(total)") }
+    }
+
+    private static func probeBuiltInCaptureSession(note: (String) -> Void) {
+        let discovery = AVCaptureDevice.DiscoverySession(deviceTypes: [.builtInMicrophone], mediaType: .audio, position: .unspecified)
+        note("PROBE-SESSION-BI devices: \(discovery.devices.map { "\($0.localizedName)|\($0.uniqueID)" })")
+        guard let device = discovery.devices.first(where: { $0.uniqueID.contains("BuiltIn") || $0.localizedName.contains("MacBook") }),
+              let input = try? AVCaptureDeviceInput(device: device) else { note("PROBE-SESSION-BI: sem embutido"); return }
+        let session = AVCaptureSession()
+        let output = AVCaptureAudioDataOutput()
+        let probe = SessionProbe()
+        output.setSampleBufferDelegate(probe, queue: DispatchQueue(label: "probe.session.bi"))
+        guard session.canAddInput(input), session.canAddOutput(output) else { note("PROBE-SESSION-BI cannot add"); return }
+        session.addInput(input); session.addOutput(output)
+        session.startRunning()
+        Thread.sleep(forTimeInterval: 4)
+        session.stopRunning()
+        probe.lock.withLock {
+            note("PROBE-SESSION-BI device=\(device.localizedName) buffers=\(probe.buffers) nonZeroBytes=\(probe.nonZeroBytes)/\(probe.totalBytes)")
         }
     }
 
@@ -122,11 +200,32 @@ enum HardwareSelfTest {
         let policyArg = CommandLine.arguments.firstIndex(of: "--mic-policy").flatMap { index in
             index + 1 < CommandLine.arguments.count ? MicInputPolicy(rawValue: CommandLine.arguments[index + 1]) : nil
         }
+        // --set-default-input builtin (07/out): aposta de fixar a ENTRADA PADRÃO do
+        // sistema no embutido durante a gravação e restaurar no fim.
+        var restoreDefault: MicInputDevice?
+        if let i = CommandLine.arguments.firstIndex(of: "--set-default-input"), i + 1 < CommandLine.arguments.count,
+           CommandLine.arguments[i + 1] == "builtin", let builtIn = MicInputDevices.all().first(where: { $0.isBuiltIn }) {
+            let previous = MicInputDevices.systemDefault()
+            let status = setSystemDefaultInput(builtIn.id)
+            note("DEFAULT-INPUT: \(previous?.label ?? "?") -> \(builtIn.label) status=\(status)")
+            if status == noErr, let previous, previous.id != builtIn.id { restoreDefault = previous }
+        }
+        defer {
+            if let previous = restoreDefault, MicInputDevices.find(uid: previous.uid) != nil {
+                let status = setSystemDefaultInput(previous.id)
+                note("DEFAULT-INPUT restaurado: \(previous.label) status=\(status)")
+            }
+        }
+        // --backend engine|raw (07/out): A/B do IOProc direto contra o AVAudioEngine.
+        let backendArg = CommandLine.arguments.firstIndex(of: "--backend").flatMap { index in
+            index + 1 < CommandLine.arguments.count ? MicRecorder.CaptureBackend(rawValue: CommandLine.arguments[index + 1]) : nil
+        }
         let mic = MicRecorder(
             stagingDirectory: directory,
             stagingFileName: "mic.inprogress.wav",
             preserveOnDeinit: true,
-            policy: policyArg ?? AppConfig.micInputPolicy
+            policy: policyArg ?? AppConfig.micInputPolicy,
+            captureBackend: backendArg ?? AppConfig.micCaptureBackend
         )
         let system = SystemAudioRecorder(stagingDirectory: directory, stagingFileName: "system.inprogress.wav", preserveOnDeinit: true)
         let startedAt = Date()
@@ -145,6 +244,7 @@ enum HardwareSelfTest {
         while Date() < deadline {
             try? await Task.sleep(nanoseconds: 500_000_000)
             note("mic \(String(describing: mic.health))")
+            note("DEV default=\(MicInputDevices.systemDefault()?.label ?? "?") rates=\(MicInputDevices.all().map { "\($0.name.prefix(12))@\(Int(nominalSampleRate($0.id)))" })")
             if let at = probeAt, Date().timeIntervalSince(startedAt) >= at {
                 probeAt = nil
                 probeFreshEngine(note: note)
@@ -152,6 +252,11 @@ enum HardwareSelfTest {
             if let at = probeSessionAt, Date().timeIntervalSince(startedAt) >= at {
                 probeSessionAt = nil
                 probeCaptureSession(note: note)
+            }
+            if let at = probeBuiltInAt, Date().timeIntervalSince(startedAt) >= at {
+                probeBuiltInAt = nil
+                probeBuiltInRaw(note: note)
+                probeBuiltInCaptureSession(note: note)
             }
             if let (callStart, callEnd) = callWindow {
                 let elapsed = Date().timeIntervalSince(startedAt)
