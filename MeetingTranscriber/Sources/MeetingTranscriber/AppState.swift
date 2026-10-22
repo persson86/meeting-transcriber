@@ -37,6 +37,14 @@ enum RecordingStatus {
     }
 }
 
+/// Quem pediu a gravação (2.0). Toda gravação é iniciada por gesto humano; a
+/// origem assistida só torna a sessão elegível para a pergunta de fim.
+enum RecordingOrigin: String, Codable, Equatable {
+    case manual
+    /// Confirmada numa oferta da assistência Teams.
+    case assisted
+}
+
 enum TranscriptionJobStatus: Equatable {
     case queued
     case running
@@ -149,6 +157,15 @@ final class AppState: ObservableObject {
     private var currentCalendarMeeting: CalendarMeeting?
     private var currentTitle: String?
     private var currentRecord: SessionRecord?
+    /// Origem da sessão em captura; nil sem captura.
+    @Published private(set) var currentOrigin: RecordingOrigin?
+    /// Sessão em captura (starting/recording), para a assistência validar que
+    /// uma resposta antiga não opera outra gravação.
+    var activeSessionID: UUID? { currentSessionID ?? pendingSessionID }
+    private var pendingSessionID: UUID?
+    /// Avisos para a assistência Teams: captura admitida e captura encerrada.
+    var onCaptureStarted: ((UUID, RecordingOrigin) -> Void)?
+    var onCaptureEnded: ((UUID) -> Void)?
 
     /// Quantas transcrições concluídas ficam retidas (na lista e em memória).
     /// Jobs ativos não contam para esse limite — eles são sempre visíveis.
@@ -248,9 +265,17 @@ final class AppState: ObservableObject {
     /// Um erro com recorder ainda ativo não autoriza iniciar outra gravação.
     var hasActiveRecorder: Bool { mic != nil || sys != nil }
 
-    func startRecording() {
+    /// `title` e `calendarMeeting` vêm da oferta assistida; sem eles vale o
+    /// campo do menu, como sempre. Retorna o ID da sessão admitida, ou nil se a
+    /// captura não estava livre (nada muda nesse caso).
+    @discardableResult
+    func startRecording(
+        origin: RecordingOrigin = .manual,
+        title requestedTitle: String? = nil,
+        calendarMeeting requestedMeeting: CalendarMeeting? = nil
+    ) -> UUID? {
         guard storageLeaseAvailable, status.canStartRecording, !hasActiveRecorder,
-              !isCalendarSyncing else { return }
+              !isCalendarSyncing else { return nil }
         status = .starting
         lastWarning = nil
 
@@ -260,17 +285,23 @@ final class AppState: ObservableObject {
             lastWarning = "Transcrição em andamento — gravar agora aumenta o uso de memória (o app processa uma por vez). A gravação continua normalmente."
         }
 
-        let typedTitle = meetingTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fieldTitle = meetingTitle
+        let typedTitle = (requestedTitle ?? meetingTitle).trimmingCharacters(in: .whitespacesAndNewlines)
         let title = typedTitle.isEmpty ? Self.defaultTitle() : typedTitle
-        let calendarMeeting = Self.calendarMeetingForTitle(
-            title,
-            selected: selectedCalendarMeeting,
-            selectedTitle: selectedCalendarTitle
-        )
+        let calendarMeeting = requestedTitle == nil
+            ? Self.calendarMeetingForTitle(
+                title,
+                selected: selectedCalendarMeeting,
+                selectedTitle: selectedCalendarTitle
+            )
+            : requestedMeeting
         meetingTitle = title
         let outDir = outputDirectory
         let currentLanguage = language
         let sessionID = UUID()
+        pendingSessionID = sessionID
+        currentOrigin = origin
+        onCaptureStarted?(sessionID, origin)
 
         Task {
             var pendingDirectory: URL?
@@ -279,7 +310,7 @@ final class AppState: ObservableObject {
             var recordingStartedAt: Date?
             do {
                 guard await ensureMicrophoneAccess() else {
-                    if typedTitle.isEmpty { meetingTitle = "" }
+                    restoreFieldAfterFailedStart(fieldTitle, sessionID: sessionID)
                     status = .error("Permissão de microfone necessária. Ative o Meeting Transcriber em Configurações do Sistema → Privacidade e Segurança → Microfone, depois tente novamente.")
                     return
                 }
@@ -294,7 +325,7 @@ final class AppState: ObservableObject {
                     outputDirectory: outDir,
                     createdAt: createdAt,
                     calendarMeeting: calendarMeeting,
-                    record: SessionRecord.starting(at: createdAt)
+                    record: SessionRecord.starting(at: createdAt, origin: origin)
                 )
                 pendingDirectory = dir
 
@@ -321,7 +352,8 @@ final class AppState: ObservableObject {
                 currentSessionID = sessionID
                 captureStartedAt = createdAt
                 currentTitle = title
-                currentRecord = SessionRecord.starting(at: createdAt)
+                currentRecord = SessionRecord.starting(at: createdAt, origin: origin)
+                pendingSessionID = nil
                 currentCalendarMeeting = calendarMeeting
                 selectedCalendarMeeting = nil
                 AppLog.capture.info("start session=\(sessionID.uuidString, privacy: .public)")
@@ -358,7 +390,7 @@ final class AppState: ObservableObject {
                     transcriptionJobs.append(failedJob)
                     persist(failedJob)
                 }
-                if typedTitle.isEmpty { meetingTitle = "" }
+                restoreFieldAfterFailedStart(fieldTitle, sessionID: sessionID)
                 if msg.contains("declined") || msg.contains("not authorized") || msg.contains("userDeclined") {
                     CGRequestScreenCaptureAccess()
                     status = .error("Permissão de gravação de tela necessária. Ative o Meeting Transcriber em Configurações do Sistema → Privacidade e Segurança → Gravação de Tela e Áudio do Sistema, depois tente novamente.")
@@ -367,9 +399,20 @@ final class AppState: ObservableObject {
                 }
             }
         }
+        return sessionID
     }
 
-    func stopRecording() {
+    /// Início falhou antes de haver recorder: o campo volta ao que o usuário
+    /// tinha digitado e a assistência sabe que a sessão não existe.
+    private func restoreFieldAfterFailedStart(_ fieldTitle: String, sessionID: UUID) {
+        meetingTitle = fieldTitle
+        pendingSessionID = nil
+        currentOrigin = nil
+        onCaptureEnded?(sessionID)
+    }
+
+    /// `reason` vai para o manifest; "user" é o botão do menu.
+    func stopRecording(reason: String = "user") {
         guard status.isRecording || (status.isError && hasActiveRecorder) else { return }
         status = .stopping
 
@@ -384,7 +427,9 @@ final class AppState: ObservableObject {
         let title = currentTitle ?? (meetingTitle.isEmpty ? Self.defaultTitle(at: startedAt) : meetingTitle)
         let calendarMeeting = currentCalendarMeeting
         var sessionRecord = currentRecord ?? SessionRecord.starting(at: captureStartedAt ?? Date())
-        sessionRecord.stopReason = quitRequested ? "quit" : "user"
+        sessionRecord.stopReason = quitRequested ? "quit" : reason
+        currentOrigin = nil
+        onCaptureEnded?(sessionID)
         let outDir = outputDirectory
         let currentLanguage = language
         AppLog.capture.info("stop session=\(sessionID.uuidString, privacy: .public) reason=\(sessionRecord.stopReason ?? "", privacy: .public)")
@@ -638,6 +683,31 @@ final class AppState: ObservableObject {
                 status = .error(error.localizedDescription)
             }
         }
+    }
+
+    /// Renomeia a gravação em curso (2.0). Vale até o stop, que congela o título
+    /// no job. Título diferente do evento associado desfaz a associação: evento
+    /// errado é pior que nenhum.
+    func renameActiveRecording(_ newTitle: String) {
+        let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard status.isRecording, let sessionID = currentSessionID, !trimmed.isEmpty else { return }
+        let meeting = Self.calendarMeeting(currentCalendarMeeting, afterRenamingTo: trimmed)
+        // Grava primeiro: memória e manifest nunca divergem sobre o título.
+        do {
+            try sessionStore.updateRecordingTitle(id: sessionID, title: trimmed, calendarMeeting: meeting)
+        } catch {
+            lastWarning = "Não foi possível salvar o novo título; a gravação segue como “\(currentTitle ?? "")”. Tente de novo: \(error.localizedDescription)"
+            return
+        }
+        currentCalendarMeeting = meeting
+        currentTitle = trimmed
+        meetingTitle = trimmed
+    }
+
+    /// O evento continua associado só se o título novo ainda é o dele.
+    static func calendarMeeting(_ meeting: CalendarMeeting?, afterRenamingTo title: String) -> CalendarMeeting? {
+        guard let meeting, title == calendarTitle(for: meeting) || title == meeting.title else { return nil }
+        return meeting
     }
 
     /// Com recorder ativo, limpar o erro não pode declarar o app ocioso.
@@ -1447,7 +1517,7 @@ final class AppState: ObservableObject {
         return integrity
     }
 
-    private static func calendarTitle(for meeting: CalendarMeeting) -> String {
+    static func calendarTitle(for meeting: CalendarMeeting) -> String {
         "\(meeting.title) — \(formattedTitleDate(meeting.startDate))"
     }
 

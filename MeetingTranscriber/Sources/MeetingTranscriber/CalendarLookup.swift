@@ -81,6 +81,39 @@ enum CalendarMeetingSelector {
         }
     }
 
+    /// Assistência Teams (2.0): evento cujo início fica a até `tolerance` do
+    /// início observado da chamada, e só se for único. Dois candidatos não têm
+    /// desempate: título errado é pior que título neutro. Usa instantes, não HH:mm.
+    static func startingNear(
+        _ reference: Date,
+        from candidates: [CalendarMeetingCandidate],
+        tolerance: TimeInterval
+    ) -> CalendarMeeting? {
+        var seenExternal = Set<String>()
+        let eligible = candidates
+            .filter { candidate in
+                guard !candidate.isAllDay, !candidate.isCancelled,
+                      candidate.participation != .ineligible else { return false }
+                let end = candidate.endDate ?? candidate.startDate
+                if end.timeIntervalSince(candidate.startDate) > maxMeetingDuration { return false }
+                return abs(candidate.startDate.timeIntervalSince(reference)) <= tolerance
+            }
+            .sorted(by: isOrderedBefore)
+            .filter { candidate in
+                guard let external = candidate.externalIdentifier, !external.isEmpty else { return true }
+                return seenExternal.insert(external).inserted
+            }
+        guard eligible.count == 1, let candidate = eligible.first else { return nil }
+        return CalendarMeeting(
+            title: normalizedTitle(candidate.title),
+            startDate: candidate.startDate,
+            endDate: candidate.endDate,
+            eventIdentifier: candidate.eventIdentifier.isEmpty ? nil : candidate.eventIdentifier,
+            organizerName: candidate.organizerName,
+            attendeeNames: Array(candidate.attendeeNames.prefix(maxAttendeeNames))
+        )
+    }
+
     /// Nomes de exibição limpos: sem e-mail, sem duplicata, sem vazio.
     static func displayNames(_ names: [String?]) -> [String] {
         var seen = Set<String>()
@@ -173,6 +206,26 @@ actor CalendarLookup {
         )
         let candidates = eventStore.events(matching: predicate).compactMap(candidate)
         return CalendarMeetingSelector.forRecording(from: candidates, now: now)
+    }
+
+    /// Sem pedir permissão: durante uma chamada o app não abre diálogo do
+    /// sistema. Sem acesso já concedido, não há sugestão.
+    func meetingStarting(near reference: Date, tolerance: TimeInterval) -> CalendarMeeting? {
+        let status = EKEventStore.authorizationStatus(for: .event)
+        let granted: Bool
+        if #available(macOS 14.0, *) {
+            granted = status == .fullAccess
+        } else {
+            granted = status == .authorized
+        }
+        guard granted else { return nil }
+        let predicate = eventStore.predicateForEvents(
+            withStart: reference.addingTimeInterval(-tolerance - 60),
+            end: reference.addingTimeInterval(tolerance + 60),
+            calendars: nil
+        )
+        let candidates = eventStore.events(matching: predicate).compactMap(candidate)
+        return CalendarMeetingSelector.startingNear(reference, from: candidates, tolerance: tolerance)
     }
 
     private func candidate(from event: EKEvent) -> CalendarMeetingCandidate? {

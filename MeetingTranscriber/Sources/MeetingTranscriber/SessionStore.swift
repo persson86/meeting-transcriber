@@ -188,6 +188,16 @@ struct SessionStore {
         try write(manifest)
     }
 
+    /// Título editado durante a captura (2.0). O evento do Calendar vai junto,
+    /// inclusive nil: editar o título desfaz a associação também no manifest,
+    /// senão o `save` do stop herdaria o evento antigo.
+    func updateRecordingTitle(id: UUID, title: String, calendarMeeting: CalendarMeeting?) throws {
+        var manifest = try readManifest(id: id)
+        manifest.title = title
+        manifest.calendarMeeting = calendarMeeting
+        try write(manifest)
+    }
+
     func hide(id: UUID) throws {
         var manifest = try readManifest(id: id)
         manifest.hidden = true

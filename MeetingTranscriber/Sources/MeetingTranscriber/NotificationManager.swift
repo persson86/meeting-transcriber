@@ -14,6 +14,13 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
     func requestAuthorization() {
         let center = UNUserNotificationCenter.current()
         center.delegate = self
+        center.setNotificationCategories(Self.assistanceCategories)
+        // Ofertas não sobrevivem a um relançamento: avisos da execução anterior
+        // sairiam da Central apontando para nada.
+        center.getDeliveredNotifications { delivered in
+            let stale = delivered.map(\.request.identifier).filter { $0.hasPrefix("assistance-") }
+            if !stale.isEmpty { center.removeDeliveredNotifications(withIdentifiers: stale) }
+        }
         center.requestAuthorization(options: [.alert, .sound]) { granted, error in
             if let error {
                 Self.logger.error("Notification authorization failed: \(error.localizedDescription, privacy: .public)")
@@ -59,12 +66,28 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         completionHandler([.banner, .list, .sound])
     }
 
-    /// Clique abre o `.md` do job concluído.
+    /// Clique abre o `.md` do job concluído. Ofertas da assistência Teams vão
+    /// para o `CallAssistant`, que revalida a oferta antes de qualquer ação.
     func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         didReceive response: UNNotificationResponse,
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
+        let content = response.notification.request.content
+        if let action = Self.assistanceAction(
+            category: content.categoryIdentifier,
+            actionIdentifier: response.actionIdentifier
+        ) {
+            let offerID = (content.userInfo[Self.offerIDKey] as? String).flatMap(UUID.init(uuidString:))
+            Self.logger.info("Assistance response action=\(action.rawValue, privacy: .public)")
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    _ = CallAssistant.current?.perform(action, offerID: offerID)
+                }
+                completionHandler()
+            }
+            return
+        }
         if let path = response.notification.request.content.userInfo["filePath"] as? String {
             NSWorkspace.shared.open(URL(fileURLWithPath: path))
         }
@@ -108,9 +131,9 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         notifyRecommendation(eventTitle: title, reason: reason, leadMinutes: lead)
     }
 
-    private func deliver(_ content: UNNotificationContent, kind: String) {
+    private func deliver(_ content: UNNotificationContent, kind: String, identifier: String = UUID().uuidString) {
         let request = UNNotificationRequest(
-            identifier: UUID().uuidString,
+            identifier: identifier,
             content: content,
             trigger: nil
         )
@@ -122,4 +145,93 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
             }
         }
     }
+}
+
+// MARK: - Assistência Teams (2.0)
+
+extension NotificationManager: AssistanceNotifying {
+    static let startCategory = "MT_ASSISTED_START"
+    static let endCategory = "MT_ASSISTED_END"
+    static let offerIDKey = "offerID"
+
+    /// Ações sem `.foreground`: responder não abre o menu nem tira o foco do
+    /// Teams. `.customDismissAction` só registra que o aviso foi fechado.
+    static var assistanceCategories: Set<UNNotificationCategory> {
+        let start = UNNotificationCategory(
+            identifier: startCategory,
+            actions: [
+                UNNotificationAction(identifier: CallAssistant.Action.startNow.rawValue, title: "Gravar agora", options: []),
+                UNNotificationAction(identifier: CallAssistant.Action.decline.rawValue, title: "Não gravar nesta chamada", options: [])
+            ],
+            intentIdentifiers: [],
+            options: [.customDismissAction]
+        )
+        let end = UNNotificationCategory(
+            identifier: endCategory,
+            actions: [
+                UNNotificationAction(identifier: CallAssistant.Action.stopAndTranscribe.rawValue, title: "Encerrar e transcrever", options: []),
+                UNNotificationAction(identifier: CallAssistant.Action.continueRecording.rawValue, title: "Continuar gravando", options: [])
+            ],
+            intentIdentifiers: [],
+            options: [.customDismissAction]
+        )
+        return [start, end]
+    }
+
+    /// Corpo da notificação só navega (abre a revisão); nunca grava nem para.
+    static func assistanceAction(category: String, actionIdentifier: String) -> CallAssistant.Action? {
+        guard category == startCategory || category == endCategory else { return nil }
+        switch actionIdentifier {
+        case UNNotificationDefaultActionIdentifier: return .openReview
+        case UNNotificationDismissActionIdentifier: return .dismissed
+        default:
+            guard let action = CallAssistant.Action(rawValue: actionIdentifier) else { return nil }
+            switch (category, action) {
+            case (startCategory, .startNow), (startCategory, .decline),
+                 (endCategory, .stopAndTranscribe), (endCategory, .continueRecording):
+                return action
+            default:
+                return nil
+            }
+        }
+    }
+
+    /// Texto genérico: banner aparece em compartilhamento de tela, então o
+    /// título da reunião só aparece no menu ou na janela aberta pela pessoa.
+    static func assistanceContent(for offer: CallAssistant.Offer) -> UNMutableNotificationContent {
+        let content = UNMutableNotificationContent()
+        switch offer.kind {
+        case .start:
+            content.title = "Chamada do Teams detectada"
+            content.body = "Deseja gravar esta chamada? Clique para revisar o título."
+            content.categoryIdentifier = startCategory
+        case .end:
+            content.title = "A chamada parece ter terminado"
+            content.body = "A gravação continua até você encerrar."
+            content.categoryIdentifier = endCategory
+        }
+        // Sem som: a pergunta não compete com o áudio da reunião.
+        content.sound = nil
+        content.userInfo = [offerIDKey: offer.id.uuidString, "kind": offer.kind.rawValue]
+        return content
+    }
+
+    @MainActor
+    func postOffer(_ offer: CallAssistant.Offer) {
+        deliver(
+            Self.assistanceContent(for: offer),
+            kind: "assistance-\(offer.kind.rawValue)",
+            identifier: Self.requestIdentifier(offer.id)
+        )
+    }
+
+    @MainActor
+    func removeOffer(id: UUID) {
+        let identifier = Self.requestIdentifier(id)
+        let center = UNUserNotificationCenter.current()
+        center.removePendingNotificationRequests(withIdentifiers: [identifier])
+        center.removeDeliveredNotifications(withIdentifiers: [identifier])
+    }
+
+    static func requestIdentifier(_ offerID: UUID) -> String { "assistance-\(offerID.uuidString)" }
 }

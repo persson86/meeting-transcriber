@@ -19,6 +19,46 @@ Speaker labels are track based: microphone audio is labeled `Você`, system audi
 is labeled `Interlocutor`. Optional local clustering can split the system track
 into heuristic `Remote_A`, `Remote_B`, etc. labels.
 
+## What's New in 2.0
+
+**Teams assistance (opt-in).** Turn on **Perguntar ao entrar em chamada do
+Teams** at the bottom of the menu. The app then watches, once per second,
+whether a Microsoft Teams process is using the microphone (Core Audio process
+metadata only: no audio is read, no device is opened). It never starts or
+stops a recording on its own; it asks.
+
+- **Call starts** (Teams microphone active for 2 s): a silent notification
+  offers **Gravar agora** / **Não gravar nesta chamada**, and the same question
+  appears at the top of the menu with an editable title. If exactly one
+  eligible Calendar event starts within 5 minutes of the moment the call
+  began, its title is suggested in the menu (Calendar is only read if access
+  was already granted; the app never asks for it here). Only the title is
+  used: attendees are attached only when you pick the event with the Calendar
+  button. An empty title falls back to date and time. Notifications are
+  generic and never show meeting titles (banners appear during screen
+  sharing). Clicking the body of the notification opens a small review window;
+  only the buttons record.
+- **Call seems to end** (Teams microphone idle for 12 s) in a recording that
+  the assistance started: a notification asks **Encerrar e transcrever** /
+  **Continuar gravando**. Ignoring it keeps recording, with no repeated
+  reminders. Recordings started from the menu never get this question.
+- Mute, silence and short device switches do not end a call. Answers to an old
+  notification (another call, another recording) are ignored.
+- While recording, the title can be edited with the pencil next to it; a title
+  that no longer names a Calendar event picked with the button drops that
+  event's attendees.
+- The session record stores `startOrigin` (`manual` / `assisted`) and the stop
+  reason `user_confirmed_assisted_end`.
+
+Requires macOS 14.2 or later for the assistance; on older systems the toggle
+explains it is unavailable and manual recording is unchanged. Diagnostics:
+`log stream --predicate 'subsystem == "io.github.meetingtranscriber.app" AND category == "assistance"'`.
+
+Not changed: capture, pipeline (0.10.0), integrity rules, manual recording.
+Known unknown: which Teams process holds the microphone in a real call (main
+app or a helper) has not been measured on a live call yet; the matcher accepts
+`com.microsoft.teams*` bundle IDs and executables inside `Microsoft Teams.app`.
+
 ## What's New in 1.9.0
 
 Two capture changes, both measured in the hardware battery of 7 Oct with a
@@ -450,6 +490,9 @@ it with `tccutil reset ScreenCapture <bundle-id>` and relaunch.
 3. Enter a meeting title or click **Usar reunião atual ou próxima do Calendar**.
 4. Click **Iniciar gravação** to begin recording.
 5. Click **Parar e adicionar à fila** to save audio and enqueue the transcription.
+   With the Teams assistance on, the app can also ask to start and stop for you
+   (see [What's New in 2.0](#whats-new-in-20)); it never does either without
+   your click.
 6. Follow progress in the **Transcrições** section. JSONL and Markdown files are
    written to the configured output directory.
 

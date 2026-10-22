@@ -15,7 +15,11 @@ private enum MenuLayout {
 
 struct MenuBarView: View {
     @EnvironmentObject var state: AppState
+    @EnvironmentObject var assistant: CallAssistant
     @State private var showDirPicker = false
+    /// Edição do título durante a gravação (2.0): Enter aplica, Esc cancela.
+    @State private var editingTitle: String?
+    @FocusState private var titleFieldFocused: Bool
     @State private var jobPendingCancellation: TranscriptionJob?
 
     var body: some View {
@@ -76,6 +80,9 @@ struct MenuBarView: View {
 
             // ── Idle / active content ─────────────────────────────────────
             VStack(alignment: .leading, spacing: MenuLayout.sectionSpacing) {
+
+                // Pergunta pendente da assistência Teams (início ou fim).
+                AssistOfferCard()
 
                 if case .idle = state.status {
                     VStack(alignment: .leading, spacing: MenuLayout.controlSpacing) {
@@ -154,15 +161,49 @@ struct MenuBarView: View {
                     }
 
                 } else {
-                    // Recording / stopping — show read-only info
-                    HStack {
-                        Text(state.meetingTitle)
-                            .font(.body.weight(.medium))
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                        Spacer()
-                        Text(languageLabel(state.language))
-                            .font(.subheadline)
+                    // Recording / stopping — título editável só durante a gravação
+                    if let draft = editingTitle, state.status.isRecording {
+                        HStack(spacing: MenuLayout.controlSpacing) {
+                            TextField("Título da transcrição", text: Binding(
+                                get: { draft },
+                                set: { editingTitle = $0 }
+                            ))
+                            .textFieldStyle(.roundedBorder)
+                            .focused($titleFieldFocused)
+                            .onSubmit { applyTitleEdit() }
+                            .onExitCommand { editingTitle = nil }
+                            Button("Aplicar") { applyTitleEdit() }
+                                .buttonStyle(.bordered)
+                        }
+                    } else {
+                        HStack {
+                            Text(state.meetingTitle)
+                                .font(.body.weight(.medium))
+                                .lineLimit(2)
+                                .truncationMode(.tail)
+                            Spacer()
+                            if state.status.isRecording {
+                                Button {
+                                    editingTitle = state.meetingTitle
+                                    titleFieldFocused = true
+                                } label: {
+                                    Image(systemName: "pencil")
+                                        .frame(width: MenuLayout.iconButtonSize, height: MenuLayout.iconButtonSize)
+                                        .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .foregroundColor(.secondary)
+                                .help("Editar título")
+                                .accessibilityLabel("Editar título")
+                            }
+                            Text(languageLabel(state.language))
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    if state.status.isRecording, let origin = state.currentOrigin {
+                        Text(originLabel(origin))
+                            .font(.caption)
                             .foregroundColor(.secondary)
                     }
 
@@ -437,6 +478,12 @@ struct MenuBarView: View {
                 .padding(MenuLayout.padding)
             }
 
+            // ── Assistência Teams ─────────────────────────────────────────
+            Divider()
+            AssistanceToggleRow()
+                .padding(.horizontal, MenuLayout.padding)
+                .padding(.vertical, MenuLayout.controlSpacing)
+
             // ── Footer ────────────────────────────────────────────────────
             Divider()
 
@@ -589,6 +636,22 @@ struct MenuBarView: View {
         case .stopping:  return .orange
         case .importing: return .blue
         case .error:     return .red
+        }
+    }
+
+    private func applyTitleEdit() {
+        if let draft = editingTitle { state.renameActiveRecording(draft) }
+        editingTitle = nil
+    }
+
+    private func originLabel(_ origin: RecordingOrigin) -> String {
+        switch origin {
+        case .manual:
+            return "Iniciada manualmente"
+        case .assisted:
+            return assistant.assistedSessionID != nil
+                ? "Iniciada pela pergunta do Teams · perguntaremos ao fim da chamada"
+                : "Iniciada pela pergunta do Teams · sem pergunta de fim nesta gravação"
         }
     }
 

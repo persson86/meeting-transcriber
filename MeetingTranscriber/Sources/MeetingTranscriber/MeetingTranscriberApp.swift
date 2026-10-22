@@ -4,7 +4,9 @@ import CoreGraphics
 
 @main
 struct MeetingTranscriberApp: App {
-    @StateObject private var appState = AppState()
+    @StateObject private var appState: AppState
+    @StateObject private var assistant: CallAssistant
+    private let reviewWindow: AssistReviewWindowController
     @NSApplicationDelegateAdaptor(URLSchemeDelegate.self) private var urlSchemeDelegate
 
     init() {
@@ -12,6 +14,18 @@ struct MeetingTranscriberApp: App {
         HardwareSelfTest.runIfRequested()
         #endif
         NotificationManager.shared.requestAuthorization()
+        // Assistência Teams (2.0): observa e oferece; só gestos explícitos
+        // chamam start/stop do AppState.
+        let state = AppState()
+        let assistant = CallAssistant(recorder: state, notifier: NotificationManager.shared)
+        let reviewWindow = AssistReviewWindowController(state: state, assistant: assistant)
+        state.onCaptureStarted = { [weak assistant] id, origin in assistant?.captureStarted(sessionID: id, origin: origin) }
+        state.onCaptureEnded = { [weak assistant] id in assistant?.captureEnded(sessionID: id) }
+        assistant.presentReview = { [weak reviewWindow] in reviewWindow?.present() }
+        _appState = StateObject(wrappedValue: state)
+        _assistant = StateObject(wrappedValue: assistant)
+        self.reviewWindow = reviewWindow
+        assistant.activate()
         let dir = UserDefaults.standard.url(forKey: "outputDirectory")
             ?? AppConfig.defaultOutputDirectory
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -23,21 +37,12 @@ struct MeetingTranscriberApp: App {
         MenuBarExtra {
             MenuBarView()
                 .environmentObject(appState)
+                .environmentObject(assistant)
         } label: {
             // Alerta visível mesmo em call/compartilhamento de tela, quando a
-            // notificação costuma ficar suprimida: erro = logo com selo vermelho.
-            switch appState.appIndicator {
-            case .error:
-                Image(nsImage: AppIndicatorImage.logoWithErrorBadge())
-            case .attention:
-                Image(nsImage: AppIndicatorImage.logoWithErrorBadge(color: .systemOrange))
-            case .recording:
-                Image(systemName: "record.circle.fill")
-                    .symbolRenderingMode(.hierarchical)
-                    .foregroundStyle(.red)
-            case .idle:
-                Image(systemName: AppIndicatorImage.logoSymbol)
-            }
+            // notificação costuma ficar suprimida: erro = logo com selo vermelho;
+            // pergunta da assistência = selo azul com "?".
+            MenuBarIcon(state: appState, assistant: assistant)
         }
         .menuBarExtraStyle(.window)
     }

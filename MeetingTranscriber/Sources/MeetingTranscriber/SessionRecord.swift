@@ -21,17 +21,22 @@ struct SessionRecord: Codable, Equatable {
     var pipelineDirty: Bool?
     var recordingStartedAt: Date?
     var recordingStoppedAt: Date?
-    /// "user", "quit" ou "error".
+    /// "user", "quit", "error" ou, na 2.0, "user_confirmed_assisted_end"
+    /// (Encerrar confirmado na pergunta de fim da assistência Teams).
     var stopReason: String?
+    /// 2.0: "manual" ou "assisted" (confirmada numa oferta da assistência
+    /// Teams). Ausente em sessões anteriores: origem desconhecida.
+    var startOrigin: String? = nil
     /// Dispositivo de entrada efetivo lido no stop (ex.: "MacBook Air Microphone").
     var inputDevice: String?
     var asrAttempts: [ASRAttempt] = []
 
-    static func starting(at date: Date) -> SessionRecord {
+    static func starting(at date: Date, origin: RecordingOrigin? = nil) -> SessionRecord {
         SessionRecord(
             appVersion: AppVersion.app,
             appBuild: Bundle.main.infoDictionary?["CFBundleVersion"] as? String,
-            recordingStartedAt: date
+            recordingStartedAt: date,
+            startOrigin: origin?.rawValue
         )
     }
 }
@@ -98,4 +103,5 @@ enum AppLog {
     static let recovery = Logger(subsystem: subsystem, category: "recovery")
     static let queue = Logger(subsystem: subsystem, category: "queue")
     static let runner = Logger(subsystem: subsystem, category: "runner")
+    static let assistance = Logger(subsystem: subsystem, category: "assistance")
 }

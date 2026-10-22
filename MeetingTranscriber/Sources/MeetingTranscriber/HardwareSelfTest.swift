@@ -33,6 +33,31 @@ enum HardwareSelfTest {
             engine.stop()
             exit(0)
         }
+        // 2.0: leitura real do Core Audio pelo detector da assistência, sem abrir
+        // áudio. `--assistance-extra <bundle>` conta outro app como "Teams" (ex.:
+        // um --call-process deste mesmo bundle, que tem outro PID).
+        if let index = args.firstIndex(of: "--assistance-probe"), index + 1 < args.count {
+            let seconds = Int(args[index + 1]) ?? 40
+            var matcher = CallAppMatcher()
+            if let extra = args.firstIndex(of: "--assistance-extra"), extra + 1 < args.count {
+                matcher.bundleIDPrefixes.append(args[extra + 1])
+            }
+            let provider = CoreAudioProcessActivityProvider()
+            var detector = CallEpisodeDetector()
+            let origin = ProcessInfo.processInfo.systemUptime
+            for _ in 0..<seconds {
+                let now = ProcessInfo.processInfo.systemUptime - origin
+                let snapshot = provider.snapshot()
+                let matched = (snapshot ?? []).filter(matcher.matches).map { "\($0.pid):\($0.bundleID):in=\($0.isRunningInput.map(String.init) ?? "?")" }
+                let active = matcher.callActive(in: snapshot)
+                let event = detector.ingest(active: active, at: now, wall: Date())
+                print(String(format: "t=%.1f", now), "active=\(active.map(String.init) ?? "nil")",
+                      "matched=\(matched)", event.map { "EVENT=\($0)" } ?? "")
+                fflush(stdout)
+                Thread.sleep(forTimeInterval: 1)
+            }
+            exit(0)
+        }
         guard let index = args.firstIndex(of: "--hardware-selftest"), index + 2 < args.count else { return }
         let directory = URL(fileURLWithPath: args[index + 1])
         let seconds = Double(args[index + 2]) ?? 60

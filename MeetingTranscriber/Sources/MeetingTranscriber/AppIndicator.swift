@@ -35,15 +35,38 @@ enum AppIndicator: Equatable {
 enum AppIndicatorImage {
     static let logoSymbol = "mic.circle"
     static let errorBadgeSymbol = "exclamationmark.circle.fill"
+    /// 2.0: pergunta pendente da assistência Teams (azul, forma distinta do erro).
+    static let questionBadgeSymbol = "questionmark.circle.fill"
 
     /// Logo do app com selo vermelho no canto superior direito. Não é template: o
     /// vermelho precisa sobreviver na barra de menu. O glifo usa `labelColor`,
     /// resolvido na hora do desenho, então acompanha o tema claro/escuro.
-    static func logoWithErrorBadge(size: CGFloat = 18, color: NSColor = .systemRed) -> NSImage {
+    static func logoWithErrorBadge(
+        size: CGFloat = 18,
+        color: NSColor = .systemRed,
+        badgeSymbol: String = errorBadgeSymbol,
+        accessibility: String = "Meeting Transcriber com erro"
+    ) -> NSImage {
+        badged(base: logoSymbol, baseColor: .labelColor, badge: badgeSymbol, badgeColor: color, size: size, accessibility: accessibility)
+    }
+
+    /// Gravando com pergunta de fim pendente: o ponto vermelho continua visível.
+    static func recordingWithQuestionBadge(size: CGFloat = 18) -> NSImage {
+        badged(
+            base: "record.circle.fill", baseColor: .systemRed,
+            badge: questionBadgeSymbol, badgeColor: .systemBlue, size: size,
+            accessibility: "Meeting Transcriber gravando, pergunta de encerramento pendente"
+        )
+    }
+
+    private static func badged(
+        base: String, baseColor: NSColor, badge badgeSymbol: String, badgeColor color: NSColor,
+        size: CGFloat, accessibility: String
+    ) -> NSImage {
         let image = NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
             let logoConfig = NSImage.SymbolConfiguration(pointSize: size * 0.78, weight: .regular)
-                .applying(NSImage.SymbolConfiguration(paletteColors: [.labelColor]))
-            if let logo = NSImage(systemSymbolName: logoSymbol, accessibilityDescription: nil)?
+                .applying(NSImage.SymbolConfiguration(paletteColors: [baseColor]))
+            if let logo = NSImage(systemSymbolName: base, accessibilityDescription: nil)?
                 .withSymbolConfiguration(logoConfig) {
                 let logoSize = logo.size
                 logo.draw(in: NSRect(
@@ -57,13 +80,13 @@ enum AppIndicatorImage {
             let badgeRect = NSRect(x: rect.maxX - badgeSide, y: rect.maxY - badgeSide, width: badgeSide, height: badgeSide)
             let badgeConfig = NSImage.SymbolConfiguration(pointSize: badgeSide, weight: .bold)
                 .applying(NSImage.SymbolConfiguration(paletteColors: [.white, color]))
-            NSImage(systemSymbolName: errorBadgeSymbol, accessibilityDescription: nil)?
+            NSImage(systemSymbolName: badgeSymbol, accessibilityDescription: nil)?
                 .withSymbolConfiguration(badgeConfig)?
                 .draw(in: badgeRect)
             return true
         }
         image.isTemplate = false
-        image.accessibilityDescription = "Meeting Transcriber com erro"
+        image.accessibilityDescription = accessibility
         return image
     }
 }
