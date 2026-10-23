@@ -19,6 +19,37 @@ Speaker labels are track based: microphone audio is labeled `Você`, system audi
 is labeled `Interlocutor`. Optional local clustering can split the system track
 into heuristic `Remote_A`, `Remote_B`, etc. labels.
 
+## What's New in 2.2
+
+**Redesigned menu.** One layout per moment, with the decisive buttons never
+truncated:
+
+- **Idle:** a single optional title field (*Título da transcrição*; empty
+  falls back to date and time), the Calendar button, language and
+  **Iniciar gravação**.
+- **Teams asks to record:** the question sits in a box at the top with
+  **Não gravar nesta chamada** / **Iniciar gravação** side by side; no second
+  title field or start button competes with it. Enter never starts a
+  recording and Esc never touches audio.
+- **Recording:** title with **Editar título**, the origin (*Iniciada após sua
+  confirmação* / *Iniciada manualmente · encerramento manual*), a large timer,
+  a capture health box for Microfone and Sistema, and **Encerrar gravação**
+  right below it. The end question (**Continuar gravando** /
+  **Encerrar e transcrever**) appears in a box above the title.
+- **Assistência Teams row:** state in one line plus **Ativar…**, **Pausar** or
+  **Retomar**. Pausing stops watching Teams until resumed (it survives
+  restarts); a recording in progress keeps going and loses its end question.
+- **Settings (gear in the footer):** assistance on/off, *Transcrever só na
+  tomada e fora de chamadas* and the output folder. They no longer live at the
+  bottom of the menu.
+- Header shows a status dot and text (*Não está gravando · decisão pendente*,
+  *Gravando*, *transcrição em pausa*); the queue is now *Transcrições
+  recentes*, with the same per-job actions.
+- Notification copy: *O Teams está usando áudio. Deseja gravar?* and *A
+  chamada parece ter terminado.*
+
+Not changed: capture, pipeline (0.10.1), queue rules, integrity rules.
+
 ## What's New in 2.1
 
 **Transcription waits for power and for the end of the call.** With
@@ -522,7 +553,7 @@ it with `tccutil reset ScreenCapture <bundle-id>` and relaunch.
 2. Click the microphone icon in the macOS menu bar.
 3. Enter a meeting title or click **Usar reunião atual ou próxima do Calendar**.
 4. Click **Iniciar gravação** to begin recording.
-5. Click **Parar e adicionar à fila** to save audio and enqueue the transcription.
+5. Click **Encerrar gravação** to save audio and enqueue the transcription.
    With the Teams assistance on, the app can also ask to start and stop for you
    (see [What's New in 2.0](#whats-new-in-20)); it never does either without
    your click.
@@ -571,7 +602,7 @@ use **Reiniciar microfone**; the app also retries on its own. See
 [What's New in 1.6](#whats-new-in-16).
 
 Click the output folder name in the footer to open it directly in Finder;
-click the pencil icon next to it to change the output folder.
+change the output folder in the settings (gear icon in the footer).
 
 ## External Recommendation Trigger
 

@@ -60,6 +60,7 @@ final class CallAssistant: ObservableObject {
     }
 
     static let enabledDefaultsKey = "assistanceEnabled"
+    static let pausedDefaultsKey = "assistancePaused"
     /// Janela entre o início observado da chamada e o início do evento.
     static let calendarTolerance: TimeInterval = 5 * 60
     /// Logo após o app iniciar ou parar a captura, a troca da entrada padrão
@@ -71,6 +72,8 @@ final class CallAssistant: ObservableObject {
     static weak var current: CallAssistant?
 
     @Published private(set) var isEnabled: Bool
+    /// Ligada, mas sem observar até a pessoa retomar (persiste entre aberturas).
+    @Published private(set) var isPaused: Bool
     @Published private(set) var availability: Availability = .off
     @Published private(set) var offer: Offer?
     /// Rascunho de título da oferta de início; compartilhado entre menu e janela.
@@ -137,12 +140,13 @@ final class CallAssistant: ObservableObject {
         self.uptime = uptime
         self.pollInterval = pollInterval
         self.isEnabled = defaults.bool(forKey: Self.enabledDefaultsKey)
+        self.isPaused = defaults.bool(forKey: Self.pausedDefaultsKey)
     }
 
     /// Liga a observação se a preferência estiver ativa. Chamado uma vez pelo app.
     func activate() {
         Self.current = self
-        if isEnabled { startObserving() }
+        if isEnabled, !isPaused { startObserving() }
     }
 
     // MARK: - Preferência
@@ -155,14 +159,34 @@ final class CallAssistant: ObservableObject {
         defaults.set(enabled, forKey: Self.enabledDefaultsKey)
         AppLog.assistance.info("assistance enabled=\(enabled, privacy: .public)")
         if enabled {
+            setPausedFlag(false)
             startObserving()
         } else {
-            stopObserving()
-            withdrawOffer()
-            assistedSessionID = nil
-            assistedEpisode = nil
-            availability = .off
+            setPausedFlag(false)
+            standDown()
         }
+    }
+
+    /// Pausar só para de observar: a gravação corrente continua e perde a
+    /// pergunta de fim; retomar não a readota.
+    func setPaused(_ paused: Bool) {
+        guard isEnabled, paused != isPaused else { return }
+        setPausedFlag(paused)
+        AppLog.assistance.info("assistance paused=\(paused, privacy: .public)")
+        if paused { standDown() } else { startObserving() }
+    }
+
+    private func setPausedFlag(_ paused: Bool) {
+        isPaused = paused
+        defaults.set(paused, forKey: Self.pausedDefaultsKey)
+    }
+
+    private func standDown() {
+        stopObserving()
+        withdrawOffer()
+        assistedSessionID = nil
+        assistedEpisode = nil
+        availability = .off
     }
 
     private func startObserving() {
@@ -194,6 +218,20 @@ final class CallAssistant: ObservableObject {
         detector.reset()
     }
 
+    #if DEBUG
+    /// Só para snapshots da interface nos testes: pergunta pendente sem detector.
+    func _previewOffer(_ kind: Kind, suggestion: CalendarMeeting? = nil, assistedSession: UUID? = nil) {
+        offer = Offer(id: UUID(), kind: kind, episode: UUID(), sessionID: assistedSession, createdAt: Date())
+        assistedSessionID = assistedSession
+        if let suggestion {
+            self.suggestion = suggestion
+            applyingSuggestion = true
+            draftTitle = AppState.calendarTitle(for: suggestion)
+            applyingSuggestion = false
+        }
+    }
+    #endif
+
     nonisolated static var platformSupported: Bool {
         if #available(macOS 14.2, *) { return true }
         return false
@@ -203,7 +241,7 @@ final class CallAssistant: ObservableObject {
 
     /// Uma leitura do detector. Interno para os testes com relógio virtual.
     func ingest(active: Bool?, at time: TimeInterval, wall: Date) {
-        guard isEnabled else { return }
+        guard isEnabled, !isPaused else { return }
         if active == nil {
             consecutiveReadFailures += 1
             if consecutiveReadFailures >= 5, availability == .observing {
@@ -325,7 +363,7 @@ final class CallAssistant: ObservableObject {
         deferredEnd = nil
         switch origin {
         case .assisted:
-            assistedSessionID = isEnabled ? sessionID : nil
+            assistedSessionID = isEnabled && !isPaused ? sessionID : nil
             assistedEpisode = pendingAssistedEpisode
         case .manual:
             // Iniciar manualmente responde à oferta pendente: some, sem pergunta

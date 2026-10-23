@@ -892,6 +892,14 @@ final class AppState: ObservableObject {
 
     static let deferDefaultsKey = "deferTranscriptionWhenBusy"
 
+    #if DEBUG
+    /// Só para snapshots da interface nos testes: estado de captura sem hardware.
+    func _previewCapture(origin: RecordingOrigin, proof: CaptureProof?) {
+        currentOrigin = origin
+        captureProof = proof
+    }
+    #endif
+
     /// Liga os monitores de energia e de chamada. Chamado uma vez pelo app; os
     /// testes alimentam `onBattery`/`callActive` direto.
     func attachDeferralMonitors(power: PowerSourceReading, call: CallActivityMonitor) {

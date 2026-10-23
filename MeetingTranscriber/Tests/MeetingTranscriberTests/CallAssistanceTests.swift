@@ -480,6 +480,50 @@ final class CallAssistantTests: XCTestCase {
         XCTAssertTrue(recorder.stops.isEmpty)
     }
 
+    func testPauseWithdrawsThePendingQuestionAndIgnoresCallsUntilResumed() async {
+        await run(false, seconds: 1)
+        await run(true, seconds: 3)
+        let offer = try! XCTUnwrap(assistant.offer)
+        assistant.setPaused(true)
+        XCTAssertTrue(assistant.isPaused)
+        XCTAssertNil(assistant.offer)
+        XCTAssertTrue(notifier.removed.contains(offer.id))
+        XCTAssertEqual(assistant.availability, .off)
+        await run(false, seconds: 15)
+        await run(true, seconds: 10)
+        XCTAssertNil(assistant.offer)
+        XCTAssertEqual(notifier.posted.count, 1)
+
+        assistant.setPaused(false)
+        XCTAssertEqual(assistant.availability, .observing)
+        await run(false, seconds: 15)
+        await run(true, seconds: 3)
+        XCTAssertEqual(assistant.offer?.kind, .start)
+        XCTAssertTrue(recorder.starts.isEmpty)
+    }
+
+    func testPausingDuringAssistedRecordingKeepsAudioAndDropsTheEndQuestion() async {
+        await startAssistedCall()
+        assistant.setPaused(true)
+        XCTAssertNotNil(recorder.activeSessionID)
+        XCTAssertNil(assistant.assistedSessionID)
+        assistant.setPaused(false)
+        await run(true, seconds: 10)
+        await run(false, seconds: 30)
+        XCTAssertNil(assistant.offer)
+        XCTAssertTrue(recorder.stops.isEmpty)
+    }
+
+    func testPauseNeedsAssistanceOnAndTurningOffClearsIt() {
+        assistant.setPaused(true)
+        assistant.setEnabled(false)
+        XCTAssertFalse(assistant.isPaused)
+        assistant.setPaused(true)
+        XCTAssertFalse(assistant.isPaused, "desligada não pausa")
+        assistant.setEnabled(true)
+        XCTAssertFalse(assistant.isPaused)
+    }
+
     func testEndQuestionDisappearsWhenUserStopsManually() async {
         await startAssistedCall()
         await run(false, seconds: 13)
@@ -601,7 +645,8 @@ final class AssistanceNotificationRoutingTests: XCTestCase {
         XCTAssertEqual(content.categoryIdentifier, NotificationManager.startCategory)
         XCTAssertEqual(content.userInfo["offerID"] as? String, offer.id.uuidString)
         // Genérico: nenhum título de reunião no banner.
-        XCTAssertEqual(content.body, "Deseja gravar esta chamada? Clique para revisar o título.")
+        XCTAssertEqual(content.title, "O Teams está usando áudio. Deseja gravar?")
+        XCTAssertEqual(content.body, "Clique no aviso para definir um título.")
     }
 }
 

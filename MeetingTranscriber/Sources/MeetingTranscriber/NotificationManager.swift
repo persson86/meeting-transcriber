@@ -202,12 +202,12 @@ extension NotificationManager: AssistanceNotifying {
         let content = UNMutableNotificationContent()
         switch offer.kind {
         case .start:
-            content.title = "Chamada do Teams detectada"
-            content.body = "Deseja gravar esta chamada? Clique para revisar o título."
+            content.title = "O Teams está usando áudio. Deseja gravar?"
+            content.body = "Clique no aviso para definir um título."
             content.categoryIdentifier = startCategory
         case .end:
-            content.title = "A chamada parece ter terminado"
-            content.body = "A gravação continua até você encerrar."
+            content.title = "A chamada parece ter terminado."
+            content.body = "A gravação continua até sua confirmação."
             content.categoryIdentifier = endCategory
         }
         // Sem som: a pergunta não compete com o áudio da reunião.
