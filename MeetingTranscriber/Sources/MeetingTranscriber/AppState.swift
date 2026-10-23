@@ -101,14 +101,27 @@ final class AppState: ObservableObject {
     @Published var status: RecordingStatus = .idle {
         didSet { applyTranscriptionPause() }
     }
-    /// Transcrições em andamento suspensas durante a gravação.
+    /// Transcrições suspensas: durante a gravação e, com o adiamento ligado,
+    /// na bateria ou em chamada do Teams. Retomam de onde pararam (SIGCONT).
     @Published private(set) var transcriptionsPaused = false
+    @Published private(set) var transcriptionPauseReason: TranscriptionPauseReason?
+    /// "Transcrever só na tomada e fora de chamadas" (padrão ligado).
+    @Published private(set) var deferTranscriptionWhenBusy: Bool
+    /// "Retomar agora": fura bateria/chamada até a fila esvaziar.
+    @Published private(set) var transcriptionDeferralOverridden = false
+    /// Estado do ambiente, alimentado pelos monitores (ou pelos testes).
+    var onBattery = false { didSet { if onBattery != oldValue { applyTranscriptionPause() } } }
+    var callActive = false { didSet { if callActive != oldValue { applyTranscriptionPause() } } }
+    private var powerSource: PowerSourceReading?
+    private var callMonitor: CallActivityMonitor?
     @Published var meetingTitle: String = ""
     @Published var lastWarning: String?
     @Published var lastOutputURL: URL?
     @Published var outputDirectory: URL
     @Published var language: String  // "pt" | "en" | "auto"
-    @Published var transcriptionJobs: [TranscriptionJob] = []
+    @Published var transcriptionJobs: [TranscriptionJob] = [] {
+        didSet { refreshDeferralObservation() }
+    }
     @Published var isCalendarSyncing = false
     /// Mensagem de alerta enquanto o microfone está sem entregar áudio durante a
     /// gravação. O ícone da barra de menu muda enquanto não for nil.
@@ -177,6 +190,7 @@ final class AppState: ObservableObject {
         outputDirectory = UserDefaults.standard.url(forKey: "outputDirectory")
             ?? AppConfig.defaultOutputDirectory
         language = UserDefaults.standard.string(forKey: "language") ?? "pt"
+        deferTranscriptionWhenBusy = UserDefaults.standard.object(forKey: Self.deferDefaultsKey) as? Bool ?? true
         // Vazio de propósito: o título padrão é calculado no início da gravação,
         // não no stop anterior (o horário ficava errado em até 16 h).
         meetingTitle = ""
@@ -857,13 +871,69 @@ final class AppState: ObservableObject {
     /// O mlx-whisper rodava logo após cada reunião e, em 23 de 55 sessões, durante
     /// a seguinte: disputava o Mac com a captura. Agora o que está rodando é
     /// suspenso enquanto há gravação, e nada novo começa até ela terminar.
+    /// Na bateria ou em chamada o ASR também espera: no Air sem ventoinha ele
+    /// disputava CPU, memória e temperatura com o Teams.
     private func applyTranscriptionPause() {
-        let paused = status.isCapturing
+        let reason = TranscriptionPausePolicy.reason(
+            capturing: status.isCapturing,
+            deferEnabled: deferTranscriptionWhenBusy,
+            overridden: transcriptionDeferralOverridden,
+            callActive: callActive,
+            onBattery: onBattery
+        )
+        if reason != transcriptionPauseReason { transcriptionPauseReason = reason }
+        let paused = reason != nil
         guard paused != transcriptionsPaused else { return }
         transcriptionsPaused = paused
         for runner in runners.values { runner.setPaused(paused) }
-        AppLog.queue.info("asr \(paused ? "pausado" : "retomado", privacy: .public) jobs=\(self.runners.count, privacy: .public)")
+        AppLog.queue.info("asr \(paused ? "pausado" : "retomado", privacy: .public) motivo=\(reason?.rawValue ?? "-", privacy: .public) jobs=\(self.runners.count, privacy: .public)")
         if !paused { scheduleTranscriptionJobs() }
+    }
+
+    static let deferDefaultsKey = "deferTranscriptionWhenBusy"
+
+    /// Liga os monitores de energia e de chamada. Chamado uma vez pelo app; os
+    /// testes alimentam `onBattery`/`callActive` direto.
+    func attachDeferralMonitors(power: PowerSourceReading, call: CallActivityMonitor) {
+        powerSource = power
+        callMonitor = call
+        onBattery = power.isOnBattery ?? false
+        power.startObserving { [weak self] onBattery in
+            MainActor.assumeIsolated { self?.onBattery = onBattery ?? false }
+        }
+        call.onChange = { [weak self] active in self?.callActive = active }
+        refreshDeferralObservation()
+    }
+
+    func setDeferTranscriptionWhenBusy(_ enabled: Bool) {
+        guard enabled != deferTranscriptionWhenBusy else { return }
+        deferTranscriptionWhenBusy = enabled
+        UserDefaults.standard.set(enabled, forKey: Self.deferDefaultsKey)
+        refreshDeferralObservation()
+        applyTranscriptionPause()
+    }
+
+    /// "Retomar agora": vale para bateria e chamada, nunca para a gravação.
+    func resumeTranscriptionsNow() {
+        guard transcriptionPauseReason?.canOverride == true else { return }
+        transcriptionDeferralOverridden = true
+        AppLog.queue.info("asr adiamento furado pelo usuário")
+        applyTranscriptionPause()
+    }
+
+    private var hasPendingTranscriptions: Bool {
+        transcriptionJobs.contains { $0.status.isQueued || $0.status.isRunning }
+    }
+
+    /// O Teams só é observado enquanto há transcrição a fazer; com a fila vazia
+    /// o "Retomar agora" deixa de valer.
+    private func refreshDeferralObservation() {
+        let pending = hasPendingTranscriptions
+        callMonitor?.setObserving(pending && deferTranscriptionWhenBusy)
+        if !pending, transcriptionDeferralOverridden {
+            transcriptionDeferralOverridden = false
+            applyTranscriptionPause()
+        }
     }
 
     private func scheduleTranscriptionJobs() {

@@ -30,6 +30,19 @@ from scipy.io import wavfile
 import transcript_signals as signals
 
 SAMPLE_RATE = 16000
+# Teto do cache de buffers Metal do MLX. Sem teto ele cresce a cada bloco (as
+# formas variam) até 10–12 GB e empurra o modelo para o swap num Mac de 16 GB;
+# 1–2 GB realocam por bloco e ficam mais lentos (bench 14/out). 0 = sem teto:
+# o padrão até validar 4096 com repetições (no bench, 4 GB perdeu 2 blocos).
+MLX_CACHE_LIMIT_MB = 0
+
+# Groq (PoC): API compatível com OpenAI. A chave nunca fica no código: vem de
+# GROQ_API_KEY ou do Keychain (serviço abaixo), criado pela própria pessoa.
+GROQ_API_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+GROQ_KEYCHAIN_SERVICE = "meeting-transcriber-groq"
+GROQ_DEFAULT_MODEL = "whisper-large-v3"
+GROQ_MAX_ATTEMPTS = 5
+GROQ_TIMEOUT_SEC = 120
 
 VAD_PARAMETERS = dict(
     min_speech_duration_ms=150,   # captura backchannels PT-BR curtos ("sim", "aham")
@@ -49,7 +62,7 @@ CHUNK_OVERLAP_SEC = 3.0
 CHUNK_DEDUP_TOLERANCE_SEC = 0.5
 TEXT_DENSITY_SUSPECT_CHARS_PER_SEC = 80.0
 
-PIPELINE_VERSION = "0.10.0"
+PIPELINE_VERSION = "0.10.1"
 DEFAULT_HOTWORD_LIMIT = 60
 PROMPT_TAIL_MAX_CHARS = 240
 RUNAWAY_UNICODE_MIN_REPEATS = 8
@@ -1309,8 +1322,15 @@ class MlxBackend:
     transcribe_track needs no changes.
     """
 
-    def __init__(self, model_repo: str) -> None:
+    def __init__(self, model_repo: str, cache_limit_mb: int = MLX_CACHE_LIMIT_MB) -> None:
         self.model_repo = model_repo
+        if cache_limit_mb > 0:
+            try:
+                import mlx.core as mx
+                mx.set_cache_limit(cache_limit_mb * 1024 * 1024)
+                print(f"  [MLX] cache limit {cache_limit_mb} MB", flush=True)
+            except Exception as exc:
+                print(f"  [MLX] cache limit not applied: {exc}", flush=True)
 
     def _resolve_model_path(self) -> str:
         """Return local snapshot dir if cached, else HF repo id (triggers download)."""
@@ -1406,6 +1426,207 @@ class MlxBackend:
         )
         language = result.get("language")
         return str(language) if language else None
+
+
+# ---------------------------------------------------------------------------
+# Groq backend (PoC) — Whisper na nuvem; o áudio sai do Mac
+# ---------------------------------------------------------------------------
+
+# verbose_json devolve o idioma por extenso.
+_GROQ_LANGUAGE_CODES = {"portuguese": "pt", "english": "en", "spanish": "es"}
+
+
+def groq_api_key() -> str:
+    """GROQ_API_KEY ou o item do Keychain; nunca de arquivo do projeto."""
+    key = os.environ.get("GROQ_API_KEY", "").strip()
+    if key:
+        return key
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", GROQ_KEYCHAIN_SERVICE, "-w"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        result = None
+    if result is not None and result.returncode == 0 and result.stdout.strip():
+        return result.stdout.strip()
+    raise RuntimeError(
+        "Chave da Groq não encontrada: defina GROQ_API_KEY ou crie o item "
+        f"'{GROQ_KEYCHAIN_SERVICE}' no Keychain."
+    )
+
+
+def wav_bytes(audio: np.ndarray) -> bytes:
+    """Trecho float32 16 kHz → WAV PCM 16-bit mono (32 kB por segundo)."""
+    import io
+    pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(SAMPLE_RATE)
+        handle.writeframes(pcm.tobytes())
+    return buffer.getvalue()
+
+
+def _multipart(fields: list[tuple[str, str]], file_bytes: bytes) -> tuple[bytes, str]:
+    import uuid
+    boundary = f"mt-{uuid.uuid4().hex}"
+    parts = []
+    for name, value in fields:
+        parts.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'
+            .encode("utf-8")
+        )
+    parts.append(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="chunk.wav"\r\n'
+        "Content-Type: audio/wav\r\n\r\n".encode("utf-8")
+    )
+    parts.append(file_bytes)
+    parts.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+
+def _words_by_segment(segments: list[dict], words: list[dict]) -> list[list[dict]]:
+    """A Groq devolve as palavras numa lista só; cada uma vai para o segmento
+    que contém o seu meio."""
+    grouped: list[list[dict]] = [[] for _ in segments]
+    for word in words:
+        start, end = word.get("start"), word.get("end")
+        if start is None or end is None:
+            continue
+        middle = (float(start) + float(end)) / 2
+        for index, seg in enumerate(segments):
+            if float(seg["start"]) <= middle <= float(seg["end"]):
+                grouped[index].append(word)
+                break
+    return grouped
+
+
+class GroqBackend:
+    """Whisper hospedado na Groq, com a mesma interface do MlxBackend.
+
+    Cada bloco vira um WAV e uma requisição (cobrança mínima de 10 s por
+    requisição). Recebe prompt + hotwords como o MLX; limiares de silêncio e
+    temperatura ficam no servidor. Só roda com consentimento explícito na CLI.
+    """
+
+    def __init__(self, model: str = GROQ_DEFAULT_MODEL, api_key: str | None = None,
+                 urlopen=None, sleep=None) -> None:
+        import time
+        import urllib.request
+        self.model = model
+        self._api_key = api_key or groq_api_key()
+        self._urlopen = urlopen or urllib.request.urlopen
+        self._sleep = sleep or time.sleep
+        self.requests = 0
+        self.billed_seconds = 0.0
+        self.audio_seconds = 0.0
+
+    def _request(self, audio: np.ndarray, fields: list[tuple[str, str]]) -> dict:
+        import urllib.error
+        import urllib.request
+        body, content_type = _multipart(fields, wav_bytes(audio))
+        request = urllib.request.Request(GROQ_API_URL, data=body, method="POST", headers={
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": content_type,
+        })
+        seconds = len(audio) / SAMPLE_RATE
+        for attempt in range(1, GROQ_MAX_ATTEMPTS + 1):
+            try:
+                with self._urlopen(request, timeout=GROQ_TIMEOUT_SEC) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                self.requests += 1
+                self.audio_seconds += seconds
+                self.billed_seconds += max(10.0, seconds)
+                return payload
+            except urllib.error.HTTPError as exc:
+                retryable = exc.code == 429 or exc.code >= 500
+                if not retryable or attempt == GROQ_MAX_ATTEMPTS:
+                    # Sem o corpo da resposta: pode ecoar parte da requisição.
+                    raise RuntimeError(f"Groq HTTP {exc.code} na tentativa {attempt}") from None
+                retry_after = exc.headers.get("retry-after") if exc.headers else None
+                try:
+                    wait = float(retry_after) if retry_after else 2.0 ** attempt
+                except ValueError:
+                    wait = 2.0 ** attempt
+                print(f"  [Groq] HTTP {exc.code}; nova tentativa em {wait:.0f}s", flush=True)
+                self._sleep(min(wait, 60.0))
+            except urllib.error.URLError as exc:
+                if attempt == GROQ_MAX_ATTEMPTS:
+                    raise RuntimeError(f"Groq inacessível: {exc.reason}") from None
+                self._sleep(2.0 ** attempt)
+        raise RuntimeError("Groq: tentativas esgotadas")
+
+    def transcribe(self, audio_input, **kwargs):
+        audio = audio_input if isinstance(audio_input, np.ndarray) else load_audio(audio_input)
+        initial_prompt = kwargs.get("initial_prompt") or ""
+        hotwords = kwargs.get("hotwords")
+        if hotwords:
+            initial_prompt = f"{initial_prompt} {hotwords}".strip()
+        fields = [
+            ("model", self.model),
+            ("response_format", "verbose_json"),
+            ("temperature", "0"),
+            ("timestamp_granularities[]", "segment"),
+        ]
+        if kwargs.get("word_timestamps"):
+            fields.append(("timestamp_granularities[]", "word"))
+        if kwargs.get("language"):
+            fields.append(("language", kwargs["language"]))
+        if initial_prompt:
+            fields.append(("prompt", initial_prompt))
+        result = self._request(audio, fields)
+
+        raw_segments = result.get("segments") or []
+        words = _words_by_segment(raw_segments, result.get("words") or [])
+        segments = [
+            SimpleNamespace(
+                start=float(seg["start"]),
+                end=float(seg["end"]),
+                text=seg.get("text", ""),
+                words=words[index] or None,
+                avg_logprob=seg.get("avg_logprob"),
+                no_speech_prob=seg.get("no_speech_prob"),
+                temperature=seg.get("temperature"),
+                compression_ratio=seg.get("compression_ratio"),
+            )
+            for index, seg in enumerate(raw_segments)
+            # O servidor não aplica no_speech_threshold: mesmo corte do Whisper local.
+            if not (
+                (seg.get("no_speech_prob") or 0) > kwargs.get("no_speech_threshold", 0.6)
+                and (seg.get("avg_logprob") or 0) < kwargs.get("log_prob_threshold", -0.8)
+            )
+        ]
+        info = SimpleNamespace(
+            duration=len(audio) / SAMPLE_RATE,
+            language=self._language_code(result.get("language")) or kwargs.get("language") or "pt",
+            language_probability=1.0,
+        )
+        return segments, info
+
+    def detect_language(self, audio_chunk: np.ndarray) -> str | None:
+        result = self._request(audio_chunk, [
+            ("model", self.model),
+            ("response_format", "verbose_json"),
+            ("temperature", "0"),
+        ])
+        return self._language_code(result.get("language"))
+
+    @staticmethod
+    def _language_code(language) -> str | None:
+        if not language:
+            return None
+        name = str(language).strip().lower()
+        return _GROQ_LANGUAGE_CODES.get(name, name)
+
+    def usage_line(self) -> str:
+        cost_per_hour = {"whisper-large-v3": 0.111, "whisper-large-v3-turbo": 0.04}.get(self.model)
+        cost = f", ~US${self.billed_seconds / 3600 * cost_per_hour:.4f}" if cost_per_hour else ""
+        return (
+            f"[Groq] {self.requests} requisições, {self.audio_seconds:.0f}s de áudio, "
+            f"{self.billed_seconds:.0f}s cobrados{cost}"
+        )
 
 
 def detect_chunk_language(model, audio_chunk: np.ndarray) -> str | None:
@@ -2877,8 +3098,24 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--backend", default="mlx", choices=["mlx", "faster-whisper"],
-        help="Backend de inferência: mlx (default, Apple Metal) ou faster-whisper (CPU)",
+        "--backend", default="mlx", choices=["mlx", "faster-whisper", "groq"],
+        help=(
+            "Backend de inferência: mlx (default, Apple Metal), faster-whisper (CPU) "
+            "ou groq (PoC na nuvem; exige --allow-cloud-asr)"
+        ),
+    )
+    parser.add_argument(
+        "--mlx-cache-limit-mb", type=int, default=MLX_CACHE_LIMIT_MB,
+        help="Teto do cache Metal do MLX em MB (0 = sem teto)",
+    )
+    parser.add_argument(
+        "--groq-model", default=GROQ_DEFAULT_MODEL,
+        choices=["whisper-large-v3", "whisper-large-v3-turbo"],
+        help="Modelo Whisper da Groq (com --backend groq)",
+    )
+    parser.add_argument(
+        "--allow-cloud-asr", action="store_true",
+        help="Consentimento por execução: o áudio desta reunião vai para a Groq (EUA)",
     )
     parser.add_argument(
         "--mlx-model",
@@ -3028,6 +3265,10 @@ def main() -> None:
 
     if not args.mic and not args.system:
         parser.error("Pelo menos um de --mic ou --system é obrigatório")
+    if args.backend == "groq" and not args.allow_cloud_asr:
+        # O app nunca passa esta flag: áudio de reunião só sai do Mac por
+        # decisão explícita a cada execução.
+        parser.error("--backend groq envia o áudio para a Groq; confirme com --allow-cloud-asr")
     validate_audio_inputs(parser, args)
 
     if args.persona_analysis:
@@ -3076,7 +3317,10 @@ def main() -> None:
     # Carrega backend de inferência UMA vez — reutilizado nas duas trilhas
     if args.backend == "mlx":
         print(f"  Loading MLX backend: {args.mlx_model}...", flush=True)
-        model = MlxBackend(args.mlx_model)
+        model = MlxBackend(args.mlx_model, cache_limit_mb=args.mlx_cache_limit_mb)
+    elif args.backend == "groq":
+        print(f"  Groq backend: {args.groq_model} (o áudio sai do Mac)", flush=True)
+        model = GroqBackend(args.groq_model)
     else:
         from faster_whisper import WhisperModel
         print(f"  Loading Whisper model '{args.model}'...", flush=True)
@@ -3209,7 +3453,7 @@ def main() -> None:
         turns=turns,
         tracks="both" if dual_track else ("mic" if args.mic else "system"),
         backend=args.backend,
-        model_name=args.mlx_model if args.backend == "mlx" else args.model,
+        model_name={"mlx": args.mlx_model, "groq": args.groq_model}.get(args.backend, args.model),
         analysis_context=dict(args.analysis_context),
         participants=args.participant,
         analysis_goal=(
@@ -3359,6 +3603,9 @@ def main() -> None:
         f"Segments: {len(segments)}, Turns: {len(turns)}, "
         f"Duration: {format_time(max((s.end for s in segments), default=0))}"
     )
+
+    if isinstance(model, GroqBackend):
+        print(model.usage_line(), flush=True)
 
     if args.profile_memory and args.backend == "mlx":
         peak = _mlx_peak_mb()

@@ -19,6 +19,39 @@ Speaker labels are track based: microphone audio is labeled `Você`, system audi
 is labeled `Interlocutor`. Optional local clustering can split the system track
 into heuristic `Remote_A`, `Remote_B`, etc. labels.
 
+## What's New in 2.1
+
+**Transcription waits for power and for the end of the call.** With
+**Transcrever só na tomada e fora de chamadas** on (default, bottom of the
+menu), transcription runs only on AC power and while no Microsoft Teams call is
+active. If a call starts or the Mac goes on battery mid-job, the Python process
+is suspended and later continues exactly where it stopped (the same
+SIGSTOP/SIGCONT used during recording); queued jobs start only when both
+conditions clear.
+
+- Calls are detected with the same Core Audio process metadata as the Teams
+  assistance (no audio read), independently of the assistance toggle, and only
+  while there are queued or running transcriptions. A call is "on" after 2 s of
+  Teams microphone activity and "off" after 12 s without it.
+- Power comes from IOKit (`IOPSGetProvidingPowerSourceType`) with change
+  notifications; Macs without a battery are always on AC.
+- The queue shows why it is paused (*Pausada durante a chamada*, *Pausada na
+  bateria*) and offers **Retomar agora**, which ignores call/battery until the
+  queue is empty. Recording always pauses transcription.
+
+**Pipeline 0.10.1** (default output unchanged):
+
+- `--mlx-cache-limit-mb N` caps MLX's Metal buffer cache (default `0` = no cap
+  until 4096 MB is validated with repeated runs).
+- `--backend groq` (proof of concept): sends each speech chunk to Groq's hosted
+  Whisper (`--groq-model whisper-large-v3` or `whisper-large-v3-turbo`) and
+  prints requests, billed seconds and estimated cost. **Audio leaves the Mac**,
+  so it requires `--allow-cloud-asr` on every run; the app never passes it. The
+  API key is read from `GROQ_API_KEY` or from the Keychain item
+  `meeting-transcriber-groq` (create it yourself with
+  `security add-generic-password -s meeting-transcriber-groq -a groq -w`);
+  never store it in the repository.
+
 ## What's New in 2.0
 
 **Teams assistance (opt-in).** Turn on **Perguntar ao entrar em chamada do
@@ -606,7 +639,10 @@ Main options:
 | `--format` | `both` (default), `jsonl`, `markdown`, `llm`, or `analysis` |
 | `--persona-analysis` | Writes `.analysis.jsonl` with extra context and quality signals |
 | `--language` | `pt` (default), `en`, or `auto` (detects once per track and locks it) |
-| `--backend` | `mlx` (default) or `faster-whisper` |
+| `--backend` | `mlx` (default), `faster-whisper`, or `groq` (cloud PoC; needs `--allow-cloud-asr`) |
+| `--mlx-cache-limit-mb` | MLX Metal cache cap in MB (`0` = no cap, default) |
+| `--groq-model` | `whisper-large-v3` (default) or `whisper-large-v3-turbo` |
+| `--allow-cloud-asr` | Per-run consent to send audio to Groq |
 | `--model` | Whisper model for faster-whisper, from `tiny` to `large-v3` |
 | `--sys-offset MS` | System-track offset in milliseconds |
 | `--denoise` | Applies stationary-noise reduction to the microphone track |

@@ -26,6 +26,7 @@ struct MeetingTranscriberApp: App {
         _assistant = StateObject(wrappedValue: assistant)
         self.reviewWindow = reviewWindow
         assistant.activate()
+        state.attachDeferralMonitors(power: IOKitPowerSource(), call: CallActivityMonitor())
         let dir = UserDefaults.standard.url(forKey: "outputDirectory")
             ?? AppConfig.defaultOutputDirectory
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

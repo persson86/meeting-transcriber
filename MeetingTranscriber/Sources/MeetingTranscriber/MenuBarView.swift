@@ -304,6 +304,18 @@ struct MenuBarView: View {
                             .monospacedDigit()
                     }
 
+                    if let reason = state.transcriptionPauseReason, reason.canOverride {
+                        // Adiamento (bateria/chamada): a pessoa pode furar.
+                        HStack(spacing: MenuLayout.controlSpacing) {
+                            Text(reason == .call ? "Em pausa enquanto a chamada dura" : "Em pausa até ligar na tomada")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            Spacer()
+                            Button("Retomar agora") { state.resumeTranscriptionsNow() }
+                                .controlSize(.small)
+                        }
+                    }
+
                     VStack(alignment: .leading, spacing: MenuLayout.controlSpacing) {
                         ForEach(state.visibleTranscriptionJobs) { job in
                             HStack(alignment: .top, spacing: MenuLayout.controlSpacing) {
@@ -482,7 +494,19 @@ struct MenuBarView: View {
             Divider()
             AssistanceToggleRow()
                 .padding(.horizontal, MenuLayout.padding)
-                .padding(.vertical, MenuLayout.controlSpacing)
+                .padding(.top, MenuLayout.controlSpacing)
+            Toggle(isOn: Binding(
+                get: { state.deferTranscriptionWhenBusy },
+                set: { state.setDeferTranscriptionWhenBusy($0) }
+            )) {
+                Text("Transcrever só na tomada e fora de chamadas")
+                    .font(.callout)
+            }
+            .toggleStyle(.switch)
+            .controlSize(.small)
+            .help("Na bateria ou em chamada do Teams a transcrição pausa e retoma de onde parou.")
+            .padding(.horizontal, MenuLayout.padding)
+            .padding(.bottom, MenuLayout.controlSpacing)
 
             // ── Footer ────────────────────────────────────────────────────
             Divider()
@@ -684,9 +708,9 @@ struct MenuBarView: View {
     private func jobStatusLabel(_ job: TranscriptionJob) -> String {
         switch job.status {
         case .queued:
-            return state.transcriptionsPaused ? "Na fila — começa quando a gravação terminar" : "Na fila"
+            return state.transcriptionPauseReason?.queuedLabel ?? "Na fila"
         case .running:
-            return state.transcriptionsPaused ? "Pausada durante a gravação" : "Em andamento"
+            return state.transcriptionPauseReason?.runningLabel ?? "Em andamento"
         case .cancelling:
             return "Cancelando…"
         case .succeeded, .failed:
