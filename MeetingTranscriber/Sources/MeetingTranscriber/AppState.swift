@@ -107,6 +107,8 @@ final class AppState: ObservableObject {
     @Published private(set) var transcriptionPauseReason: TranscriptionPauseReason?
     /// "Transcrever só na tomada e fora de chamadas" (padrão ligado).
     @Published private(set) var deferTranscriptionWhenBusy: Bool
+    /// 2.3: Local ou Groq para os próximos jobs enfileirados.
+    @Published private(set) var processingBackend: ProcessingBackend
     /// "Retomar agora": fura bateria/chamada até a fila esvaziar.
     @Published private(set) var transcriptionDeferralOverridden = false
     /// Estado do ambiente, alimentado pelos monitores (ou pelos testes).
@@ -182,7 +184,10 @@ final class AppState: ObservableObject {
 
     /// Quantas transcrições concluídas ficam retidas (na lista e em memória).
     /// Jobs ativos não contam para esse limite — eles são sempre visíveis.
-    private static let finishedJobRetentionCount = 5
+    private static let finishedJobRetentionCount = 20
+    /// `.md` sem manifest (saídas antigas) seguem limitados a 5: a varredura
+    /// da pasta de saída não distingue saída antiga de item já dispensado.
+    private static let legacyFinishedJobCount = 5
 
     init(sessionStore: SessionStore = SessionStore()) {
         self.sessionStore = sessionStore
@@ -191,6 +196,7 @@ final class AppState: ObservableObject {
             ?? AppConfig.defaultOutputDirectory
         language = UserDefaults.standard.string(forKey: "language") ?? "pt"
         deferTranscriptionWhenBusy = UserDefaults.standard.object(forKey: Self.deferDefaultsKey) as? Bool ?? true
+        processingBackend = ProcessingBackend.stored()
         // Vazio de propósito: o título padrão é calculado no início da gravação,
         // não no stop anterior (o horário ficava errado em até 16 h).
         meetingTitle = ""
@@ -210,7 +216,7 @@ final class AppState: ObservableObject {
             guard case .succeeded(let url) = job.status else { return nil }
             return url.resolvingSymlinksInPath().path
         })
-        let legacy = Self.loadRecentFinishedJobs(from: outputDirectory, limit: Self.finishedJobRetentionCount)
+        let legacy = Self.loadRecentFinishedJobs(from: outputDirectory, limit: Self.legacyFinishedJobCount)
             .filter { job in
                 guard case .succeeded(let url) = job.status else { return true }
                 return !recoveredOutputs.contains(url.resolvingSymlinksInPath().path)
@@ -549,8 +555,8 @@ final class AppState: ObservableObject {
                     record: sessionRecord
                 )
 
-                transcriptionJobs.append(job)
-                persist(job)
+                transcriptionJobs.append(stampBackend(job))
+                persist(transcriptionJobs[transcriptionJobs.count - 1])
                 if !captureIssues.isEmpty {
                     warn("Captura parcial: \(captureIssues.joined(separator: " ")) O áudio recuperável foi preservado.")
                 }
@@ -688,8 +694,8 @@ final class AppState: ObservableObject {
                     captureIntegrity: .complete
                 )
 
-                transcriptionJobs.append(job)
-                persist(job)
+                transcriptionJobs.append(stampBackend(job))
+                persist(transcriptionJobs[transcriptionJobs.count - 1])
                 meetingTitle = ""
                 status = .idle
                 scheduleTranscriptionJobs()
@@ -879,18 +885,74 @@ final class AppState: ObservableObject {
             deferEnabled: deferTranscriptionWhenBusy,
             overridden: transcriptionDeferralOverridden,
             callActive: callActive,
-            onBattery: onBattery
+            onBattery: onBattery,
+            cloudOnly: pendingJobsAreCloudOnly
         )
         if reason != transcriptionPauseReason { transcriptionPauseReason = reason }
         let paused = reason != nil
-        guard paused != transcriptionsPaused else { return }
-        transcriptionsPaused = paused
-        for runner in runners.values { runner.setPaused(paused) }
-        AppLog.queue.info("asr \(paused ? "pausado" : "retomado", privacy: .public) motivo=\(reason?.rawValue ?? "-", privacy: .public) jobs=\(self.runners.count, privacy: .public)")
-        if !paused { scheduleTranscriptionJobs() }
+        // Cada job segue a própria regra: na bateria a Groq segue mesmo com um
+        // job local esperando a tomada.
+        for job in transcriptionJobs where job.status.isRunning {
+            runners[job.id]?.setPaused(pauseReason(for: job) != nil)
+        }
+        if paused != transcriptionsPaused {
+            transcriptionsPaused = paused
+            AppLog.queue.info("asr \(paused ? "pausado" : "retomado", privacy: .public) motivo=\(reason?.rawValue ?? "-", privacy: .public) jobs=\(self.runners.count, privacy: .public)")
+        }
+        scheduleTranscriptionJobs()
+    }
+
+    /// Por que este job não roda agora (nil = pode rodar).
+    func pauseReason(for job: TranscriptionJob) -> TranscriptionPauseReason? {
+        TranscriptionPausePolicy.reason(
+            capturing: status.isCapturing,
+            deferEnabled: deferTranscriptionWhenBusy,
+            overridden: transcriptionDeferralOverridden,
+            callActive: callActive,
+            onBattery: onBattery,
+            cloudOnly: backend(of: job) == .groq
+        )
     }
 
     static let deferDefaultsKey = "deferTranscriptionWhenBusy"
+    static let missingGroqKeyMessage =
+        "Chave da Groq não encontrada. Salve-a no Keychain (item meeting-transcriber-groq) e tente de novo."
+
+    /// Escolha global; só vale para o que entrar na fila depois. Groq sem chave
+    /// não é aceito: a falta de chave aparece aqui, nunca no meio de um job.
+    @discardableResult
+    func setProcessingBackend(_ backend: ProcessingBackend) -> Bool {
+        guard backend != processingBackend else { return true }
+        if backend == .groq, !groqKeyCheck() {
+            lastWarning = Self.missingGroqKeyMessage  // menu aberto: sem notificação
+            return false
+        }
+        processingBackend = backend
+        UserDefaults.standard.set(backend.rawValue, forKey: ProcessingBackend.defaultsKey)
+        AppLog.queue.info("backend de transcrição=\(backend.rawValue, privacy: .public)")
+        return true
+    }
+
+    func backend(of job: TranscriptionJob) -> ProcessingBackend {
+        ProcessingBackend(jobValue: job.record?.asrBackend)
+    }
+
+    /// Injetável nos testes: a presença real da chave depende do Keychain.
+    var groqKeyCheck: () -> Bool = { ProcessingBackend.groqKeyAvailable() }
+
+    private func stampBackend(_ job: TranscriptionJob) -> TranscriptionJob {
+        var job = job
+        var record = job.record ?? SessionRecord()
+        record.asrBackend = processingBackend.rawValue
+        job.record = record
+        return job
+    }
+
+    /// Fila pendente só com jobs na Groq (a bateria não os adia).
+    private var pendingJobsAreCloudOnly: Bool {
+        let pending = transcriptionJobs.filter { $0.status.isQueued || $0.status.isRunning }
+        return !pending.isEmpty && pending.allSatisfy { backend(of: $0) == .groq }
+    }
 
     #if DEBUG
     /// Só para snapshots da interface nos testes: estado de captura sem hardware.
@@ -942,12 +1004,21 @@ final class AppState: ObservableObject {
             transcriptionDeferralOverridden = false
             applyTranscriptionPause()
         }
+        // A mistura Local/Groq da fila muda a regra da bateria. Fora do didSet:
+        // retomar agenda jobs, o que mexe na própria lista.
+        let cloudOnly = pendingJobsAreCloudOnly
+        if cloudOnly != lastCloudOnly {
+            lastCloudOnly = cloudOnly
+            Task { @MainActor [weak self] in self?.applyTranscriptionPause() }
+        }
     }
+    private var lastCloudOnly = false
 
+    /// Pula o job local que espera a tomada e começa o próximo que pode rodar.
     private func scheduleTranscriptionJobs() {
-        guard !transcriptionsPaused, !quitRequested else { return }
+        guard !quitRequested else { return }
         while runningTranscriptionCount < maxConcurrentTranscriptions,
-              let index = transcriptionJobs.firstIndex(where: { $0.status.isQueued }) {
+              let index = transcriptionJobs.firstIndex(where: { $0.status.isQueued && pauseReason(for: $0) == nil }) {
             transcriptionJobs[index].status = .running
             transcriptionJobs[index].startedAt = Date()
             persist(transcriptionJobs[index])
@@ -996,6 +1067,7 @@ final class AppState: ObservableObject {
                     recordedAt: job.createdAt,
                     calendarMeeting: job.calendarMeeting,
                     logURL: logURL,
+                    backend: backend(of: job),
                     onProgress: { [weak self] pct in
                         Task { @MainActor in
                             self?.updateProgress(id: job.id, pct: pct)
@@ -1003,6 +1075,12 @@ final class AppState: ObservableObject {
                     }
                 )
 
+                // Reprocessamento lê o áudio já arquivado da origem: arquivar de
+                // novo duplicaria os WAVs a cada rodada.
+                guard job.record?.reprocessOf == nil else {
+                    finishTranscriptionJob(id: job.id, outputURL: outputURL, micURL: job.micURL, systemURL: job.systemURL)
+                    return
+                }
                 let archiveURL = try Self.archiveSessionFiles(
                     outputURL: outputURL,
                     micURL: job.micURL,
@@ -1130,15 +1208,76 @@ final class AppState: ObservableObject {
         runners[id]?.cancel()
     }
 
-    func retryJob(_ id: UUID) {
+    /// `backend` troca onde o ASR roda nesta nova tentativa (ex.: Groq falhou
+    /// sem rede → tentar localmente). Sem ele, repete onde o job estava.
+    func retryJob(_ id: UUID, backend: ProcessingBackend? = nil) {
         guard let index = transcriptionJobs.firstIndex(where: { $0.id == id }),
               case .failed = transcriptionJobs[index].status,
               transcriptionJobs[index].micURL != nil || transcriptionJobs[index].systemURL != nil else { return }
+        if let backend {
+            if backend == .groq, !groqKeyCheck() {
+                lastWarning = Self.missingGroqKeyMessage  // menu aberto: sem notificação
+                return
+            }
+            var record = transcriptionJobs[index].record ?? SessionRecord()
+            record.asrBackend = backend.rawValue
+            transcriptionJobs[index].record = record
+        }
         transcriptionJobs[index].status = .queued
         transcriptionJobs[index].startedAt = nil
         transcriptionJobs[index].completedAt = nil
         transcriptionJobs[index].progress = 0
         persist(transcriptionJobs[index])
+        scheduleTranscriptionJobs()
+    }
+
+    /// Concluída com áudio preservado e sem outro processamento ativo da
+    /// mesma reunião neste backend.
+    func canReprocess(_ job: TranscriptionJob, with backend: ProcessingBackend) -> Bool {
+        guard case .succeeded = job.status,
+              job.micURL != nil || job.systemURL != nil else { return false }
+        let origin = job.record?.reprocessOf ?? job.id.uuidString
+        return !transcriptionJobs.contains { other in
+            (other.status.isQueued || other.status.isRunning)
+                && (other.record?.reprocessOf ?? other.id.uuidString) == origin
+                && self.backend(of: other) == backend
+        }
+    }
+
+    /// Processa de novo uma transcrição concluída, com o outro backend, num job
+    /// novo: a saída original fica intacta e a nova sai com nome próprio.
+    func reprocessJob(_ id: UUID, backend: ProcessingBackend) {
+        guard let source = transcriptionJobs.first(where: { $0.id == id }),
+              case .succeeded(let outputURL) = source.status,
+              canReprocess(source, with: backend) else { return }
+        if backend == .groq, !groqKeyCheck() {
+            lastWarning = Self.missingGroqKeyMessage  // menu aberto: sem notificação
+            return
+        }
+        var record = SessionRecord.starting(at: source.record?.recordingStartedAt ?? source.createdAt)
+        record.recordingStoppedAt = source.record?.recordingStoppedAt
+        record.inputDevice = source.record?.inputDevice
+        record.asrBackend = backend.rawValue
+        record.reprocessOf = source.record?.reprocessOf ?? source.id.uuidString
+        let job = TranscriptionJob(
+            id: UUID(),
+            title: source.title,
+            language: source.language,
+            micURL: source.micURL,
+            systemURL: source.systemURL,
+            outputDir: outputURL.deletingLastPathComponent(),
+            sysOffsetMs: source.sysOffsetMs,
+            createdAt: source.createdAt,
+            startedAt: nil,
+            completedAt: nil,
+            status: .queued,
+            captureIntegrity: source.captureIntegrity,
+            calendarMeeting: source.calendarMeeting,
+            record: record
+        )
+        transcriptionJobs.append(job)
+        persist(job)
+        AppLog.queue.info("reprocessar origem=\(record.reprocessOf ?? "-", privacy: .public) backend=\(backend.rawValue, privacy: .public)")
         scheduleTranscriptionJobs()
     }
 

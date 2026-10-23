@@ -13,6 +13,15 @@ enum MenuLayout {
     static let jobIconWidth: CGFloat = 20
     static let boxPadding: CGFloat = 12
     static let cornerRadius: CGFloat = 10
+    /// Altura da lista de transcrições antes de rolar: 7 itens e meio, para o
+    /// item cortado mostrar que há mais abaixo.
+    static let jobListMaxHeight: CGFloat = 364
+}
+
+/// Altura natural da lista de transcrições, para a rolagem não sobrar nem cortar.
+private struct JobListHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
 }
 
 struct MenuBarView: View {
@@ -24,6 +33,7 @@ struct MenuBarView: View {
     @FocusState private var titleFieldFocused: Bool
     @State private var jobPendingCancellation: TranscriptionJob?
     @State private var showingSettings: Bool
+    @State private var jobListHeight: CGFloat = 0
 
     init(showingSettings: Bool = false) {
         _showingSettings = State(initialValue: showingSettings)
@@ -298,6 +308,12 @@ struct MenuBarView: View {
 
         captureAction
 
+        if state.processingBackend == .groq, state.status.isRecording {
+            Label("A transcrição desta gravação vai para a Groq.", systemImage: "cloud")
+                .font(.caption)
+                .foregroundColor(.orange)
+        }
+
         if state.status.isRecording {
             Text("O indicador de compartilhamento do macOS é esperado durante a captura.")
                 .font(.caption)
@@ -361,72 +377,60 @@ struct MenuBarView: View {
                     .font(.callout)
                     .foregroundColor(.secondary)
             } else {
-                VStack(alignment: .leading, spacing: MenuLayout.controlSpacing) {
-                    ForEach(state.visibleTranscriptionJobs) { job in
-                        HStack(alignment: .top, spacing: MenuLayout.controlSpacing) {
-                            Image(systemName: jobIcon(job))
-                                .font(.body)
-                                .foregroundColor(jobTint(job))
-                                .frame(width: MenuLayout.jobIconWidth)
+                // Até 20 concluídas: a lista rola em vez de esticar o menu.
+                ScrollView(.vertical) {
+                    VStack(alignment: .leading, spacing: MenuLayout.controlSpacing) {
+                        ForEach(state.visibleTranscriptionJobs) { job in
+                            HStack(alignment: .top, spacing: MenuLayout.controlSpacing) {
+                                Image(systemName: jobIcon(job))
+                                    .font(.body)
+                                    .foregroundColor(jobTint(job))
+                                    .frame(width: MenuLayout.jobIconWidth)
 
-                            VStack(alignment: .leading, spacing: MenuLayout.compactSpacing) {
-                                Text(job.title)
-                                    .font(.callout.weight(.medium))
-                                    .lineLimit(1)
-                                    .truncationMode(.tail)
-                                HStack(alignment: .top, spacing: MenuLayout.compactSpacing) {
-                                    Text(jobStatusLabel(job))
-                                        .fixedSize(horizontal: false, vertical: true)
-                                        .help(jobStatusLabel(job))
-                                    Text("•")
-                                    Text(timeLabel(job.createdAt))
-                                }
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                                .lineLimit(job.status.isFinished ? 4 : 1)
+                                VStack(alignment: .leading, spacing: MenuLayout.compactSpacing) {
+                                    Text(job.title)
+                                        .font(.callout.weight(.medium))
+                                        .lineLimit(1)
+                                        .truncationMode(.tail)
+                                    HStack(alignment: .top, spacing: MenuLayout.compactSpacing) {
+                                        Text(jobStatusLabel(job))
+                                            .fixedSize(horizontal: false, vertical: true)
+                                            .help(jobStatusLabel(job))
+                                        Text("•")
+                                        Text(timeLabel(job.createdAt))
+                                    }
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                    .lineLimit(job.status.isFinished ? 4 : 1)
 
-                                if let sideError = job.sideError {
-                                    Text(sideError)
-                                        .font(.caption)
-                                        .foregroundColor(.red)
-                                        .lineLimit(3)
-                                        .fixedSize(horizontal: false, vertical: true)
-                                        .help(sideError)
-                                }
-
-                                if job.status.isRunning {
-                                    HStack(spacing: MenuLayout.controlSpacing) {
-                                        ProgressView(value: Double(job.progress), total: 100)
-                                            .progressViewStyle(.linear)
-                                        Text("\(job.progress)%")
+                                    if let sideError = job.sideError {
+                                        Text(sideError)
                                             .font(.caption)
-                                            .monospacedDigit()
-                                            .foregroundColor(.secondary)
+                                            .foregroundColor(.red)
+                                            .lineLimit(3)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                            .help(sideError)
+                                    }
+
+                                    if job.status.isRunning {
+                                        HStack(spacing: MenuLayout.controlSpacing) {
+                                            ProgressView(value: Double(job.progress), total: 100)
+                                                .progressViewStyle(.linear)
+                                            Text("\(job.progress)%")
+                                                .font(.caption)
+                                                .monospacedDigit()
+                                                .foregroundColor(.secondary)
+                                        }
                                     }
                                 }
-                            }
 
-                            Spacer(minLength: MenuLayout.compactSpacing)
+                                Spacer(minLength: MenuLayout.compactSpacing)
 
-                            if case .succeeded(let url) = job.status {
-                                Button {
-                                    openTranscript(url)
-                                } label: {
-                                    Image(systemName: "doc.text")
-                                        .frame(
-                                            width: MenuLayout.iconButtonSize,
-                                            height: MenuLayout.iconButtonSize
-                                        )
-                                        .contentShape(Rectangle())
-                                }
-                                .buttonStyle(.plain)
-                                .help("Abrir transcrição")
-
-                                if AppConfig.secondBrainPath != nil {
+                                if case .succeeded(let url) = job.status {
                                     Button {
-                                        state.sendToSecondBrain(job)
+                                        openTranscript(url)
                                     } label: {
-                                        Image(systemName: job.exportedToSecondBrain ? "checkmark.circle" : "brain")
+                                        Image(systemName: "doc.text")
                                             .frame(
                                                 width: MenuLayout.iconButtonSize,
                                                 height: MenuLayout.iconButtonSize
@@ -434,22 +438,96 @@ struct MenuBarView: View {
                                             .contentShape(Rectangle())
                                     }
                                     .buttonStyle(.plain)
-                                    .disabled(job.exportedToSecondBrain || state.status.isCapturing)
-                                    .help(
-                                        job.exportedToSecondBrain
-                                            ? "Enviada ao second-brain"
-                                            : state.status.isCapturing
-                                                ? "Disponível após a gravação"
-                                                : (job.sideError ?? "Enviar ao second-brain")
-                                    )
-                                }
-                            }
+                                    .help("Abrir transcrição")
 
-                            if case .failed = job.status, let logURL = state.pipelineLogURL(for: job.id) {
+                                    if AppConfig.secondBrainPath != nil {
+                                        Button {
+                                            state.sendToSecondBrain(job)
+                                        } label: {
+                                            Image(systemName: job.exportedToSecondBrain ? "checkmark.circle" : "brain")
+                                                .frame(
+                                                    width: MenuLayout.iconButtonSize,
+                                                    height: MenuLayout.iconButtonSize
+                                                )
+                                                .contentShape(Rectangle())
+                                        }
+                                        .buttonStyle(.plain)
+                                        .disabled(job.exportedToSecondBrain || state.status.isCapturing)
+                                        .help(
+                                            job.exportedToSecondBrain
+                                                ? "Enviada ao second-brain"
+                                                : state.status.isCapturing
+                                                    ? "Disponível após a gravação"
+                                                    : (job.sideError ?? "Enviar ao second-brain")
+                                        )
+                                    }
+
+                                    // Menu de um item: mandar áudio à nuvem pede dois cliques.
+                                    let other = ProcessingBackend.allCases.first { $0 != state.backend(of: job) } ?? .local
+                                    if state.canReprocess(job, with: other) {
+                                        Menu {
+                                            Button("Processar também com \(other.label)") {
+                                                state.reprocessJob(job.id, backend: other)
+                                            }
+                                        } label: {
+                                            Image(systemName: "arrow.triangle.2.circlepath")
+                                        }
+                                        .menuStyle(.borderlessButton)
+                                        .menuIndicator(.hidden)
+                                        .fixedSize()
+                                        .frame(width: MenuLayout.iconButtonSize, height: MenuLayout.iconButtonSize)
+                                        .help(other == .groq
+                                            ? "Gera outra transcrição pela Groq; o áudio sai do Mac. A atual fica intacta."
+                                            : "Gera outra transcrição localmente. A atual fica intacta.")
+                                    }
+                                }
+
+                                if case .failed = job.status, let logURL = state.pipelineLogURL(for: job.id) {
+                                    Button {
+                                        NSWorkspace.shared.open(logURL)
+                                    } label: {
+                                        Image(systemName: "doc.plaintext")
+                                            .frame(
+                                                width: MenuLayout.iconButtonSize,
+                                                height: MenuLayout.iconButtonSize
+                                            )
+                                            .contentShape(Rectangle())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("Abrir o log do pipeline")
+                                }
+
+                                if case .failed = job.status,
+                                   job.micURL != nil || job.systemURL != nil {
+                                    let current = state.backend(of: job)
+                                    Menu {
+                                        Button("Tentar de novo (\(current.label))") {
+                                            state.retryJob(job.id)
+                                        }
+                                        ForEach(ProcessingBackend.allCases.filter { $0 != current }, id: \.self) { other in
+                                            Button("Tentar de novo (\(other.label))") {
+                                                state.retryJob(job.id, backend: other)
+                                            }
+                                        }
+                                    } label: {
+                                        Image(systemName: "arrow.clockwise.circle")
+                                    }
+                                    .menuStyle(.borderlessButton)
+                                    .menuIndicator(.hidden)
+                                    .fixedSize()
+                                    .frame(width: MenuLayout.iconButtonSize, height: MenuLayout.iconButtonSize)
+                                    .help("Tentar novamente com o áudio preservado")
+                                }
+
                                 Button {
-                                    NSWorkspace.shared.open(logURL)
+                                    if job.status.isFinished {
+                                        state.dismissJob(job.id)
+                                    } else {
+                                        jobPendingCancellation = job
+                                    }
                                 } label: {
-                                    Image(systemName: "doc.plaintext")
+                                    Image(systemName: dismissIcon(job.status))
+                                        .foregroundColor(dismissTint(job.status))
                                         .frame(
                                             width: MenuLayout.iconButtonSize,
                                             height: MenuLayout.iconButtonSize
@@ -457,46 +535,17 @@ struct MenuBarView: View {
                                         .contentShape(Rectangle())
                                 }
                                 .buttonStyle(.plain)
-                                .help("Abrir o log do pipeline")
+                                .help(job.status.isFinished ? "Remover da lista" : "Cancelar processamento")
                             }
-
-                            if case .failed = job.status,
-                               job.micURL != nil || job.systemURL != nil {
-                                Button {
-                                    state.retryJob(job.id)
-                                } label: {
-                                    Image(systemName: "arrow.clockwise.circle")
-                                        .frame(
-                                            width: MenuLayout.iconButtonSize,
-                                            height: MenuLayout.iconButtonSize
-                                        )
-                                        .contentShape(Rectangle())
-                                }
-                                .buttonStyle(.plain)
-                                .help("Tentar novamente com o áudio preservado")
-                            }
-
-                            Button {
-                                if job.status.isFinished {
-                                    state.dismissJob(job.id)
-                                } else {
-                                    jobPendingCancellation = job
-                                }
-                            } label: {
-                                Image(systemName: dismissIcon(job.status))
-                                    .foregroundColor(dismissTint(job.status))
-                                    .frame(
-                                        width: MenuLayout.iconButtonSize,
-                                        height: MenuLayout.iconButtonSize
-                                    )
-                                    .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .help(job.status.isFinished ? "Remover da lista" : "Cancelar processamento")
+                            .padding(.vertical, MenuLayout.compactSpacing)
                         }
-                        .padding(.vertical, MenuLayout.compactSpacing)
                     }
+                    .background(GeometryReader { proxy in
+                        Color.clear.preference(key: JobListHeightKey.self, value: proxy.size.height)
+                    })
                 }
+                .frame(height: min(jobListHeight, MenuLayout.jobListMaxHeight))
+                .onPreferenceChange(JobListHeightKey.self) { jobListHeight = $0 }
             }
         }
         .confirmationDialog(
@@ -531,6 +580,30 @@ struct MenuBarView: View {
                 isOn: Binding(get: { assistant.isEnabled }, set: { assistant.setEnabled($0) })
             )
             .disabled(!CallAssistant.platformSupported)
+
+            VStack(alignment: .leading, spacing: MenuLayout.compactSpacing + 2) {
+                HStack {
+                    Text("Processamento").font(.callout.weight(.semibold))
+                    Spacer(minLength: MenuLayout.controlSpacing)
+                    Picker("Processamento", selection: Binding(
+                        get: { state.processingBackend },
+                        set: { state.setProcessingBackend($0) }
+                    )) {
+                        ForEach(ProcessingBackend.allCases, id: \.self) { backend in
+                            Text(backend.label).tag(backend)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                    .fixedSize()
+                }
+                Text(state.processingBackend == .groq
+                     ? "O áudio, o título e o vocabulário saem do Mac para a Groq (EUA). Mais rápido e leve; não espera a tomada. Vale para as próximas gravações."
+                     : "Tudo roda neste Mac; nada sai dele. Vale para as próximas gravações.")
+                    .font(.caption)
+                    .foregroundColor(state.processingBackend == .groq ? .orange : .secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             settingToggle(
                 "Transcrever só na tomada e fora de chamadas",
@@ -806,12 +879,20 @@ struct MenuBarView: View {
         }
     }
 
+    /// Groq sempre se identifica; Local só quando é o segundo processamento.
     private func jobStatusLabel(_ job: TranscriptionJob) -> String {
+        let label = jobStatusBaseLabel(job)
+        let backend = state.backend(of: job)
+        if backend == .groq { return "\(label) · Groq" }
+        return job.record?.reprocessOf != nil ? "\(label) · \(backend.label)" : label
+    }
+
+    private func jobStatusBaseLabel(_ job: TranscriptionJob) -> String {
         switch job.status {
         case .queued:
-            return state.transcriptionPauseReason?.queuedLabel ?? "Na fila"
+            return state.pauseReason(for: job)?.queuedLabel ?? "Na fila"
         case .running:
-            return state.transcriptionPauseReason?.runningLabel ?? "Em andamento"
+            return state.pauseReason(for: job)?.runningLabel ?? "Em andamento"
         case .cancelling:
             return "Cancelando…"
         case .succeeded, .failed:

@@ -62,7 +62,7 @@ CHUNK_OVERLAP_SEC = 3.0
 CHUNK_DEDUP_TOLERANCE_SEC = 0.5
 TEXT_DENSITY_SUSPECT_CHARS_PER_SEC = 80.0
 
-PIPELINE_VERSION = "0.10.1"
+PIPELINE_VERSION = "0.10.3"
 DEFAULT_HOTWORD_LIMIT = 60
 PROMPT_TAIL_MAX_CHARS = 240
 RUNAWAY_UNICODE_MIN_REPEATS = 8
@@ -1489,18 +1489,67 @@ def _multipart(fields: list[tuple[str, str]], file_bytes: bytes) -> tuple[bytes,
 
 def _words_by_segment(segments: list[dict], words: list[dict]) -> list[list[dict]]:
     """A Groq devolve as palavras numa lista só; cada uma vai para o segmento
-    que contém o seu meio."""
+    que contém o seu meio. O texto ganha o espaço inicial do Whisper local
+    (" palavra"): o pipeline remonta trechos concatenando palavras."""
     grouped: list[list[dict]] = [[] for _ in segments]
     for word in words:
         start, end = word.get("start"), word.get("end")
         if start is None or end is None:
             continue
+        text = str(word.get("word") or "")
+        if text and not text[0].isspace():
+            word = {**word, "word": " " + text}
+        if not segments:
+            break
         middle = (float(start) + float(end)) / 2
-        for index, seg in enumerate(segments):
-            if float(seg["start"]) <= middle <= float(seg["end"]):
-                grouped[index].append(word)
-                break
+
+        def distance(seg) -> float:
+            seg_start, seg_end = float(seg["start"]), float(seg["end"])
+            if seg_start <= middle <= seg_end:
+                return 0.0
+            return min(abs(middle - seg_start), abs(middle - seg_end))
+
+        # Palavra no vão entre segmentos vai para o mais próximo: a costura
+        # remonta o texto pelas palavras e não pode perder fala em silêncio.
+        nearest = min(range(len(segments)), key=lambda index: distance(segments[index]))
+        grouped[nearest].append(word)
     return grouped
+
+
+GROQ_CACHE_DIR = Path.home() / "Library" / "Caches" / "MeetingTranscriber" / "groq"
+GROQ_CACHE_MAX_AGE_SEC = 7 * 24 * 3600
+
+
+def _write_private_json(path: Path, payload: dict) -> None:
+    """Grava atômico e só para o dono: a resposta contém fala da reunião."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        tmp = path.with_suffix(".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def prune_groq_cache(directory: Path, max_age_sec: float = GROQ_CACHE_MAX_AGE_SEC, now: float | None = None) -> int:
+    """Apaga respostas antigas; devolve quantas saíram."""
+    import time
+    now = time.time() if now is None else now
+    removed = 0
+    try:
+        entries = list(directory.glob("*.json"))
+    except OSError:
+        return 0
+    for entry in entries:
+        try:
+            if now - entry.stat().st_mtime > max_age_sec:
+                entry.unlink()
+                removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 class GroqBackend:
@@ -1512,10 +1561,14 @@ class GroqBackend:
     """
 
     def __init__(self, model: str = GROQ_DEFAULT_MODEL, api_key: str | None = None,
-                 urlopen=None, sleep=None) -> None:
+                 urlopen=None, sleep=None, cache_dir: Path | None = None) -> None:
         import time
         import urllib.request
         self.model = model
+        # Respostas guardadas por hash da requisição: um job que falha no meio
+        # e é refeito não paga nem espera de novo pelos blocos já transcritos.
+        self.cache_dir = cache_dir
+        self.cache_hits = 0
         self._api_key = api_key or groq_api_key()
         self._urlopen = urlopen or urllib.request.urlopen
         self._sleep = sleep or time.sleep
@@ -1526,12 +1579,28 @@ class GroqBackend:
     def _request(self, audio: np.ndarray, fields: list[tuple[str, str]]) -> dict:
         import urllib.error
         import urllib.request
-        body, content_type = _multipart(fields, wav_bytes(audio))
+        wav = wav_bytes(audio)
+        body, content_type = _multipart(fields, wav)
         request = urllib.request.Request(GROQ_API_URL, data=body, method="POST", headers={
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": content_type,
+            # O Cloudflare da Groq recusa o "Python-urllib" padrão (403, erro 1010).
+            "User-Agent": f"meeting-transcriber/{PIPELINE_VERSION}",
         })
         seconds = len(audio) / SAMPLE_RATE
+        cache_file = None
+        if self.cache_dir is not None:
+            import hashlib
+            # Chave pelo conteúdo, não pelo corpo: a fronteira multipart é aleatória.
+            digest = hashlib.sha256(json.dumps(fields, ensure_ascii=False).encode("utf-8"))
+            digest.update(wav)
+            cache_file = self.cache_dir / f"{digest.hexdigest()}.json"
+            try:
+                payload = json.loads(cache_file.read_text(encoding="utf-8"))
+                self.cache_hits += 1
+                return payload
+            except (OSError, ValueError):
+                pass
         for attempt in range(1, GROQ_MAX_ATTEMPTS + 1):
             try:
                 with self._urlopen(request, timeout=GROQ_TIMEOUT_SEC) as response:
@@ -1539,6 +1608,8 @@ class GroqBackend:
                 self.requests += 1
                 self.audio_seconds += seconds
                 self.billed_seconds += max(10.0, seconds)
+                if cache_file is not None:
+                    _write_private_json(cache_file, payload)
                 return payload
             except urllib.error.HTTPError as exc:
                 retryable = exc.code == 429 or exc.code >= 500
@@ -1552,9 +1623,12 @@ class GroqBackend:
                     wait = 2.0 ** attempt
                 print(f"  [Groq] HTTP {exc.code}; nova tentativa em {wait:.0f}s", flush=True)
                 self._sleep(min(wait, 60.0))
-            except urllib.error.URLError as exc:
+            except OSError as exc:
+                # URLError, timeout de leitura e conexão derrubada: rede, não a Groq.
                 if attempt == GROQ_MAX_ATTEMPTS:
-                    raise RuntimeError(f"Groq inacessível: {exc.reason}") from None
+                    reason = getattr(exc, "reason", None) or type(exc).__name__
+                    raise RuntimeError(f"Groq inacessível: {reason}") from None
+                print(f"  [Groq] rede ({type(exc).__name__}); nova tentativa em {2 ** attempt}s", flush=True)
                 self._sleep(2.0 ** attempt)
         raise RuntimeError("Groq: tentativas esgotadas")
 
@@ -1626,6 +1700,7 @@ class GroqBackend:
         return (
             f"[Groq] {self.requests} requisições, {self.audio_seconds:.0f}s de áudio, "
             f"{self.billed_seconds:.0f}s cobrados{cost}"
+            + (f", {self.cache_hits} do cache" if self.cache_hits else "")
         )
 
 
@@ -1919,6 +1994,9 @@ def transcribe_track(
             # "sim"/"uhum" por "sí"/"thank you" e desligava o vocabulário.
             config = config_for_language(config, locked_language)
             print(f"    Idioma travado na trilha: {locked_language} (votos: {votes})", flush=True)
+    elif language_check is not None and isinstance(model, GroqBackend):
+        # Na Groq a conferência custaria requisições cobradas e nunca troca o idioma.
+        language_check["skipped"] = "cloud_backend"
     elif language_check is not None:
         # Idioma fixo: só confere numa amostra do início e registra divergência.
         language_check.update(check_fixed_language(model, audio, chunks, config.language))
@@ -2961,10 +3039,13 @@ def output_stem(
     recorded_at: str | None = None,
     session_id: str | None = None,
     now: datetime | None = None,
+    backend: str | None = None,
 ) -> str:
     """Nome base dos artefatos pelo início da gravação (não pelo processamento).
 
     A data do arquivo precisa ser a da reunião mesmo quando a fila atrasa.
+    Saída da Groq leva "-groq": a mesma reunião processada dos dois jeitos fica
+    lado a lado sem sobrescrever, e o nome diz de onde veio o texto.
     """
     stem_time = local_datetime(recorded_at) or now or datetime.now()
     stem = f"{stem_time.strftime('%Y-%m-%d_%H-%M')}_{slugify(title)}"
@@ -2972,6 +3053,8 @@ def output_stem(
         safe_session_id = re.sub(r"[^a-zA-Z0-9]", "", session_id)[:8]
         if safe_session_id:
             stem = f"{stem}-{safe_session_id}"
+    if backend == "groq":
+        stem = f"{stem}-groq"
     return stem
 
 
@@ -3320,7 +3403,8 @@ def main() -> None:
         model = MlxBackend(args.mlx_model, cache_limit_mb=args.mlx_cache_limit_mb)
     elif args.backend == "groq":
         print(f"  Groq backend: {args.groq_model} (o áudio sai do Mac)", flush=True)
-        model = GroqBackend(args.groq_model)
+        prune_groq_cache(GROQ_CACHE_DIR)
+        model = GroqBackend(args.groq_model, cache_dir=GROQ_CACHE_DIR)
     else:
         from faster_whisper import WhisperModel
         print(f"  Loading Whisper model '{args.model}'...", flush=True)
@@ -3504,7 +3588,9 @@ def main() -> None:
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    filename_stem = output_stem(args.title, recorded_at=args.recorded_at, session_id=args.session_id)
+    filename_stem = output_stem(
+        args.title, recorded_at=args.recorded_at, session_id=args.session_id, backend=args.backend
+    )
     output_paths: list[Path] = []
 
     jsonl_path = out_dir / f"{filename_stem}.jsonl"

@@ -129,6 +129,7 @@ final class TranscriptionRunner {
         recordedAt: Date? = nil,
         calendarMeeting: CalendarMeeting? = nil,
         logURL: URL? = nil,
+        backend: ProcessingBackend = .local,
         onProgress: @escaping (Int) -> Void = { _ in }
     ) async throws -> URL {
         guard FileManager.default.isExecutableFile(atPath: python) else {
@@ -161,7 +162,7 @@ final class TranscriptionRunner {
             if let mic = micURL { args += ["--mic", mic.path] }
             if let sys = systemURL { args += ["--system", sys.path] }
             args += ["--mlx-model", AppConfig.mlxModel]
-            if let backend = AppConfig.transcriptionBackend { args += ["--backend", backend] }
+            args += backend.pipelineArguments()
 
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: python)

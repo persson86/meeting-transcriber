@@ -75,6 +75,7 @@ class GroqBackendTests(unittest.TestCase):
         request = calls[0]
         self.assertEqual(request.full_url, tm.GROQ_API_URL)
         self.assertEqual(request.get_header("Authorization"), "Bearer chave-de-teste")
+        self.assertEqual(request.get_header("User-agent"), f"meeting-transcriber/{tm.PIPELINE_VERSION}")
         body = request.data
         self.assertIn(b'name="prompt"\r\n\r\nReuni\xc3\xa3o de produto. Acme\r\n', body)
         self.assertIn(b'name="language"\r\n\r\npt\r\n', body)
@@ -83,7 +84,9 @@ class GroqBackendTests(unittest.TestCase):
         self.assertNotIn(b"beam_size", body)
 
         self.assertEqual([seg.text for seg in segments], [" Bom dia", " pessoal"])
-        self.assertEqual([w["word"] for w in segments[0].words], ["Bom", "dia"])
+        # Mesma convenção do Whisper local: o pipeline concatena as palavras.
+        self.assertEqual([w["word"] for w in segments[0].words], [" Bom", " dia"])
+        self.assertEqual("".join(w["word"] for w in segments[0].words).strip(), "Bom dia")
         self.assertEqual(info.language, "pt")
         self.assertEqual(backend.requests, 1)
         self.assertEqual(backend.billed_seconds, 10.0)   # mínimo por requisição
@@ -97,6 +100,7 @@ class GroqBackendTests(unittest.TestCase):
         segments = tm.collect_segments(raw, "Interlocutor", 100.0, tm.TranscriptionConfig())
         self.assertAlmostEqual(segments[0].start, 100.5)
         self.assertEqual(segments[0].words[0][:2], (100.6, 101.0))
+        self.assertEqual(segments[0].words[0][2], " olá")
 
     def test_silence_segments_are_dropped_like_local_whisper(self):
         backend, _ = self.backend([{
@@ -107,6 +111,58 @@ class GroqBackendTests(unittest.TestCase):
         }])
         segments, _ = backend.transcribe(np.zeros(tm.SAMPLE_RATE * 2, dtype=np.float32))
         self.assertEqual([seg.text for seg in segments], [" certo"])
+
+    def test_word_in_a_gap_goes_to_the_nearest_segment(self):
+        segments = [{"start": 0.0, "end": 1.0}, {"start": 2.0, "end": 3.0}]
+        words = [
+            {"word": "um", "start": 0.2, "end": 0.6},
+            {"word": "dois", "start": 1.1, "end": 1.3},   # vão, perto do 1º
+            {"word": "três", "start": 1.8, "end": 1.95},  # vão, perto do 2º
+            {"word": "quatro", "start": 2.2, "end": 2.6},
+        ]
+        grouped = tm._words_by_segment(segments, words)
+        self.assertEqual([[w["word"] for w in g] for g in grouped], [[" um", " dois"], [" três", " quatro"]])
+
+    def test_cached_response_is_reused_without_a_new_request(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = []
+
+            def urlopen(request, timeout):
+                calls.append(request)
+                return FakeResponse({"segments": [{"start": 0.0, "end": 1.0, "text": " oi",
+                                                   "avg_logprob": -0.1, "no_speech_prob": 0.0}]})
+
+            audio = np.zeros(tm.SAMPLE_RATE, dtype=np.float32)
+            first = tm.GroqBackend(api_key="k", urlopen=urlopen, sleep=lambda _: None, cache_dir=Path(tmp))
+            first.transcribe(audio, language="pt")
+            again = tm.GroqBackend(api_key="k", urlopen=urlopen, sleep=lambda _: None, cache_dir=Path(tmp))
+            segments, _ = again.transcribe(audio, language="pt")
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(again.cache_hits, 1)
+            self.assertEqual(again.requests, 0)
+            self.assertEqual([seg.text for seg in segments], [" oi"])
+            cached = next(Path(tmp).glob("*.json"))
+            self.assertEqual(cached.stat().st_mode & 0o777, 0o600)
+
+    def test_prune_removes_only_old_responses(self):
+        import os as _os
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            old, new = Path(tmp) / "a.json", Path(tmp) / "b.json"
+            old.write_text("{}"), new.write_text("{}")
+            _os.utime(old, (1000, 1000))
+            _os.utime(new, (9000, 9000))
+            self.assertEqual(tm.prune_groq_cache(Path(tmp), max_age_sec=5000, now=10000), 1)
+            self.assertFalse(old.exists())
+            self.assertTrue(new.exists())
+
+    def test_read_timeout_is_retried_like_a_network_error(self):
+        sleeps = []
+        backend, calls = self.backend([TimeoutError("read timed out"), {"segments": []}], sleeps)
+        backend.transcribe(np.zeros(tm.SAMPLE_RATE, dtype=np.float32))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(sleeps, [2.0])
 
     def test_rate_limit_waits_and_retries(self):
         sleeps = []

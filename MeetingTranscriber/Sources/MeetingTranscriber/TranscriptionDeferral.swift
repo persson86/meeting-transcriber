@@ -34,12 +34,14 @@ enum TranscriptionPausePolicy {
         deferEnabled: Bool,
         overridden: Bool,
         callActive: Bool,
-        onBattery: Bool
+        onBattery: Bool,
+        cloudOnly: Bool = false
     ) -> TranscriptionPauseReason? {
         if capturing { return .recording }
         guard deferEnabled, !overridden else { return nil }
         if callActive { return .call }
-        if onBattery { return .battery }
+        // Fila só com jobs na Groq não pesa na bateria: é o caso de uso da nuvem.
+        if onBattery, !cloudOnly { return .battery }
         return nil
     }
 }

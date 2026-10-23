@@ -245,6 +245,14 @@ class DateAndNamingTests(unittest.TestCase):
 
         self.assertEqual(stem, "2026-09-23_08-05_reuniao-2026-09-22-1618-C68054A5")
 
+    def test_output_stem_marks_groq_output_and_keeps_local_name(self):
+        common = dict(recorded_at="2026-09-23T11:05:00Z", session_id="C68054A5-1111", now=datetime(2026, 9, 24))
+        local = tm.output_stem("Reunião", backend="mlx", **common)
+        groq = tm.output_stem("Reunião", backend="groq", **common)
+
+        self.assertEqual(local, tm.output_stem("Reunião", **common))
+        self.assertEqual(groq, f"{local}-groq")
+
     def test_slugify_is_ascii_for_nfc_and_nfd_titles(self):
         nfc = "Reunião de apresentação"
         nfd = "Reunião de apresentação"

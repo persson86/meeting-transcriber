@@ -27,6 +27,12 @@ struct SessionRecord: Codable, Equatable {
     /// 2.0: "manual" ou "assisted" (confirmada numa oferta da assistência
     /// Teams). Ausente em sessões anteriores: origem desconhecida.
     var startOrigin: String? = nil
+    /// 2.3: onde o ASR roda ("local" / "groq"), fixado no enfileiramento.
+    /// Ausente em sessões anteriores: local.
+    var asrBackend: String? = nil
+    /// 2.3: sessão de origem quando este job processa de novo, com o outro
+    /// backend, uma transcrição já concluída. O áudio é o arquivado da origem.
+    var reprocessOf: String? = nil
     /// Dispositivo de entrada efetivo lido no stop (ex.: "MacBook Air Microphone").
     var inputDevice: String?
     var asrAttempts: [ASRAttempt] = []

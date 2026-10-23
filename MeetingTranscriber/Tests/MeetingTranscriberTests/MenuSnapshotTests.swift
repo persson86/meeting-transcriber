@@ -35,6 +35,7 @@ final class MenuSnapshotTests: XCTestCase {
 
     override func tearDownWithError() throws {
         UserDefaults.standard.removeObject(forKey: "outputDirectory")
+        UserDefaults.standard.removeObject(forKey: ProcessingBackend.defaultsKey)
         defaults?.removePersistentDomain(forName: suiteName)
         state = nil
         assistant = nil
@@ -49,6 +50,11 @@ final class MenuSnapshotTests: XCTestCase {
         state.transcriptionJobs = [job("Planejamento do trimestre", .running, progress: 42), try finishedJob("Revisão semanal"), job("Alinhamento com o time", .failed("O pipeline encerrou com erro."))]
         state.callActive = true
         snap("02-fila")
+    }
+
+    func testLongListScrolls() throws {
+        state.transcriptionJobs = try (1...12).map { try finishedJob("Reunião \($0)") }
+        snap("12-lista-longa")
     }
 
     func testStartOffer() {
@@ -76,6 +82,22 @@ final class MenuSnapshotTests: XCTestCase {
 
     func testSettings() {
         snap("07-configuracoes", settings: true)
+    }
+
+    func testSettingsWithGroq() {
+        state.groqKeyCheck = { true }
+        state.setProcessingBackend(.groq)
+        snap("10-configuracoes-groq", settings: true)
+    }
+
+    func testGroqJobsAndRecording() {
+        state.groqKeyCheck = { true }
+        state.setProcessingBackend(.groq)
+        var failed = job("Alinhamento com o time", .failed("Groq inacessível: timed out"))
+        failed.record = SessionRecord(asrBackend: "groq")
+        state.transcriptionJobs = [failed]
+        recording(.manual, assistedSession: nil)
+        snap("11-gravando-groq")
     }
 
     func testPausedWithQueue() {
@@ -120,6 +142,7 @@ final class MenuSnapshotTests: XCTestCase {
         try "# teste".write(to: output, atomically: true, encoding: .utf8)
         var finished = job(title, .succeeded(output))
         finished.completedAt = Date()
+        finished.micURL = directory.appendingPathComponent("mic.wav")  // áudio preservado: oferece o outro backend
         return finished
     }
 

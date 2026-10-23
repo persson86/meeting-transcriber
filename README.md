@@ -19,6 +19,56 @@ Speaker labels are track based: microphone audio is labeled `Você`, system audi
 is labeled `Interlocutor`. Optional local clustering can split the system track
 into heuristic `Remote_A`, `Remote_B`, etc. labels.
 
+## What's New in 2.3
+
+**Choose where transcription runs: Local or Groq API.** In the settings (gear
+in the footer), **Processamento** switches between **Local** (default,
+everything stays on this Mac) and **Groq API** (hosted Whisper
+`whisper-large-v3`, USA). The choice applies to recordings queued after the
+change and is stored in each job (`record.asrBackend`), so changing it never
+moves a job that is already queued.
+
+- Groq sends the audio **and** the title, participants and vocabulary used as
+  prompt. Only use it for meetings whose data may leave the Mac.
+- Groq can only be selected when a key exists in `GROQ_API_KEY` or in the
+  Keychain item `meeting-transcriber-groq` (the app checks only that the item
+  exists; it never reads the secret). Store the key with
+  `security add-generic-password -U -s meeting-transcriber-groq -a groq -w`.
+- While recording with Groq selected, the menu says the transcription will go
+  to Groq; queued and finished Groq jobs show *· Groq*.
+- No silent fallback: if Groq fails (network, rate limit), the job fails with
+  the audio preserved, and the retry button offers **Tentar de novo (Local)**
+  or **(Groq API)**.
+- **Process with the other backend.** A finished transcription whose audio is
+  still archived offers *Processar também com Groq API* (or *Local*). It runs
+  as a new job: the original files stay untouched, the new one reuses the
+  archived audio (no second copy) and is listed as *· Groq* / *· Local*. Each
+  output is a separate item, so send only the one you want to the second-brain.
+- The menu keeps the last 20 finished transcriptions (was 5); the list scrolls
+  after about seven items instead of stretching the menu.
+- Battery deferral is per job: Groq jobs run on battery even when a local job
+  is waiting for power (calls and recording still pause everything).
+
+**Pipeline 0.10.3** (Groq backend only; local output unchanged):
+
+- Groq output files end in `-groq` (`…-<session>-groq.md`), so both
+  transcriptions of a meeting sit side by side.
+
+- Sends its own `User-Agent` (Groq's Cloudflare rejected `Python-urllib` with
+  403 / error 1010).
+- Groq words get Whisper's leading space; words falling between segments go to
+  the nearest one. Before, seam trimming could glue words ("Edaío") or drop
+  them.
+- Responses are cached for 7 days in `~/Library/Caches/MeetingTranscriber/groq`
+  (owner-only), keyed by request content: retrying a failed job neither pays
+  nor waits again for chunks already transcribed.
+- Read timeouts and dropped connections are retried like other network errors.
+- With a fixed language, the language check is skipped on Groq (it cost extra
+  requests and never changes the language).
+
+Measured on a real 5-minute two-track meeting: 24 requests, ~38 s, ~US$0.012
+with `whisper-large-v3`; word-level agreement with the local transcript ~95%.
+
 ## What's New in 2.2
 
 **Redesigned menu.** One layout per moment, with the decisive buttons never

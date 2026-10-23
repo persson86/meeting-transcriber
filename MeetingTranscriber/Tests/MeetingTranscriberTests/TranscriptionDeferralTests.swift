@@ -14,12 +14,14 @@ final class TranscriptionDeferralTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         UserDefaults.standard.set(directory.appendingPathComponent("out"), forKey: "outputDirectory")
         UserDefaults.standard.removeObject(forKey: AppState.deferDefaultsKey)
+        UserDefaults.standard.removeObject(forKey: ProcessingBackend.defaultsKey)
         state = AppState(sessionStore: SessionStore(rootDirectory: directory.appendingPathComponent("Sessions")))
     }
 
     override func tearDownWithError() throws {
         UserDefaults.standard.removeObject(forKey: "outputDirectory")
         UserDefaults.standard.removeObject(forKey: AppState.deferDefaultsKey)
+        UserDefaults.standard.removeObject(forKey: ProcessingBackend.defaultsKey)
         state = nil
         try? FileManager.default.removeItem(at: directory)
     }
@@ -101,6 +103,118 @@ final class TranscriptionDeferralTests: XCTestCase {
         XCTAssertEqual(state.transcriptionPauseReason, .battery)
     }
 
+    // MARK: Local × Groq (2.3)
+
+    func testCloudOnlyQueueSkipsBatteryButNotCallOrRecording() {
+        XCTAssertNil(reason(battery: true, cloudOnly: true))
+        XCTAssertEqual(reason(call: true, battery: true, cloudOnly: true), .call)
+        XCTAssertEqual(reason(capturing: true, cloudOnly: true), .recording)
+    }
+
+    func testGroqJobsRunOnBatteryAndALocalJobBringsThePauseBack() async {
+        state.transcriptionJobs = [runningJob(backend: .groq)]
+        state.onBattery = true
+        await settle()
+        XCTAssertFalse(state.transcriptionsPaused)
+        state.transcriptionJobs.append(runningJob(backend: .local))
+        await settle()
+        XCTAssertEqual(state.transcriptionPauseReason, .battery)
+    }
+
+    func testBatteryHoldsOnlyLocalJobs() {
+        state.onBattery = true
+        XCTAssertNil(state.pauseReason(for: runningJob(backend: .groq)))
+        XCTAssertEqual(state.pauseReason(for: runningJob(backend: .local)), .battery)
+        state.callActive = true
+        XCTAssertEqual(state.pauseReason(for: runningJob(backend: .groq)), .call)
+    }
+
+    func testReprocessQueuesASiblingAndLeavesTheOriginalIntact() throws {
+        let output = directory.appendingPathComponent("out/2026-10-23_09-02_reuniao-AAAA.md")
+        var source = runningJob(backend: .local)
+        source.micURL = directory.appendingPathComponent("arquivo/mic.wav")
+        source.status = .succeeded(output)
+        source.completedAt = Date()
+        state.transcriptionJobs = [source]
+        // Gravando: o job novo entra na fila mas não roda (sem pipeline no teste).
+        state.mic = MicRecorder()
+        state.status = .recording
+
+        state.groqKeyCheck = { false }
+        state.reprocessJob(source.id, backend: .groq)
+        XCTAssertEqual(state.transcriptionJobs.count, 1, "sem chave não enfileira")
+        XCTAssertNotNil(state.lastWarning)
+
+        state.groqKeyCheck = { true }
+        state.reprocessJob(source.id, backend: .groq)
+        XCTAssertEqual(state.transcriptionJobs.count, 2)
+        let sibling = state.transcriptionJobs[1]
+        XCTAssertNotEqual(sibling.id, source.id)
+        XCTAssertTrue(sibling.status.isQueued)
+        XCTAssertEqual(state.backend(of: sibling), .groq)
+        XCTAssertEqual(sibling.record?.reprocessOf, source.id.uuidString)
+        XCTAssertEqual(sibling.micURL, source.micURL)
+        XCTAssertEqual(sibling.outputDir, output.deletingLastPathComponent())
+        XCTAssertEqual(sibling.createdAt, source.createdAt)
+        XCTAssertEqual(state.transcriptionJobs[0], source)
+
+        // Um por backend enquanto está na fila; o mesmo vale a partir do irmão.
+        XCTAssertFalse(state.canReprocess(source, with: .groq))
+        state.reprocessJob(source.id, backend: .groq)
+        XCTAssertEqual(state.transcriptionJobs.count, 2)
+
+        var done = sibling
+        done.status = .succeeded(output.deletingLastPathComponent().appendingPathComponent("x-groq.md"))
+        state.transcriptionJobs[1] = done
+        state.reprocessJob(done.id, backend: .local)
+        XCTAssertEqual(state.transcriptionJobs.last?.record?.reprocessOf, source.id.uuidString)
+    }
+
+    func testReprocessNeedsPreservedAudio() {
+        var job = runningJob(backend: .local)
+        job.status = .succeeded(directory.appendingPathComponent("out/a.md"))
+        XCTAssertFalse(state.canReprocess(job, with: .groq))
+    }
+
+    func testBackendDefaultsToLocalAndGroqNeedsAKey() {
+        XCTAssertEqual(state.processingBackend, .local)
+        state.groqKeyCheck = { false }
+        XCTAssertFalse(state.setProcessingBackend(.groq))
+        XCTAssertEqual(state.processingBackend, .local)
+        XCTAssertNotNil(state.lastWarning)
+        state.groqKeyCheck = { true }
+        XCTAssertTrue(state.setProcessingBackend(.groq))
+        XCTAssertEqual(UserDefaults.standard.string(forKey: ProcessingBackend.defaultsKey), "groq")
+        XCTAssertEqual(ProcessingBackend.stored(), .groq)
+    }
+
+    func testRetryCanSwitchBackendAndKeepsItOtherwise() throws {
+        var job = try finishedJob()
+        job.micURL = directory.appendingPathComponent("mic.wav")
+        job.record = SessionRecord(asrBackend: "groq")
+        state.transcriptionJobs = [job]
+        // Gravando: o job volta à fila mas não roda (sem pipeline no teste).
+        state.mic = MicRecorder()
+        state.status = .recording
+        XCTAssertEqual(state.backend(of: job), .groq)
+        state.groqKeyCheck = { false }
+        state.retryJob(job.id, backend: .groq)
+        XCTAssertTrue(state.transcriptionJobs[0].status.isFinished, "sem chave não volta à fila")
+        state.retryJob(job.id, backend: .local)
+        XCTAssertEqual(state.transcriptionJobs[0].record?.asrBackend, "local")
+        XCTAssertTrue(state.transcriptionJobs[0].status.isQueued)
+    }
+
+    func testPipelineArguments() {
+        XCTAssertEqual(ProcessingBackend.groq.pipelineArguments(localOverride: nil),
+                       ["--backend", "groq", "--allow-cloud-asr", "--groq-model", "whisper-large-v3"])
+        XCTAssertEqual(ProcessingBackend.local.pipelineArguments(localOverride: nil), [])
+        XCTAssertEqual(ProcessingBackend.local.pipelineArguments(localOverride: "faster-whisper"), ["--backend", "faster-whisper"])
+        // O valor "groq" na mesma chave nunca vira override local.
+        XCTAssertEqual(ProcessingBackend.local.pipelineArguments(localOverride: "groq"), [])
+        XCTAssertEqual(ProcessingBackend(jobValue: nil), .local)
+    }
+
     // MARK: Monitor de chamada
 
     func testCallMonitorUsesEpisodeStability() {
@@ -127,22 +241,28 @@ final class TranscriptionDeferralTests: XCTestCase {
 
     private func reason(
         capturing: Bool = false, enabled: Bool = true, overridden: Bool = false,
-        call: Bool = false, battery: Bool = false
+        call: Bool = false, battery: Bool = false, cloudOnly: Bool = false
     ) -> TranscriptionPauseReason? {
         TranscriptionPausePolicy.reason(
             capturing: capturing, deferEnabled: enabled, overridden: overridden,
-            callActive: call, onBattery: battery
+            callActive: call, onBattery: battery, cloudOnly: cloudOnly
         )
     }
 
-    private func runningJob() -> TranscriptionJob {
-        TranscriptionJob(
+    private func settle() async {
+        for _ in 0..<5 { await Task.yield() }
+    }
+
+    private func runningJob(backend: ProcessingBackend? = nil) -> TranscriptionJob {
+        var job = TranscriptionJob(
             id: UUID(), title: "Reunião de teste", language: "pt",
             micURL: nil, systemURL: nil,
             outputDir: directory.appendingPathComponent("out", isDirectory: true),
             sysOffsetMs: 0, createdAt: Date(), startedAt: Date(), completedAt: nil,
             status: .running
         )
+        if let backend { job.record = SessionRecord(asrBackend: backend.rawValue) }
+        return job
     }
 
     private func finishedJob() throws -> TranscriptionJob {
