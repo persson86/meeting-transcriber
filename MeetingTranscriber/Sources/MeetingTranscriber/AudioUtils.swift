@@ -447,8 +447,3 @@ func pcmHasSignal(_ data: Data) -> Bool {
         raw.bindMemory(to: Int16.self).contains { $0 != 0 }
     }
 }
-
-func convertToInt16Mono(_ input: AVAudioPCMBuffer, using converter: AVAudioConverter) -> Data? {
-    guard case .success(let data) = convertToInt16MonoResult(input, using: converter) else { return nil }
-    return data
-}

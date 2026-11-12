@@ -166,11 +166,15 @@ final class JobPresentationTests: XCTestCase {
         )
     }
 
+    /// Host time de `seconds` atrás. Satura em 1: numa máquina ligada há menos
+    /// tempo que isso (runner de CI recém-criado), a subtração de UInt64
+    /// estourava e derrubava o processo de teste com SIGTRAP ("signal code 5").
     private func ago(_ seconds: Double) -> UInt64 {
         var info = mach_timebase_info_data_t()
         mach_timebase_info(&info)
         let ticks = UInt64(seconds * 1_000_000_000 * Double(info.denom) / Double(info.numer))
-        return mach_absolute_time() - ticks
+        let now = mach_absolute_time()
+        return now > ticks ? now - ticks : 1
     }
 
     private func health(

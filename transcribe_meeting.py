@@ -24,7 +24,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
-import noisereduce as nr
 from scipy.io import wavfile
 
 import transcript_signals as signals
@@ -36,7 +35,7 @@ SAMPLE_RATE = 16000
 # o padrão até validar 4096 com repetições (no bench, 4 GB perdeu 2 blocos).
 MLX_CACHE_LIMIT_MB = 0
 
-# Groq (PoC): API compatível com OpenAI. A chave nunca fica no código: vem de
+# Groq: API compatível com OpenAI. A chave nunca fica no código: vem de
 # GROQ_API_KEY ou do Keychain (serviço abaixo), criado pela própria pessoa.
 GROQ_API_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_KEYCHAIN_SERVICE = "meeting-transcriber-groq"
@@ -62,7 +61,7 @@ CHUNK_OVERLAP_SEC = 3.0
 CHUNK_DEDUP_TOLERANCE_SEC = 0.5
 TEXT_DENSITY_SUSPECT_CHARS_PER_SEC = 80.0
 
-PIPELINE_VERSION = "0.10.3"
+PIPELINE_VERSION = "0.10.4"
 DEFAULT_HOTWORD_LIMIT = 60
 PROMPT_TAIL_MAX_CHARS = 240
 RUNAWAY_UNICODE_MIN_REPEATS = 8
@@ -810,6 +809,10 @@ def load_and_denoise(audio_path: str, prop_decrease: float = 0.75) -> np.ndarray
     Usar apenas para ruído estacionário de fundo (ventilador, ar-condicionado).
     NÃO usar para remover fala/bleed de outra trilha — degrada o mic.
     """
+    # Import local: só --denoise usa o noisereduce, e no topo do módulo ele
+    # carregava o torch em todo job (~0,7 s de import, sem uso).
+    import noisereduce as nr
+
     audio = load_audio(audio_path)
     return nr.reduce_noise(
         y=audio, sr=SAMPLE_RATE,
@@ -1324,6 +1327,7 @@ class MlxBackend:
 
     def __init__(self, model_repo: str, cache_limit_mb: int = MLX_CACHE_LIMIT_MB) -> None:
         self.model_repo = model_repo
+        self._model_path: str | None = None
         if cache_limit_mb > 0:
             try:
                 import mlx.core as mx
@@ -1333,12 +1337,19 @@ class MlxBackend:
                 print(f"  [MLX] cache limit not applied: {exc}", flush=True)
 
     def _resolve_model_path(self) -> str:
-        """Return local snapshot dir if cached, else HF repo id (triggers download)."""
-        try:
-            from huggingface_hub import snapshot_download
-            return snapshot_download(self.model_repo, local_files_only=True)
-        except Exception:
-            return self.model_repo
+        """Return local snapshot dir if cached, else HF repo id (triggers download).
+
+        Resolvido uma vez por processo. O mlx-whisper recarrega o modelo quando
+        o caminho muda: sem cache, a 1ª chamada usava o id do repositório e a
+        2ª já achava o snapshot recém-baixado, carregando os pesos de novo.
+        """
+        if self._model_path is None:
+            try:
+                from huggingface_hub import snapshot_download
+                self._model_path = snapshot_download(self.model_repo, local_files_only=True)
+            except Exception:
+                self._model_path = self.model_repo
+        return self._model_path
 
     def transcribe(self, audio_input, **kwargs):
         try:
@@ -1429,7 +1440,7 @@ class MlxBackend:
 
 
 # ---------------------------------------------------------------------------
-# Groq backend (PoC) — Whisper na nuvem; o áudio sai do Mac
+# Groq backend — Whisper na nuvem; o áudio sai do Mac
 # ---------------------------------------------------------------------------
 
 # verbose_json devolve o idioma por extenso.
@@ -1523,12 +1534,22 @@ GROQ_CACHE_MAX_AGE_SEC = 7 * 24 * 3600
 def _write_private_json(path: Path, payload: dict) -> None:
     """Grava atômico e só para o dono: a resposta contém fala da reunião."""
     try:
+        import tempfile
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        tmp = path.with_suffix(".tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False)
-        os.replace(tmp, path)
+        # Temporário próprio de cada escritor (0600): dois jobs gravando a mesma
+        # chave não escrevem no mesmo arquivo. Um temporário largado por um job
+        # interrompido sai na poda por idade.
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.stem + ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
     except OSError:
         pass
 
@@ -1539,7 +1560,7 @@ def prune_groq_cache(directory: Path, max_age_sec: float = GROQ_CACHE_MAX_AGE_SE
     now = time.time() if now is None else now
     removed = 0
     try:
-        entries = list(directory.glob("*.json"))
+        entries = list(directory.glob("*.json")) + list(directory.glob("*.tmp"))
     except OSError:
         return 0
     for entry in entries:
@@ -1556,8 +1577,9 @@ class GroqBackend:
     """Whisper hospedado na Groq, com a mesma interface do MlxBackend.
 
     Cada bloco vira um WAV e uma requisição (cobrança mínima de 10 s por
-    requisição). Recebe prompt + hotwords como o MLX; limiares de silêncio e
-    temperatura ficam no servidor. Só roda com consentimento explícito na CLI.
+    requisição). Recebe prompt + hotwords como o MLX. A temperatura fica no
+    servidor; o corte de silêncio (no_speech + logprob) é aplicado aqui, igual
+    ao do Whisper local. Só roda com consentimento explícito na CLI.
     """
 
     def __init__(self, model: str = GROQ_DEFAULT_MODEL, api_key: str | None = None,
@@ -1577,6 +1599,7 @@ class GroqBackend:
         self.audio_seconds = 0.0
 
     def _request(self, audio: np.ndarray, fields: list[tuple[str, str]]) -> dict:
+        import http.client
         import urllib.error
         import urllib.request
         wav = wav_bytes(audio)
@@ -1623,8 +1646,9 @@ class GroqBackend:
                     wait = 2.0 ** attempt
                 print(f"  [Groq] HTTP {exc.code}; nova tentativa em {wait:.0f}s", flush=True)
                 self._sleep(min(wait, 60.0))
-            except OSError as exc:
+            except (OSError, http.client.HTTPException) as exc:
                 # URLError, timeout de leitura e conexão derrubada: rede, não a Groq.
+                # IncompleteRead (queda no meio do corpo) não é OSError.
                 if attempt == GROQ_MAX_ATTEMPTS:
                     reason = getattr(exc, "reason", None) or type(exc).__name__
                     raise RuntimeError(f"Groq inacessível: {reason}") from None
@@ -1800,6 +1824,15 @@ def check_fixed_language(
         result["share"] = round(share, 2)
         result["mismatch"] = bool(detected != expected_lang and share >= min_share)
     return result
+
+
+def language_check_ran(check: dict | None) -> bool:
+    """A conferência de idioma fixo só conta quando chegou a detectar um idioma.
+
+    A pulada (Groq) e a que ficou sem votos seguem no diagnóstico da trilha,
+    mas não autorizam `lang_mismatch: false` nem "idioma: sem divergência".
+    """
+    return bool(check) and not check.get("skipped") and bool(check.get("detected"))
 
 
 def clean_segment_text(raw_text: str, config: TranscriptionConfig) -> tuple[str, bool]:
@@ -2979,7 +3012,14 @@ def build_confidence_box(
             for track, check in mismatches.items()
         )
     elif language_checks:
-        idiom = "idioma: sem divergência"
+        expected = ("mic", "system") if dual_track else tuple(sorted(language_checks))
+        unchecked = [track for track in expected if track not in language_checks]
+        if unchecked:
+            checked = ", ".join(_TRACK_LABEL.get(track, track) for track in sorted(language_checks))
+            missing = ", ".join(_TRACK_LABEL.get(track, track) for track in unchecked)
+            idiom = f"idioma: sem divergência no {checked}; {missing} não verificado"
+        else:
+            idiom = "idioma: sem divergência"
     else:
         idiom = "idioma: não verificado"
 
@@ -3089,8 +3129,6 @@ def normalize_track_offsets(mic_offset_sec: float, sys_offset_sec: float) -> tup
 
 
 def validate_audio_inputs(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    import wave
-
     for role, audio_path in (("microfone", args.mic), ("sistema", args.system)):
         if not audio_path:
             continue
@@ -3184,7 +3222,7 @@ def main() -> None:
         "--backend", default="mlx", choices=["mlx", "faster-whisper", "groq"],
         help=(
             "Backend de inferência: mlx (default, Apple Metal), faster-whisper (CPU) "
-            "ou groq (PoC na nuvem; exige --allow-cloud-asr)"
+            "ou groq (Whisper na nuvem; exige --allow-cloud-asr)"
         ),
     )
     parser.add_argument(
@@ -3240,7 +3278,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--context-term", action="append", default=[],
-        help="Termo esperado para enviar como hotword, sem entrar no prompt inicial (pode repetir)",
+        help="Termo esperado enviado como hotword; no MLX e na Groq ele vai no fim do prompt inicial (pode repetir)",
     )
     parser.add_argument(
         "--replace", action="append", type=parse_replacement, default=[],
@@ -3349,8 +3387,9 @@ def main() -> None:
     if not args.mic and not args.system:
         parser.error("Pelo menos um de --mic ou --system é obrigatório")
     if args.backend == "groq" and not args.allow_cloud_asr:
-        # O app nunca passa esta flag: áudio de reunião só sai do Mac por
-        # decisão explícita a cada execução.
+        # Áudio de reunião só sai do Mac por decisão explícita a cada execução.
+        # O app (2.3+) passa a flag só nos jobs enfileirados com o
+        # processamento Groq escolhido nas Configurações.
         parser.error("--backend groq envia o áudio para a Groq; confirme com --allow-cloud-asr")
     validate_audio_inputs(parser, args)
 
@@ -3397,13 +3436,17 @@ def main() -> None:
     total_sec = mic_duration_sec + system_duration_sec or 1.0
     emit_progress(0)
 
+    # As respostas da Groq em cache contêm fala e valem 7 dias. A poda roda em
+    # todo job: só nos jobs Groq, quem voltava ao modo local ficava com elas
+    # no disco sem prazo.
+    prune_groq_cache(GROQ_CACHE_DIR)
+
     # Carrega backend de inferência UMA vez — reutilizado nas duas trilhas
     if args.backend == "mlx":
         print(f"  Loading MLX backend: {args.mlx_model}...", flush=True)
         model = MlxBackend(args.mlx_model, cache_limit_mb=args.mlx_cache_limit_mb)
     elif args.backend == "groq":
         print(f"  Groq backend: {args.groq_model} (o áudio sai do Mac)", flush=True)
-        prune_groq_cache(GROQ_CACHE_DIR)
         model = GroqBackend(args.groq_model, cache_dir=GROQ_CACHE_DIR)
     else:
         from faster_whisper import WhisperModel
@@ -3567,7 +3610,9 @@ def main() -> None:
     for track, check in language_checks.items():
         if check:
             quality_reports.setdefault(track, {})["language_check"] = check
-    ran_checks = {track: check for track, check in language_checks.items() if check}
+    ran_checks = {
+        track: check for track, check in language_checks.items() if language_check_ran(check)
+    }
     if ran_checks:
         meta["lang_mismatch"] = any(check.get("mismatch") for check in ran_checks.values())
     untranscribed = [

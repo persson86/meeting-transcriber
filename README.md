@@ -19,6 +19,42 @@ Speaker labels are track based: microphone audio is labeled `Você`, system audi
 is labeled `Interlocutor`. Optional local clustering can split the system track
 into heuristic `Remote_A`, `Remote_B`, etc. labels.
 
+## What's New in 2.3.1
+
+**Fixes from a full audit: a finished transcription no longer fails on its
+last output line, and a title starting with "-" no longer stops the job.**
+
+- The app could miss the pipeline's final `Output: …` line when the process
+  exited right after printing it, and mark a finished job as failed ("Script
+  não retornou caminho do arquivo"). Reading and the final drain of each pipe
+  now share a lock.
+- Free-text values (title, calendar event, organizer, participants, context
+  terms, capture warnings) reach the pipeline as `--option=value`. A one-word
+  title starting with "-" (e.g. `-draft`) used to stop the job with exit 2.
+- Imported audio records the app version and build, and its capture is marked
+  as not measured (it was "complete", so the transcript said *captura sem
+  lacunas medidas* without measuring anything).
+- Docs: the raw microphone backend only opens the built-in microphone (see
+  1.9.0); reference sections updated (Groq backend, flags, project structure).
+
+**Pipeline 0.10.4:**
+
+- Groq: a connection dropped in the middle of a response (`IncompleteRead`) is
+  retried like other network errors.
+- The Groq response cache is pruned on every job, not only on Groq jobs, so
+  responses older than 7 days leave the disk after the next transcription of
+  any kind. Each cache write uses its own temporary file, and leftover
+  temporary files are pruned too.
+- The confidence box says *idioma: não verificado* when no language check ran
+  (Groq with a fixed language, or no detection), and names the track that was
+  not checked when only one was (*sem divergência no mic; sistema não
+  verificado*). Before, both cases read *sem divergência*.
+- `noisereduce` is imported only with `--denoise`, and the MLX model path is
+  resolved once per run.
+
+Not validated: the hardware battery (capture code is unchanged apart from the
+import marking) and the CI toolchain before the push.
+
 ## What's New in 2.3
 
 **Choose where transcription runs: Local or Groq API.** In the settings (gear
@@ -202,6 +238,10 @@ microphone with voice processing, the way Teams does.
    (the other process's voice processing takes the microphone's gain), but
    intelligible. Go back to the engine with
    `defaults write io.github.meetingtranscriber.app micCaptureBackend engine`.
+   Limitation: this backend only opens the built-in microphone. With
+   `micInputPolicy default` (the lid-closed setup described under 1.7) or on a
+   Mac without a built-in microphone, a recording does not start unless the
+   engine backend is also selected with the command above.
 
 Not changed: system audio capture, the pipeline (0.10.0), the integrity rules.
 Known unknown: a real Teams call has not been measured yet; the "call" in the
@@ -423,8 +463,9 @@ Microphone capture survives device changes, and when it does not, you see it.
 
 ## Requirements
 
-- macOS 13 or newer
-- Python 3.9 or newer
+- macOS 13 or newer (the Teams assistance needs macOS 14.2)
+- Python 3.9 to 3.12 (the pinned `numpy` and `scipy` have no wheels for 3.13+)
+- Xcode Command Line Tools (the installer builds the app with `swift build`)
 - Screen & System Audio Recording permission (system audio is captured natively
   via ScreenCaptureKit; no virtual audio device is required)
 - Calendar permission is optional and is requested only when using the automatic
@@ -470,11 +511,16 @@ defaults write <bundle-id> sessionRoot ~/Library/Application\ Support/MeetingTra
 defaults write <bundle-id> contextTerms -array "ProjectName" "CustomerName"
 defaults write <bundle-id> maxConcurrentTranscriptions 2
 defaults write <bundle-id> mlxModel mlx-community/whisper-large-v3-mlx
-defaults write <bundle-id> transcriptionBackend mlx
+defaults write <bundle-id> transcriptionBackend faster-whisper
 defaults write <bundle-id> debugMemoryLogging -bool YES
 defaults write <bundle-id> secondBrainPath /path/to/second-brain
 defaults write <bundle-id> vocabularyPath /path/to/vocabulary.json
 ```
+
+`transcriptionBackend` is also where the app stores the **Processamento**
+choice (`local` or `groq`). `faster-whisper` (or `mlx`) is an override for
+local jobs only, and it is overwritten the next time **Processamento** is
+changed in the settings.
 
 ### Vocabulary
 
@@ -530,12 +576,9 @@ stderr) to measure before changing the model.
 ## Updating to the Latest Version
 
 > [!TIP]
-> Already installed and want the newest features (transcription queue reliably
-> visible again with live progress %, confirmation before cancelling an
-> in-flight job, transcripts open in Sublime Text by default, more resilient
-> system-audio capture)? Re-run the installer from the **same folder** you used
-> the first time — it updates your existing checkout in place, it does not
-> start over.
+> Already installed and want the newest version? Re-run the installer from the
+> **same folder** you used the first time — it updates your existing checkout
+> in place, it does not start over.
 
 ```bash
 cd ~/Transcricoes   # the folder you used the first time you installed
@@ -564,6 +607,7 @@ make install
 | --- | --- | --- |
 | `mlx` (default) | Fast on Apple Silicon with Metal | Greedy-only; no beam search |
 | `faster-whisper` | Usually slower on CPU | Supports `beam_size=5`, which can help with noisy audio |
+| `groq` | Hosted Whisper; depends on the network | Audio, title and vocabulary leave the Mac; needs a key and `--allow-cloud-asr` |
 
 MLX is the default because it is fast on Apple Silicon. For noisy audio,
 overlapping speech, or unstable calls, `--backend faster-whisper` can be more
@@ -593,8 +637,9 @@ the track in the first place.
 Note for source builds: the permission is tied to the app's code signature.
 Ad-hoc signatures change on every build, which makes macOS silently revoke the
 permission and hide the app from the list. Run `make setup-cert` once (in
-`MeetingTranscriber/`) to create a stable self-signed certificate so the
-permission survives rebuilds. If the app got into the hidden/denied state, reset
+`MeetingTranscriber/`): it opens Keychain Access and prints the steps to create
+a stable self-signed code-signing certificate, so the permission survives
+rebuilds. If the app got into the hidden/denied state, reset
 it with `tccutil reset ScreenCapture <bundle-id>` and relaunch.
 
 ## Menu Bar App
@@ -607,7 +652,7 @@ it with `tccutil reset ScreenCapture <bundle-id>` and relaunch.
    With the Teams assistance on, the app can also ask to start and stop for you
    (see [What's New in 2.0](#whats-new-in-20)); it never does either without
    your click.
-6. Follow progress in the **Transcrições** section. JSONL and Markdown files are
+6. Follow progress in the **Transcrições recentes** section. JSONL and Markdown files are
    written to the configured output directory.
 
 The Calendar action considers the meeting in progress and the next 24 hours,
@@ -705,7 +750,6 @@ python transcribe_meeting.py \
   --out ~/Transcriptions \
   --title "Planning meeting" \
   --format both \
-  --model medium \
   --language pt
 ```
 
@@ -720,7 +764,8 @@ Main options:
 | `--format` | `both` (default), `jsonl`, `markdown`, `llm`, or `analysis` |
 | `--persona-analysis` | Writes `.analysis.jsonl` with extra context and quality signals |
 | `--language` | `pt` (default), `en`, or `auto` (detects once per track and locks it) |
-| `--backend` | `mlx` (default), `faster-whisper`, or `groq` (cloud PoC; needs `--allow-cloud-asr`) |
+| `--backend` | `mlx` (default), `faster-whisper`, or `groq` (hosted Whisper; needs `--allow-cloud-asr`) |
+| `--mlx-model` | MLX model repository. CLI default: `mlx-community/whisper-large-v3-mlx` (fp16); the app passes its own `mlxModel` (4-bit by default) |
 | `--mlx-cache-limit-mb` | MLX Metal cache cap in MB (`0` = no cap, default) |
 | `--groq-model` | `whisper-large-v3` (default) or `whisper-large-v3-turbo` |
 | `--allow-cloud-asr` | Per-run consent to send audio to Groq |
@@ -807,21 +852,28 @@ an empty list does not mean the transcript is right.
 
 ```text
 meeting-transcriber/
-├── transcribe_meeting.py
-├── MeetingTranscriber/
-│   └── Sources/MeetingTranscriber/
-│       ├── MeetingTranscriberApp.swift
-│       ├── MenuBarView.swift
-│       ├── AppState.swift
-│       ├── AppConfig.swift
-│       ├── MicRecorder.swift
-│       ├── MicRecovery.swift
-│       ├── MicInputDevice.swift
-│       ├── AppIndicator.swift
-│       ├── SystemAudioRecorder.swift
-│       ├── TranscriptionRunner.swift
-│       ├── AudioUtils.swift
-│       ├── NotificationManager.swift
-│       └── URLSchemeDelegate.swift
-└── tests/
+├── transcribe_meeting.py      # transcription pipeline (CLI)
+├── transcript_signals.py      # echo and seam signals, shared with report.py
+├── report.py                  # read-only report over the session manifests
+├── review_turns.py            # play a turn from the right track
+├── install.sh, Makefile, requirements.txt, requirements-test.txt
+├── MeetingTranscriber/        # menu bar app (Swift Package)
+│   ├── Package.swift, Makefile, make_icon.swift
+│   ├── Resources/             # Info.plist, entitlements, icon
+│   ├── Sources/
+│   │   ├── MeetingTranscriber/
+│   │   │   ├── MeetingTranscriberApp.swift, URLSchemeDelegate.swift
+│   │   │   ├── AppState.swift, AppConfig.swift, AppVersion.swift
+│   │   │   ├── MenuBarView.swift, AssistanceViews.swift, AppIndicator.swift
+│   │   │   ├── JobPresentation.swift, CaptureProof.swift, IntegrityRule.swift
+│   │   │   ├── MicRecorder.swift, RawMicCapture.swift, MicRecovery.swift, MicInputDevice.swift
+│   │   │   ├── SystemAudioRecorder.swift, AudioUtils.swift
+│   │   │   ├── SessionStore.swift, SessionRecord.swift
+│   │   │   ├── TranscriptionRunner.swift, TranscriptionDeferral.swift, ProcessingBackend.swift
+│   │   │   ├── CallAssistant.swift, CallActivity.swift, CalendarLookup.swift
+│   │   │   ├── NotificationManager.swift
+│   │   │   └── HardwareSelfTest.swift   # compiled only with -DMT_HARDWARE_SELFTEST
+│   │   └── ObjCExceptionCatcher/        # NSException to NSError shim
+│   └── Tests/MeetingTranscriberTests/   # Swift tests
+└── tests/                     # Python tests
 ```

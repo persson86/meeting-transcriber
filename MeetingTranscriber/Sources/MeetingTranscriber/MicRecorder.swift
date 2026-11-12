@@ -26,8 +26,9 @@ import ObjCExceptionCatcher
 /// O rearme reaproveita o mesmo engine: um engine novo criado durante o voice
 /// processing de outro processo grava zeros (reprovado em hardware no v1.5-wip).
 final class MicRecorder: @unchecked Sendable {
-    /// `.raw` (experimental, 07/out/2026): IOProc direto no mic embutido, sem
-    /// AVAudioEngine — contingência para o inputNode preso ao padrão Bluetooth.
+    /// `.raw` (padrão desde a 1.9.0): IOProc direto no mic embutido, sem
+    /// AVAudioEngine, cujo inputNode ficava preso ao padrão Bluetooth. Só abre o
+    /// microfone embutido; `.engine` aceita qualquer dispositivo.
     enum CaptureBackend: String { case engine, raw }
     private lazy var engine = AVAudioEngine()
     private let captureBackend: CaptureBackend

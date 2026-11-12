@@ -140,10 +140,12 @@ final class MeetingIdentityTests: XCTestCase {
             XCTAssertFalse(recordedAt.hasSuffix("Z"), "horário deve sair com o fuso local")
         }
         XCTAssertEqual(value(after: "--vocabulary", in: args), vocabulary.path)
-        XCTAssertEqual(value(after: "--calendar-title", in: args), "Checkpoint")
-        XCTAssertEqual(value(after: "--calendar-organizer", in: args), "Ana")
+        // Texto livre vai colado com "=" (testFreeTextArgumentsSurviveALeadingDash).
+        XCTAssertTrue(args.contains("--title=Checkpoint — x"))
+        XCTAssertTrue(args.contains("--calendar-title=Checkpoint"))
+        XCTAssertTrue(args.contains("--calendar-organizer=Ana"))
         XCTAssertNotNil(value(after: "--calendar-end", in: args))
-        XCTAssertEqual(args.filter { $0 == "--participant" }.count, 2)
+        XCTAssertEqual(args.filter { $0.hasPrefix("--participant=") }, ["--participant=Ana", "--participant=Bruno"])
     }
 
     func testArgumentsSkipMissingVocabularyAndCalendar() {
@@ -159,9 +161,39 @@ final class MeetingIdentityTests: XCTestCase {
         )
 
         XCTAssertFalse(args.contains("--vocabulary"))
-        XCTAssertFalse(args.contains("--calendar-title"))
-        XCTAssertFalse(args.contains("--participant"))
+        XCTAssertFalse(args.contains { $0.hasPrefix("--calendar-title") })
+        XCTAssertFalse(args.contains { $0.hasPrefix("--participant") })
         XCTAssertTrue(args.contains("--with-analysis"))
+    }
+
+    func testFreeTextArgumentsSurviveALeadingDash() {
+        // Separado ("--title", "-rascunho"), o argparse lê o valor como outra opção
+        // e o pipeline sai com exit 2. Colado com "=" ele é sempre valor.
+        let meeting = CalendarMeeting(
+            title: "-1:1",
+            startDate: Date(timeIntervalSince1970: 0),
+            organizerName: "-Org",
+            attendeeNames: ["-Ana"]
+        )
+        let args = TranscriptionRunner.arguments(
+            script: "s.py",
+            title: "-rascunho",
+            language: "pt",
+            outputDir: URL(fileURLWithPath: "/tmp"),
+            sessionID: nil,
+            recordedAt: nil,
+            calendarMeeting: meeting,
+            vocabularyURL: nil
+        )
+
+        XCTAssertTrue(args.contains("--title=-rascunho"))
+        XCTAssertTrue(args.contains("--calendar-title=-1:1"))
+        XCTAssertTrue(args.contains("--calendar-organizer=-Org"))
+        XCTAssertTrue(args.contains("--participant=-Ana"))
+        XCTAssertFalse(
+            args.contains { $0.hasPrefix("-") && !$0.hasPrefix("--") },
+            "nenhum valor solto começando com '-'"
+        )
     }
 
     func testSecondBrainArtifactsIncludeReviewCompanionWhenPresent() throws {

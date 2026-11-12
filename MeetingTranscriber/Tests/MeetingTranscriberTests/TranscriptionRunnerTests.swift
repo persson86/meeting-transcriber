@@ -216,6 +216,25 @@ final class TranscriptionRunnerTests: XCTestCase {
         }
         XCTAssertFalse(runner.isPaused)
     }
+
+    func testOutputLineIsNotLostWhenTheProcessExitsRightAfterPrintingIt() async throws {
+        // "Output:" é a última linha antes de o processo sair. O término montava o
+        // stdout enquanto esse último bloco, já retirado do pipe pelo
+        // readabilityHandler, ainda não tinha sido acumulado, e um processo que
+        // terminou bem virava `noOutputPath("")` (falha intermitente na CI).
+        let script = directory.appendingPathComponent("fast-exit.sh")
+        let output = directory.appendingPathComponent("fast.md")
+        let jsonl = directory.appendingPathComponent("fast.jsonl")
+        try "# ok\n".write(to: output, atomically: true, encoding: .utf8)
+        try "{\"type\":\"meta\"}\n".write(to: jsonl, atomically: true, encoding: .utf8)
+        try "#!/bin/sh\nprintf 'Output: \(output.path)\\n'\n".write(to: script, atomically: true, encoding: .utf8)
+
+        for round in 0..<150 {
+            let runner = TranscriptionRunner(python: "/bin/sh", script: script.path)
+            let result = try await runner.run(micURL: nil, systemURL: nil, title: "Teste", outputDir: directory)
+            XCTAssertEqual(result, output, "rodada \(round)")
+        }
+    }
 }
 
 private final class ProgressRecorder: @unchecked Sendable {

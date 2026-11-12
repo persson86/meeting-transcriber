@@ -2,6 +2,7 @@
 import csv
 import io
 import json
+import shutil
 import sys
 import tempfile
 import unittest
@@ -84,6 +85,7 @@ def v2_manifest(output_path=None):
 class ReportTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.sessions = self.tmp / "Sessions"
         self.sessions.mkdir()
 

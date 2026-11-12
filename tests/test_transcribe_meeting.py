@@ -819,6 +819,34 @@ class TranscribeMeetingTests(unittest.TestCase):
 
         self.assertEqual(captured["path_or_hf_repo"], "mlx-community/test")
 
+    def test_mlx_backend_resolves_the_model_path_once_per_process(self):
+        lookups = []
+        paths = []
+
+        def fake_snapshot_download(repo, local_files_only):
+            lookups.append(repo)
+            if len(lookups) == 1:
+                raise RuntimeError("not cached")   # 1ª chamada: modelo ainda não baixado
+            return "/cached/mlx-model"             # depois do download o snapshot existe
+
+        def fake_transcribe(audio_input, **kwargs):
+            paths.append(kwargs["path_or_hf_repo"])
+            return {"segments": [], "language": "pt"}
+
+        fake_hub = SimpleNamespace(snapshot_download=fake_snapshot_download)
+        fake_mlx = SimpleNamespace(transcribe=fake_transcribe)
+        audio = np.zeros(tm.SAMPLE_RATE, dtype=np.float32)
+
+        with patch.dict(sys.modules, {"huggingface_hub": fake_hub, "mlx_whisper": fake_mlx}):
+            backend = tm.MlxBackend("mlx-community/test")
+            backend.transcribe(audio, language="pt")
+            backend.transcribe(audio, language="pt")
+            backend.detect_language(audio)
+
+        # O mlx-whisper recarrega os pesos quando o caminho muda entre chamadas.
+        self.assertEqual(paths, ["mlx-community/test"] * 3)
+        self.assertEqual(len(lookups), 1)
+
     def test_load_transcription_config_merges_json_and_cli_values(self):
         payload = {
             "context_terms": ["Markdown"],

@@ -130,9 +130,6 @@ enum AppConfig {
         UserDefaults.standard.bool(forKey: "debugMemoryLogging")
     }
 
-    /// Microfone da gravação: "builtin" (padrão, fixa o microfone do Mac no início)
-    /// ou "default" (segue o dispositivo padrão do macOS, comportamento até a 1.5).
-    /// `defaults write io.github.meetingtranscriber.app micInputPolicy default`
     /// C1 (07/out/2026): com a política builtin e um fone Bluetooth como entrada
     /// padrão, a entrada padrão do sistema passa a ser o embutido durante a
     /// gravação e volta no fim. `defaults write io.github.meetingtranscriber.app micDefaultInputOverride -bool false`
@@ -150,6 +147,11 @@ enum AppConfig {
             .flatMap(MicRecorder.CaptureBackend.init(rawValue:)) ?? .raw
     }
 
+    /// Microfone da gravação: "builtin" (padrão, fixa o microfone do Mac no início)
+    /// ou "default" (segue o dispositivo padrão do macOS, comportamento até a 1.5).
+    /// `defaults write io.github.meetingtranscriber.app micInputPolicy default`
+    /// Com o backend `raw` (padrão) a captura só abre no microfone embutido:
+    /// "default", ou um Mac sem embutido, exige também `micCaptureBackend engine`.
     static var micInputPolicy: MicInputPolicy {
         UserDefaults.standard.string(forKey: "micInputPolicy").flatMap(MicInputPolicy.init(rawValue:)) ?? .builtIn
     }

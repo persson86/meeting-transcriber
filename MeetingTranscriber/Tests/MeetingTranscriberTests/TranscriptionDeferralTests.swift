@@ -205,6 +205,19 @@ final class TranscriptionDeferralTests: XCTestCase {
         XCTAssertTrue(state.transcriptionJobs[0].status.isQueued)
     }
 
+    func testJobWithoutRecordGetsAppVersionAndBackendWhenQueued() {
+        // Áudio importado não tem registro de gravação: antes saía só com o backend.
+        let fresh = AppState.stamped(nil, backend: .groq)
+        XCTAssertEqual(fresh.appVersion, AppVersion.app)
+        XCTAssertEqual(fresh.asrBackend, "groq")
+        // Gravação: o registro do início fica; só o backend é carimbado.
+        let recorded = SessionRecord(appVersion: "1.0.0", appBuild: "1", startOrigin: "manual")
+        let kept = AppState.stamped(recorded, backend: .local)
+        XCTAssertEqual(kept.appVersion, "1.0.0")
+        XCTAssertEqual(kept.startOrigin, "manual")
+        XCTAssertEqual(kept.asrBackend, "local")
+    }
+
     func testPipelineArguments() {
         XCTAssertEqual(ProcessingBackend.groq.pipelineArguments(localOverride: nil),
                        ["--backend", "groq", "--allow-cloud-asr", "--groq-model", "whisper-large-v3"])

@@ -683,6 +683,10 @@ final class AssistedStartAppStateTests: XCTestCase {
     func testRefusedStartReturnsNilWithoutTellingTheAssistant() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("assisted-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
+        // Sem isto o AppState varre a pasta de saída padrão da máquina (~/Transcriptions).
+        let previousOutput = UserDefaults.standard.object(forKey: "outputDirectory")
+        UserDefaults.standard.set(root.appendingPathComponent("out"), forKey: "outputDirectory")
+        defer { UserDefaults.standard.set(previousOutput, forKey: "outputDirectory") }
         let state = AppState(sessionStore: SessionStore(rootDirectory: root))
         var started = 0
         state.onCaptureStarted = { _, _ in started += 1 }

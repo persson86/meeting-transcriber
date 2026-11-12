@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -120,7 +121,9 @@ def transcribe_case(case: dict, python: str, backend: str, extra_args: list[str]
         if not outputs:
             raise RuntimeError(f"Nenhum JSONL gerado para {case['id']}")
         # Move para fora do TemporaryDirectory antes de ele ser destruído
-        final = Path(tempfile.mkstemp(suffix=".jsonl", prefix=f"{case['id']}-")[1])
+        handle, name = tempfile.mkstemp(suffix=".jsonl", prefix=f"{case['id']}-")
+        os.close(handle)   # mkstemp devolve o descritor aberto
+        final = Path(name)
         final.write_text(outputs[0].read_text(encoding="utf-8"), encoding="utf-8")
         return final
 

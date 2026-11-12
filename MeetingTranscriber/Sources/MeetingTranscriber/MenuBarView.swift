@@ -949,7 +949,6 @@ struct MenuBarView: View {
 }
 
 
-/// F5: por trilha, tempo gravado, idade do último sinal e dispositivo efetivo.
 /// Cronômetro grande da gravação; "Iniciando…" enquanto as trilhas abrem.
 private struct DurationRow: View {
     let proof: CaptureProof
@@ -979,6 +978,7 @@ private struct DurationRow: View {
     }
 }
 
+/// F5: por trilha, tempo gravado, idade do último sinal e dispositivo efetivo.
 /// Saúde das trilhas: uma linha por fonte, nível como barras coloridas.
 private struct CaptureProofView: View {
     let proof: CaptureProof

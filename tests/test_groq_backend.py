@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 
+import http.client
 import io
 import json
 import sys
@@ -157,9 +158,39 @@ class GroqBackendTests(unittest.TestCase):
             self.assertFalse(old.exists())
             self.assertTrue(new.exists())
 
+    def test_prune_also_removes_old_temporary_files(self):
+        import os as _os
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            stale, fresh = Path(tmp) / "a.123.tmp", Path(tmp) / "b.456.tmp"
+            stale.write_text("{"), fresh.write_text("{")
+            _os.utime(stale, (1000, 1000))
+            _os.utime(fresh, (9000, 9000))
+            self.assertEqual(tm.prune_groq_cache(Path(tmp), max_age_sec=5000, now=10000), 1)
+            self.assertFalse(stale.exists())
+            self.assertTrue(fresh.exists())
+
+    def test_cache_write_leaves_no_temporary_file(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "k.json"
+            tm._write_private_json(target, {"a": 1})
+            tm._write_private_json(target, {"a": 2})
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["k.json"])
+            self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(target.read_text(), '{"a": 2}')
+
     def test_read_timeout_is_retried_like_a_network_error(self):
         sleeps = []
         backend, calls = self.backend([TimeoutError("read timed out"), {"segments": []}], sleeps)
+        backend.transcribe(np.zeros(tm.SAMPLE_RATE, dtype=np.float32))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(sleeps, [2.0])
+
+    def test_connection_dropped_mid_body_is_retried_like_a_network_error(self):
+        # IncompleteRead é HTTPException, não OSError: antes derrubava o job inteiro.
+        sleeps = []
+        backend, calls = self.backend([http.client.IncompleteRead(b"{"), {"segments": []}], sleeps)
         backend.transcribe(np.zeros(tm.SAMPLE_RATE, dtype=np.float32))
         self.assertEqual(len(calls), 2)
         self.assertEqual(sleeps, [2.0])
@@ -204,11 +235,13 @@ class GroqBackendTests(unittest.TestCase):
         self.assertIn(tm.GROQ_KEYCHAIN_SERVICE, str(ctx.exception))
 
     def test_cli_refuses_groq_without_explicit_consent(self):
-        argv = ["transcribe_meeting.py", "--backend", "groq", "--system", "x.wav"]
+        # Com --out: sem ele o argparse saía antes da guarda, e o "usage" impresso
+        # já contém "--allow-cloud-asr" (o teste passava mesmo sem a guarda).
+        argv = ["transcribe_meeting.py", "--backend", "groq", "--system", "x.wav", "--out", "/tmp"]
         with patch.object(sys, "argv", argv), patch("sys.stderr", new=io.StringIO()) as err:
             with self.assertRaises(SystemExit):
                 tm.main()
-        self.assertIn("--allow-cloud-asr", err.getvalue())
+        self.assertIn("confirme com --allow-cloud-asr", err.getvalue())
 
 
 if __name__ == "__main__":

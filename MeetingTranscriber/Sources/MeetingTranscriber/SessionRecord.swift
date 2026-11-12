@@ -8,8 +8,11 @@ struct ASRAttempt: Codable, Equatable {
     var startedAt: Date
     var endedAt: Date?
     var exitCode: Int32?
-    /// Tempo que o Python ficou suspenso (SIGSTOP) por causa de uma gravação.
+    /// Tempo que o Python ficou suspenso (SIGSTOP): por gravação e, desde a 2.1,
+    /// também por bateria ou chamada.
     var pausedSeconds: Double
+    /// `pausedSeconds > 0`: houve pausa por qualquer um desses motivos, não só
+    /// sobreposição com uma gravação.
     var overlappedRecording: Bool
 }
 

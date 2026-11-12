@@ -30,6 +30,12 @@ enum TranscriptionError: LocalizedError {
 /// readabilityHandlers dos pipes disparam em filas de background.
 private final class PipeDrain: @unchecked Sendable {
     private let lock = NSLock()
+    /// Uma trava por pipe: ler do pipe e acumular é uma operação só. Sem isso o
+    /// término podia montar o stdout enquanto o último bloco, já retirado do pipe
+    /// pelo readabilityHandler, ainda não tinha sido acumulado — e um processo
+    /// que terminou bem virava "Script não retornou caminho do arquivo".
+    private let outRead = NSLock()
+    private let errRead = NSLock()
     private var out = Data()
     private var err = Data()
     private var lineBuf = Data()
@@ -56,6 +62,36 @@ private final class PipeDrain: @unchecked Sendable {
         }
     }
     func appendErr(_ d: Data) { lock.withLock { err.append(d) } }
+
+    func readOut(_ handle: FileHandle) {
+        outRead.withLock {
+            let data = handle.availableData
+            if data.isEmpty { handle.readabilityHandler = nil; return }
+            appendOut(data)
+        }
+    }
+
+    func readErr(_ handle: FileHandle) {
+        errRead.withLock {
+            let data = handle.availableData
+            if data.isEmpty { handle.readabilityHandler = nil; return }
+            appendErr(data)
+        }
+    }
+
+    /// No término do processo: desliga os handlers, lê o que restou e devolve
+    /// tudo. Espera um handler que esteja no meio de uma leitura.
+    func finish(out: FileHandle, err: FileHandle) -> (String, String) {
+        outRead.withLock {
+            out.readabilityHandler = nil
+            appendOut(out.readDataToEndOfFile())
+        }
+        errRead.withLock {
+            err.readabilityHandler = nil
+            appendErr(err.readDataToEndOfFile())
+        }
+        return strings()
+    }
 
     func strings() -> (String, String) {
         lock.withLock {
@@ -151,10 +187,10 @@ final class TranscriptionRunner {
                 vocabularyURL: AppConfig.vocabularyURL
             )
             args += ["--capture-integrity", captureIntegrity.status.rawValue]
-            for issue in captureIntegrity.details { args += ["--capture-issue", issue] }
+            for issue in captureIntegrity.details { args.append("--capture-issue=\(issue)") }
             args += Self.captureLossArguments(captureIntegrity)
             for term in AppConfig.contextTerms {
-                args += ["--context-term", term]
+                args.append("--context-term=\(term)")
             }
             if abs(sysOffsetMs) > 10 {   // ignora offsets menores que 10ms (ruído de medição)
                 args += ["--sys-offset", String(format: "%.1f", sysOffsetMs)]
@@ -180,23 +216,14 @@ final class TranscriptionRunner {
             // que o buffer do pipe (~64 KB) antes de sair, ler tudo no término trava.
             let drain = PipeDrain()
             drain.onProgress = onProgress
-            outPipe.fileHandleForReading.readabilityHandler = { fh in
-                let d = fh.availableData
-                if d.isEmpty { fh.readabilityHandler = nil; return }
-                drain.appendOut(d)
-            }
-            errPipe.fileHandleForReading.readabilityHandler = { fh in
-                let d = fh.availableData
-                if d.isEmpty { fh.readabilityHandler = nil; return }
-                drain.appendErr(d)
-            }
+            outPipe.fileHandleForReading.readabilityHandler = { drain.readOut($0) }
+            errPipe.fileHandleForReading.readabilityHandler = { drain.readErr($0) }
 
             proc.terminationHandler = { p in
-                outPipe.fileHandleForReading.readabilityHandler = nil
-                errPipe.fileHandleForReading.readabilityHandler = nil
-                drain.appendOut(outPipe.fileHandleForReading.readDataToEndOfFile())
-                drain.appendErr(errPipe.fileHandleForReading.readDataToEndOfFile())
-                let (stdout, stderr) = drain.strings()
+                let (stdout, stderr) = drain.finish(
+                    out: outPipe.fileHandleForReading,
+                    err: errPipe.fileHandleForReading
+                )
                 if let logURL { Self.writeLog(stderr, to: logURL) }
                 let wasCancelled = self.lock.withLock {
                     self.proc = nil
@@ -305,7 +332,10 @@ final class TranscriptionRunner {
         vocabularyURL: URL?,
         fileManager: FileManager = .default
     ) -> [String] {
-        var args = [script, "--out", outputDir.path, "--title", title, "--language", language]
+        // Texto livre vai colado com "=": separado, um valor de uma palavra começando
+        // com "-" ("-rascunho", "-1:1") é lido pelo argparse como outra opção e o
+        // job sai com exit 2.
+        var args = [script, "--out", outputDir.path, "--title=\(title)", "--language", language]
         // Companion de revisão: trilha por turno, sinais de qualidade e decisão
         // de cada bloco (vocabulário, retry). Não muda o texto nem o .md/.jsonl.
         args.append("--with-analysis")
@@ -317,16 +347,16 @@ final class TranscriptionRunner {
             args += ["--vocabulary", vocabularyURL.path]
         }
         if let calendarMeeting {
-            args += ["--calendar-title", calendarMeeting.title]
+            args.append("--calendar-title=\(calendarMeeting.title)")
             args += ["--calendar-start", isoFormatter.string(from: calendarMeeting.startDate)]
             if let end = calendarMeeting.endDate {
                 args += ["--calendar-end", isoFormatter.string(from: end)]
             }
             if let organizer = calendarMeeting.organizerName, !organizer.isEmpty {
-                args += ["--calendar-organizer", organizer]
+                args.append("--calendar-organizer=\(organizer)")
             }
             for name in calendarMeeting.attendeeNames ?? [] {
-                args += ["--participant", name]
+                args.append("--participant=\(name)")
             }
         }
         return args

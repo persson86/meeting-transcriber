@@ -5,9 +5,12 @@ e os WAVs são tons constantes gerados aqui.
 """
 import io
 import json
+import os
 import re
+import shutil
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -73,11 +76,15 @@ class PipelineHarness(unittest.TestCase):
         self.addCleanup(lambda: Path(tmp.name).unlink(missing_ok=True))
         return tmp.name
 
-    def run_main(self, model, islands_by_track, extra_args=(), mic_sec=20.0, system_sec=20.0):
+    def run_main(self, model, islands_by_track, extra_args=(), mic_sec=20.0, system_sec=20.0, groq_cache=None):
         """Roda main() com backend e VAD falsos; devolve (md, analysis rows, jsonl rows, stdout)."""
         mic = self.write_wav(mic_sec)
         system = self.write_wav(system_sec)
         out_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, out_dir, ignore_errors=True)
+        # main() poda o cache de respostas da Groq em todo job: aponta para uma
+        # pasta do teste, nunca para ~/Library/Caches da máquina.
+        groq_cache = groq_cache or Path(out_dir) / "groq-cache"
         islands_queue = [islands_by_track["mic"], islands_by_track["system"]]
         argv = [
             "transcribe_meeting.py", "--mic", mic, "--system", system, "--out", out_dir,
@@ -87,6 +94,7 @@ class PipelineHarness(unittest.TestCase):
         stdout = io.StringIO()
         with patch.object(sys, "argv", argv), \
                 patch.object(tm, "MlxBackend", return_value=model), \
+                patch.object(tm, "GROQ_CACHE_DIR", groq_cache), \
                 patch.object(tm, "detect_speech_islands", side_effect=lambda audio: islands_queue.pop(0)), \
                 redirect_stdout(stdout):
             tm.main()
@@ -390,6 +398,32 @@ class FixedLanguageCheckTests(PipelineHarness):
         })
         self.assertIs(analysis[0]["lang_mismatch"], False)
 
+    def test_check_without_detection_is_not_reported_as_no_divergence(self):
+        # A conferência rodou mas não detectou idioma: nada de `lang_mismatch: false`
+        # nem de "idioma: sem divergência" na caixa.
+        model = ScriptedModel(
+            [[seg(0.1, 9.0, " bom dia ")], [seg(0.1, 9.0, " bom dia a todos ")]],
+            languages=[None] * 6,
+        )
+        md, analysis, _, _ = self.run_main(model, {
+            "mic": [{"start": 0, "end": 10 * SR}],
+            "system": [{"start": 0, "end": 10 * SR}],
+        }, extra_args=["--capture-integrity", "degraded", "--capture-issue", "microfone interrompido"])
+
+        meta = analysis[0]
+        self.assertNotIn("lang_mismatch", meta)
+        self.assertIn("idioma: não verificado", md)
+        self.assertNotIn("sem divergência", md)
+        # O diagnóstico da trilha continua registrando a tentativa.
+        self.assertIsNone(meta["transcription_diagnostics"]["mic"]["language_check"]["detected"])
+
+    def test_skipped_or_empty_check_does_not_count_as_a_check(self):
+        self.assertTrue(tm.language_check_ran({"expected": "pt", "detected": "pt", "mismatch": False}))
+        self.assertFalse(tm.language_check_ran({"skipped": "cloud_backend"}))   # Groq
+        self.assertFalse(tm.language_check_ran({"expected": "pt", "detected": None, "mismatch": False}))
+        self.assertFalse(tm.language_check_ran({}))
+        self.assertFalse(tm.language_check_ran(None))
+
     def test_low_share_divergence_is_not_flagged(self):
         audio = np.full(60 * SR, 0.1, dtype=np.float32)
         chunks = [{"start": 0, "end": 20 * SR}, {"start": 21 * SR, "end": 31 * SR}]
@@ -406,6 +440,51 @@ class FixedLanguageCheckTests(PipelineHarness):
         sample = tm.language_sample_chunks(chunks)
         self.assertEqual(sum(item["end"] - item["start"] for item in sample), 30 * SR)
         self.assertEqual(len(sample), 2)
+
+
+class AppArgumentContractTests(PipelineHarness):
+    ISLANDS = {"mic": [{"start": 0, "end": 2 * SR}], "system": [{"start": 0, "end": 2 * SR}]}
+
+    def test_free_text_with_a_leading_dash_is_accepted_in_equals_form(self):
+        # O app passa texto livre como --title=valor (TranscriptionRunner.arguments).
+        model = ScriptedModel([[seg(0.1, 1.5, " oi ")], [seg(0.1, 1.0, " olá ")]])
+        md, _, jsonl, _ = self.run_main(model, self.ISLANDS, extra_args=[
+            "--title=-rascunho", "--participant=-Ana", "--context-term=-termo",
+            "--calendar-title=-1:1", "--calendar-organizer=-Org",
+        ])
+        self.assertIn("-rascunho", md.splitlines()[0])
+        self.assertEqual(jsonl[0]["title"], "-rascunho")
+
+    def test_same_value_as_a_separate_argument_is_rejected_by_argparse(self):
+        # O defeito que a forma com "=" evita: "-rascunho" solto vira outra opção.
+        stderr = io.StringIO()
+        argv = ["transcribe_meeting.py", "--out", "/tmp", "--mic", "/tmp/x.wav", "--title", "-rascunho"]
+        with patch.object(sys, "argv", argv), patch("sys.stderr", stderr), \
+                self.assertRaises(SystemExit) as raised:
+            tm.main()
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("--title", stderr.getvalue())
+
+
+class GroqCachePruneTests(PipelineHarness):
+    def test_local_job_also_prunes_expired_groq_responses(self):
+        # README: respostas da Groq ficam 7 dias em cache. Antes só um job Groq podava.
+        cache = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, cache, ignore_errors=True)
+        old, fresh = cache / "antiga.json", cache / "recente.json"
+        old.write_text("{}")
+        fresh.write_text("{}")
+        expired = time.time() - tm.GROQ_CACHE_MAX_AGE_SEC - 60
+        os.utime(old, (expired, expired))
+
+        model = ScriptedModel([[seg(0.1, 1.5, " oi ")], [seg(0.1, 1.0, " olá ")]])
+        self.run_main(
+            model, {"mic": [{"start": 0, "end": 2 * SR}], "system": [{"start": 0, "end": 2 * SR}]},
+            groq_cache=cache,
+        )
+
+        self.assertFalse(old.exists())
+        self.assertTrue(fresh.exists())
 
 
 # ---------------------------------------------------------------------------
@@ -545,6 +624,13 @@ class ConfidenceBoxTests(PipelineHarness):
 
         self.assertEqual((segments[0].temperature, segments[0].compression_ratio), (0.2, 1.4))
 
+    def test_box_names_the_track_whose_language_was_not_checked(self):
+        box = tm.build_confidence_box(
+            self.clean_turns(), dual_track=True, tracks="both", capture_integrity="degraded",
+            language_checks={"mic": {"mismatch": False}},
+        )
+        self.assertIn("idioma: sem divergência no mic; sistema não verificado", box[1])
+
     def test_box_quality_line_counts_retries_and_removals(self):
         box = tm.build_confidence_box(
             self.clean_turns(), dual_track=True, tracks="both", capture_integrity="complete",
@@ -552,7 +638,7 @@ class ConfidenceBoxTests(PipelineHarness):
                 "mic": {"coverage_retries_used": 2, "prompt_echo_removed": 1},
                 "system": {"seam_segments_trimmed": 3, "coverage_retries_used": 1},
             },
-            language_checks={"mic": {"mismatch": False}},
+            language_checks={"mic": {"mismatch": False}, "system": {"mismatch": False}},
             echo_share=0.12,
         )
         self.assertEqual(len(box), 3)

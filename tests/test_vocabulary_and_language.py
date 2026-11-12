@@ -4,7 +4,7 @@ import sys
 import tempfile
 import time
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -300,10 +300,6 @@ class DateAndNamingTests(unittest.TestCase):
         self.assertIn("Convidados (convite, não confirma presença):** Ana, Bruno", markdown)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class CoverageGuardTests(unittest.TestCase):
     def islands(self):
         sr = tm.SAMPLE_RATE
@@ -427,3 +423,7 @@ class CoverageGuardTests(unittest.TestCase):
             tm.speech_seconds_in_range([{"start": 0, "end": 16000}, {"start": 32000, "end": 64000}], 16000, 48000),
             1.0,
         )
+
+
+if __name__ == "__main__":
+    unittest.main()

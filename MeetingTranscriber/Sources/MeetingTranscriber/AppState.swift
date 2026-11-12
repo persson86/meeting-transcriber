@@ -265,22 +265,6 @@ final class AppState: ObservableObject {
         job.completedAt ?? job.createdAt
     }
 
-    var statusLabel: String {
-        if status.isBusy {
-            return status.label
-        }
-        if runningTranscriptionCount > 0 {
-            let queued = queuedTranscriptionCount
-            return queued > 0
-                ? "Transcrevendo \(runningTranscriptionCount) • \(queued) na fila"
-                : "Transcrevendo \(runningTranscriptionCount)"
-        }
-        if queuedTranscriptionCount > 0 {
-            return "\(queuedTranscriptionCount) na fila"
-        }
-        return status.label
-    }
-
     /// Invariante: `status` em {starting, recording, stopping} ⇔ há captura ativa.
     /// Um erro com recorder ainda ativo não autoriza iniciar outra gravação.
     var hasActiveRecorder: Bool { mic != nil || sys != nil }
@@ -691,7 +675,8 @@ final class AppState: ObservableObject {
                     startedAt: nil,
                     completedAt: nil,
                     status: .queued,
-                    captureIntegrity: .complete
+                    // Arquivo importado: nada foi medido na captura.
+                    captureIntegrity: .unknown
                 )
 
                 transcriptionJobs.append(stampBackend(job))
@@ -942,10 +927,19 @@ final class AppState: ObservableObject {
 
     private func stampBackend(_ job: TranscriptionJob) -> TranscriptionJob {
         var job = job
-        var record = job.record ?? SessionRecord()
-        record.asrBackend = processingBackend.rawValue
-        job.record = record
+        job.record = Self.stamped(job.record, backend: processingBackend)
         return job
+    }
+
+    /// Registro do job no enfileiramento. Áudio importado chega sem registro:
+    /// sem a versão do app aqui, o `report.py` tinha de inferi-la pela data.
+    static func stamped(_ record: SessionRecord?, backend: ProcessingBackend) -> SessionRecord {
+        var record = record ?? SessionRecord(
+            appVersion: AppVersion.app,
+            appBuild: Bundle.main.infoDictionary?["CFBundleVersion"] as? String
+        )
+        record.asrBackend = backend.rawValue
+        return record
     }
 
     /// Fila pendente só com jobs na Groq (a bateria não os adia).
@@ -1546,11 +1540,6 @@ final class AppState: ObservableObject {
             "(\(Int(micDuration))s de microfone, \(Int(systemDuration))s de sistema)."
         ]
     }
-
-    /// Uma interrupção no meio da trilha a partir disso vira problema de integridade.
-    static let materialDropoutSeconds = IntegrityRule.materialEventSeconds
-    /// Perda somada (início + interrupções + fim) a partir disso também vira.
-    static let materialLossSeconds = IntegrityRule.materialLossSeconds
 
     /// v1.7: `degraded` só com falha de escrita/conversão ou perda medida em
     /// segundos. Contagem de rearmes, erro de uma tentativa que depois funcionou e

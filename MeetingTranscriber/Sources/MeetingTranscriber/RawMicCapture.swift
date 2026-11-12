@@ -1,5 +1,6 @@
-// Protótipo (Astra, 07/out/2026): cliente HAL direto no mic embutido, fora do
-// AVAudioEngine. Experimental: `defaults write io.github.meetingtranscriber.app micCaptureBackend raw`.
+// Cliente HAL direto no mic embutido (IOProc), fora do AVAudioEngine. É o backend
+// padrão desde a 1.9.0 (07/out/2026) e só captura o microfone embutido. Volta ao
+// engine com `defaults write io.github.meetingtranscriber.app micCaptureBackend engine`.
 import Foundation
 import CoreAudio
 import AVFoundation
