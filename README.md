@@ -19,6 +19,19 @@ Speaker labels are track based: microphone audio is labeled `Você`, system audi
 is labeled `Interlocutor`. Optional local clustering can split the system track
 into heuristic `Remote_A`, `Remote_B`, etc. labels.
 
+## What's New in 2.3.2
+
+**"Processar arquivo de áudio…" now takes the iPhone's `.m4a` (and MP3, AAC,
+AIFF, CAF or a WAV at any sample rate), converting it inside the app.**
+
+- A 16 kHz WAV is still copied as is. Any other format or sample rate is
+  converted with AVFoundation to the 16 kHz mono Int16 WAV the pipeline reads,
+  in blocks (a 31-minute `.m4a` converts in under a second), with multichannel
+  audio downmixed. The original file is never changed.
+- A file that is not readable audio fails with a clear message and leaves no
+  partial WAV behind; the picker opens on any audio type instead of WAV only.
+- Not validated: formats other than AAC `.m4a` and WAV on real recordings.
+
 ## What's New in 2.3.1
 
 **Fixes from a full audit: a finished transcription no longer fails on its
@@ -664,9 +677,11 @@ picking an event drops the association. If no eligible event is found, the
 existing title is preserved and the app shows a warning.
 
 To process an iPhone recording manually, click **Processar arquivo de áudio…**. The
-file picker opens in Downloads by default; choose the 16 kHz WAV and leave the
-app open while the job runs. The app copies the selected file into its durable
-session storage and never changes or deletes the original in Downloads. A single imported
+file picker opens in Downloads by default; choose the audio file (the iPhone's
+`.m4a`, MP3, AAC, AIFF, CAF or WAV) and leave the app open while the job runs. A
+16 kHz WAV is copied as is; any other format or sample rate is converted to a
+16 kHz mono WAV inside the app's durable session storage. The original in
+Downloads is never changed or deleted. A single imported
 track uses the neutral speaker label `Áudio`.
 
 Each recording gets a stable session directory with a durable manifest and WAV

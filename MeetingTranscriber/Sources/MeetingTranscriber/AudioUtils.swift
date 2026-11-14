@@ -447,3 +447,78 @@ func pcmHasSignal(_ data: Data) -> Bool {
         raw.bindMemory(to: Int16.self).contains { $0 != 0 }
     }
 }
+
+// MARK: - Importação: qualquer arquivo que o AVFoundation lê → WAV 16 kHz mono Int16
+
+/// Converte um arquivo de áudio (m4a do iPhone, mp3, aac, aiff, caf, WAV em outra
+/// taxa) para o WAV 16 kHz mono Int16 que o pipeline lê. Lê em blocos para não
+/// carregar uma reunião inteira na memória; canais múltiplos viram média (downmix).
+/// O destino só aparece completo: o parcial fica em nome próprio e some na falha.
+func transcodeAudioFileToWAV16kMono(from sourceURL: URL, to destinationURL: URL) throws {
+    let input = try AVAudioFile(forReading: sourceURL)
+    let sourceFormat = input.processingFormat
+    guard sourceFormat.sampleRate > 0, sourceFormat.channelCount > 0 else {
+        throw AudioConversionError.invalidInputFormat
+    }
+    guard let targetFormat = AVAudioFormat(
+        commonFormat: .pcmFormatInt16, sampleRate: 16_000, channels: 1, interleaved: true
+    ), let converter = AVAudioConverter(from: sourceFormat, to: targetFormat) else {
+        throw AudioConversionError.converterFailed("formato de origem não suportado")
+    }
+    converter.downmix = true
+
+    let chunkFrames: AVAudioFrameCount = 65_536
+    let outCapacity = AVAudioFrameCount(ceil(Double(chunkFrames) * 16_000 / sourceFormat.sampleRate)) + 4_096
+    guard let outBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outCapacity) else {
+        throw AudioConversionError.cannotAllocateOutputBuffer
+    }
+
+    let writer = WAVWriter(
+        stagingDirectory: destinationURL.deletingLastPathComponent(),
+        stagingFileName: destinationURL.deletingPathExtension().lastPathComponent + ".importing.wav",
+        preserveOnDeinit: false
+    )
+    var reachedEnd = false
+    var readError: Error?
+
+    while true {
+        outBuffer.frameLength = 0
+        var conversionError: NSError?
+        let status = converter.convert(to: outBuffer, error: &conversionError) { _, inputStatus in
+            guard !reachedEnd, input.framePosition < input.length,
+                  let chunk = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: chunkFrames) else {
+                reachedEnd = true
+                inputStatus.pointee = .endOfStream
+                return nil
+            }
+            do {
+                try input.read(into: chunk, frameCount: chunkFrames)
+            } catch {
+                readError = error
+                reachedEnd = true
+                inputStatus.pointee = .endOfStream
+                return nil
+            }
+            guard chunk.frameLength > 0 else {
+                reachedEnd = true
+                inputStatus.pointee = .endOfStream
+                return nil
+            }
+            inputStatus.pointee = .haveData
+            return chunk
+        }
+        if let readError { throw readError }
+        if let conversionError { throw AudioConversionError.converterFailed(conversionError.localizedDescription) }
+        guard status != .error else { throw AudioConversionError.converterFailed("status \(status.rawValue)") }
+
+        if outBuffer.frameLength > 0, let channel = outBuffer.int16ChannelData {
+            guard writer.append(Data(bytes: channel[0], count: Int(outBuffer.frameLength) * 2)) else {
+                throw AudioConversionError.converterFailed(writer.firstErrorDescription ?? "falha ao gravar o WAV")
+            }
+        }
+        if status == .endOfStream || (reachedEnd && outBuffer.frameLength == 0) { break }
+    }
+
+    guard !writer.isEmpty else { throw AudioConversionError.emptyOutput }
+    try writer.save(to: destinationURL)
+}

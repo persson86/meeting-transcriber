@@ -1461,28 +1461,34 @@ final class AppState: ObservableObject {
 
     private static func stageImportedAudio(from sourceURL: URL, destinationDirectory: URL) async throws -> URL {
         try await Task.detached(priority: .userInitiated) {
-            guard sourceURL.pathExtension.lowercased() == "wav" else {
-                throw AudioImportError.unsupportedFile
-            }
-
             let hasScopedAccess = sourceURL.startAccessingSecurityScopedResource()
             defer {
                 if hasScopedAccess { sourceURL.stopAccessingSecurityScopedResource() }
             }
 
-            let audioFile = try AVAudioFile(forReading: sourceURL)
+            let audioFile: AVAudioFile
+            do {
+                audioFile = try AVAudioFile(forReading: sourceURL)
+            } catch {
+                throw AudioImportError.unsupportedFile
+            }
             guard audioFile.length > 0 else {
                 throw AudioImportError.emptyFile
             }
-            guard abs(audioFile.fileFormat.sampleRate - 16_000) < 0.5 else {
-                throw AudioImportError.unsupportedSampleRate(audioFile.fileFormat.sampleRate)
-            }
+            // WAV já em 16 kHz segue copiado como antes; o resto (m4a do iPhone,
+            // mp3, WAV em outra taxa…) é convertido para o WAV que o pipeline lê.
+            let copiesAsIs = sourceURL.pathExtension.lowercased() == "wav"
+                && abs(audioFile.fileFormat.sampleRate - 16_000) < 0.5
 
             let directory = destinationDirectory
             do {
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
                 let stagedURL = directory.appendingPathComponent("mic.wav")
-                try FileManager.default.copyItem(at: sourceURL, to: stagedURL)
+                if copiesAsIs {
+                    try FileManager.default.copyItem(at: sourceURL, to: stagedURL)
+                } else {
+                    try transcodeAudioFileToWAV16kMono(from: sourceURL, to: stagedURL)
+                }
                 return stagedURL
             } catch {
                 try? FileManager.default.removeItem(at: directory)
@@ -1786,16 +1792,13 @@ final class AppState: ObservableObject {
 private enum AudioImportError: LocalizedError {
     case unsupportedFile
     case emptyFile
-    case unsupportedSampleRate(Double)
 
     var errorDescription: String? {
         switch self {
         case .unsupportedFile:
-            return "Selecione um arquivo WAV."
+            return "Não foi possível ler esse arquivo como áudio. Use WAV, M4A, MP3, AAC, AIFF ou CAF."
         case .emptyFile:
             return "O arquivo selecionado não contém áudio."
-        case .unsupportedSampleRate(let sampleRate):
-            return "O WAV precisa ter 16 kHz; o arquivo selecionado tem \(Int(sampleRate)) Hz."
         }
     }
 }

@@ -184,7 +184,7 @@ struct MenuBarView: View {
                 }
                 .buttonStyle(.link)
                 .disabled(state.isCalendarSyncing)
-                .help("Escolher um WAV de 16 kHz sem alterar o arquivo original")
+                .help("Escolher um áudio (WAV, M4A, MP3…) sem alterar o arquivo original")
             }
         }
     }
@@ -777,9 +777,9 @@ struct MenuBarView: View {
     private func chooseAudioFile() {
         let panel = NSOpenPanel()
         panel.title = "Processar arquivo de áudio"
-        panel.message = "Escolha um WAV de 16 kHz para adicionar à fila de transcrição."
+        panel.message = "Escolha um áudio (WAV, M4A, MP3…) para adicionar à fila de transcrição."
         panel.prompt = "Processar"
-        panel.allowedContentTypes = [.wav]
+        panel.allowedContentTypes = [.audio]
         panel.allowsMultipleSelection = false
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
